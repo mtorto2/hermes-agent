@@ -14,6 +14,11 @@ if TYPE_CHECKING:
     from .store import MemoryStore
 
 try:
+    from .store import normalize_fts_query
+except ImportError:
+    from store import normalize_fts_query  # type: ignore[no-redef]
+
+try:
     from . import holographic as hrr
 except ImportError:
     import holographic as hrr  # type: ignore[no-redef]
@@ -492,11 +497,15 @@ class FactRetriever:
         """
         conn = self.store._conn
 
-        # Build query - FTS5 rank is negative (lower = better match)
+        fts_query = normalize_fts_query(query)
+        if not fts_query:
+            return []
+
+        # Build query - FTS5 rank is negative (lower = better)
         # We need to join facts_fts with facts to get all columns
         params: list = []
         where_clauses = ["facts_fts MATCH ?"]
-        params.append(query)
+        params.append(fts_query)
 
         if category:
             where_clauses.append("f.category = ?")
