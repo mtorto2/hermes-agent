@@ -2039,8 +2039,23 @@ class BasePlatformAdapter(ABC):
     def prepare_tts_text(self, text: str) -> str:
         """Prepare text for TTS. Override to filter tool output, code, etc.
 
-        Default strips markdown formatting and truncates to 4000 chars.
+        Default strips markdown formatting, removes the Telegram voice-transcript
+        audit block from the spoken text, and truncates to 4000 chars.
         """
+        # Telegram voice replies may be prefixed by GatewayRunner with a visible
+        # transcript audit block like:
+        #   🎙️ You said: "..."
+        #
+        #   <assistant reply>
+        # Keep that block in the text reply/caption, but don't read the user's
+        # own dictated prompt back to them in the generated audio.
+        text = re.sub(
+            r'^\s*🎙️ You said:\s*".*?"\s*\n\s*\n',
+            '',
+            text,
+            count=1,
+            flags=re.DOTALL,
+        )
         return re.sub(r'[*_`#\[\]()]', '', text)[:4000].strip()
 
     async def play_tts(

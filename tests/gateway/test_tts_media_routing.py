@@ -203,3 +203,27 @@ async def test_streaming_delivery_routes_telegram_mp3_media_tag_to_voice_sender(
         metadata={"thread_id": "topic-1"},
     )
     adapter.send_document.assert_not_awaited()
+
+
+def test_prepare_tts_text_strips_voice_transcript_echo_prefix_short_form():
+    adapter = _MediaRoutingAdapter()
+
+    spoken = adapter.prepare_tts_text(
+        '🎙️ You said: "Please read this as text only."\n\n'
+        'Sure, Matt — this is the part that should be spoken.'
+    )
+
+    assert spoken == 'Sure, Matt — this is the part that should be spoken.'
+    assert 'Please read this as text only' not in spoken
+
+
+def test_prepare_tts_text_strips_voice_transcript_echo_prefix_long_form():
+    adapter = _MediaRoutingAdapter()
+
+    spoken = adapter.prepare_tts_text(
+        '🎙️ You said:\n"Please read this as text only, even when it is long."\n\n'
+        '**Sure**, Matt — only my reply should be in the generated audio.'
+    )
+
+    assert spoken == 'Sure, Matt — only my reply should be in the generated audio.'
+    assert 'Please read this as text only' not in spoken
