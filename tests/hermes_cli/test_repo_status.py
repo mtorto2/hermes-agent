@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from hermes_cli.repo_status import (
+    FetchSummary,
     RepoStatus,
     RepoStatusOptions,
     format_repo_status_report,
@@ -45,14 +46,25 @@ def test_parse_porcelain_status_counts_file_states():
 
 
 def test_parse_repo_status_args_accepts_all_and_paths():
-    options = parse_repo_status_args("all --paths --root ~/dev --depth 2 --limit 10")
+    options = parse_repo_status_args(
+        "all --paths --root ~/dev --depth 2 --limit 10 "
+        "--fetch-stale --fetch-interval 300"
+    )
 
     assert options.include_clean is True
     assert options.show_paths is True
     assert options.roots == (Path("~/dev").expanduser(),)
     assert options.max_depth == 2
     assert options.limit == 10
+    assert options.fetch_mode == "stale"
+    assert options.fetch_interval_seconds == 300
     assert options.errors == ()
+
+
+def test_parse_repo_status_args_force_fetch_wins_over_stale():
+    options = parse_repo_status_args("--fetch-stale --force-fetch")
+
+    assert options.fetch_mode == "force"
 
 
 def test_format_report_hides_clean_repositories_by_default():
@@ -85,15 +97,19 @@ def test_swiftbar_menu_marks_attention_count(monkeypatch):
 
     monkeypatch.setattr(
         repo_status,
-        "collect_repo_statuses",
-        lambda _options: [
-            RepoStatus(Path("/tmp/dirty"), branch="dev", unstaged=1),
-            RepoStatus(Path("/tmp/clean"), branch="main"),
-        ],
+        "collect_repo_status_report",
+        lambda _options: (
+            [
+                RepoStatus(Path("/tmp/dirty"), branch="dev", unstaged=1),
+                RepoStatus(Path("/tmp/clean"), branch="main"),
+            ],
+            FetchSummary(),
+        ),
     )
 
     menu = format_swiftbar_menu("")
 
     assert menu.splitlines()[0] == "Git: 1"
+    assert "Force fetch now | bash=" in menu
     assert "dirty: dev - 1 unstaged | color=orange" in menu
     assert "clean: main - clean | color=green" in menu
