@@ -9,6 +9,53 @@ import pytest
 import hermes_cli.gateway as gateway
 
 
+def test_launchd_probe_uses_print_domain_before_legacy_list(monkeypatch, tmp_path):
+    plist = tmp_path / "ai.hermes.gateway.plist"
+    plist.write_text("<plist/>", encoding="utf-8")
+
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd[:2] == ["launchctl", "print"]:
+            return SimpleNamespace(returncode=0, stdout="state = running\n", stderr="")
+        raise AssertionError(f"unexpected command: {cmd}")
+
+    monkeypatch.setattr(gateway, "get_launchd_plist_path", lambda: plist)
+    monkeypatch.setattr(gateway, "get_launchd_label", lambda: "ai.hermes.gateway")
+    monkeypatch.setattr(gateway, "_launchd_domain", lambda: "gui/501")
+    monkeypatch.setattr(gateway.subprocess, "run", fake_run)
+
+    assert gateway._probe_launchd_service_running() is True
+    assert calls == [["launchctl", "print", "gui/501/ai.hermes.gateway"]]
+
+
+def test_launchd_probe_falls_back_to_legacy_list(monkeypatch, tmp_path):
+    plist = tmp_path / "ai.hermes.gateway.plist"
+    plist.write_text("<plist/>", encoding="utf-8")
+
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd[:2] == ["launchctl", "print"]:
+            return SimpleNamespace(returncode=113, stdout="", stderr="not loaded")
+        if cmd == ["launchctl", "list", "ai.hermes.gateway"]:
+            return SimpleNamespace(returncode=0, stdout="123\t0\tai.hermes.gateway\n", stderr="")
+        raise AssertionError(f"unexpected command: {cmd}")
+
+    monkeypatch.setattr(gateway, "get_launchd_plist_path", lambda: plist)
+    monkeypatch.setattr(gateway, "get_launchd_label", lambda: "ai.hermes.gateway")
+    monkeypatch.setattr(gateway, "_launchd_domain", lambda: "gui/501")
+    monkeypatch.setattr(gateway.subprocess, "run", fake_run)
+
+    assert gateway._probe_launchd_service_running() is True
+    assert calls == [
+        ["launchctl", "print", "gui/501/ai.hermes.gateway"],
+        ["launchctl", "list", "ai.hermes.gateway"],
+    ]
+
+
 def _install_fake_gateway_run(monkeypatch, start_gateway):
     module = ModuleType("gateway.run")
     module.start_gateway = start_gateway
