@@ -89,10 +89,25 @@ _RE_AKA          = re.compile(
     r'(\w+(?:\s+\w+)*)\s+(?:aka|also known as)\s+(\w+(?:\s+\w+)*)',
     re.IGNORECASE,
 )
+_RE_FTS_TOKEN    = re.compile(r"\w+")
 
 
 def _clamp_trust(value: float) -> float:
     return max(_TRUST_MIN, min(_TRUST_MAX, value))
+
+
+def normalize_fts_query(query: str) -> str:
+    """Convert plain-language user input into a safe FTS5 AND query.
+
+    The fact_store search action is a keyword lookup, not an advanced FTS5
+    syntax interface. Passing arbitrary user text directly to MATCH lets
+    punctuation change semantics; for example ``low-value`` is parsed by
+    FTS5 as ``low`` followed by a column/filter expression for ``value`` and
+    raises ``no such column: value``. Tokenizing and quoting each term keeps
+    searches literal and predictable.
+    """
+    tokens = _RE_FTS_TOKEN.findall(query)
+    return " ".join(f'"{token}"' for token in tokens)
 
 
 class MemoryStore:
@@ -205,7 +220,11 @@ class MemoryStore:
             if not query:
                 return []
 
-            params: list = [query, min_trust]
+            fts_query = normalize_fts_query(query)
+            if not fts_query:
+                return []
+
+            params: list = [fts_query, min_trust]
             category_clause = ""
             if category is not None:
                 category_clause = "AND f.category = ?"
