@@ -1525,6 +1525,10 @@ def create_task(
         board_default = board_meta.get("default_workdir")
         if board_default:
             workspace_path = str(board_default)
+            if workspace_kind == "scratch":
+                # Board default workdirs are durable project directories, not
+                # disposable scratch workspaces.
+                workspace_kind = "dir"
 
     # Retry once on the extremely unlikely id collision.
     for attempt in range(2):
@@ -2924,10 +2928,20 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
         if kind != "scratch" or not path:
             return
         import shutil
-        wp = Path(path)
-        if wp.is_dir():
-            shutil.rmtree(wp, ignore_errors=True)
-            _log.debug("Removed scratch workspace: %s", wp)
+        wp = Path(path).expanduser()
+        try:
+            resolved = wp.resolve()
+            scratch_root = workspaces_root().resolve()
+            resolved.relative_to(scratch_root)
+        except (OSError, ValueError):
+            _log.warning(
+                "Refusing to remove scratch workspace outside scratch root: %s",
+                wp,
+            )
+            return
+        if resolved.is_dir():
+            shutil.rmtree(resolved, ignore_errors=True)
+            _log.debug("Removed scratch workspace: %s", resolved)
         # Also kill the tmux session for the worker that owned this task,
         # if the tmux session is now dead (worker process exited).
         _cleanup_worker_tmux(conn, task_id)

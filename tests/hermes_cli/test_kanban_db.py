@@ -1446,6 +1446,25 @@ def test_scratch_workspace_created_under_hermes_home(kanban_home):
     assert "kanban" in str(ws)
 
 
+def test_complete_task_keeps_scratch_workspace_outside_root(kanban_home, tmp_path):
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    marker = project_dir / "keep.txt"
+    marker.write_text("do not delete")
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="legacy explicit scratch path",
+            workspace_kind="scratch",
+            workspace_path=str(project_dir),
+        )
+        assert kb.complete_task(conn, tid)
+
+    assert project_dir.is_dir()
+    assert marker.read_text() == "do not delete"
+
+
 def test_dir_workspace_honors_given_path(kanban_home, tmp_path):
     target = tmp_path / "my-vault"
     with kb.connect() as conn:
@@ -2474,6 +2493,7 @@ def test_create_task_without_workspace_inherits_board_default_workdir(kanban_hom
         t = kb.get_task(conn, tid)
     assert t is not None
     assert t.workspace_path == default_wd
+    assert t.workspace_kind == "dir"
 
 
 def test_create_task_without_workspace_no_default_stays_none(kanban_home):
