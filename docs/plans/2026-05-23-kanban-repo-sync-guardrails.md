@@ -51,3 +51,20 @@ Dropbox is acceptable for durable project checkouts when it is intentionally
 part of the operator workflow and provides recovery value. Disposable Kanban
 scratch workspaces, temporary clones, and cleanup-owned directories should stay
 under Hermes' Kanban workspaces root, not under Dropbox-synced project folders.
+
+Matt's local Hermes setup uses these boundaries:
+
+- `/Users/matt/.hermes` is the live runtime home for config, auth, logs,
+  sessions, Kanban databases, memories, scripts, and machine-local state.
+- `/Users/matt/.hermes/hermes-agent` is the active Hermes source checkout for
+  code patches, branches, commits, and pull request work.
+- `/Users/matt/Dropbox/CLIENTS/SAVANT SOFTWARE SYSTEMS/DEV/Hermes` is a
+  Dropbox-backed safe archive for reviewed seeds, policies, runbooks, draft
+  skills, and recovery notes.
+- `/Users/matt/Dropbox/CLIENTS/SAVANT SOFTWARE SYSTEMS/DEV/ai-workflow-core`
+  is the git-backed source of truth for reusable workflow policy.
+
+Hermes runtime behavior should not depend on the Dropbox archive. If archive
+material becomes active behavior, promote it first to generic Hermes code,
+Hermes runtime config, board/profile config, or `ai-workflow-core`, depending
+on scope.
