@@ -7294,6 +7294,9 @@ class GatewayRunner:
         if canonical == "status":
             return await self._handle_status_command(event)
 
+        if canonical == "repos":
+            return await self._handle_repos_command(event)
+
         if canonical == "agents":
             return await self._handle_agents_command(event)
 
@@ -9529,6 +9532,13 @@ class GatewayRunner:
             logger.debug("build_recap failed in /status: %s", exc)
 
         return "\n".join(lines)
+
+    async def _handle_repos_command(self, event: MessageEvent) -> str:
+        """Handle /repos command."""
+        from hermes_cli.repo_status import format_repo_status_gateway
+
+        args = event.get_command_args().strip()
+        return await asyncio.to_thread(format_repo_status_gateway, args)
 
     async def _handle_agents_command(self, event: MessageEvent) -> str:
         """Handle /agents command - list active agents and running tasks."""
