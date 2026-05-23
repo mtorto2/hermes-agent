@@ -8033,6 +8033,15 @@ class HermesCLI:
             self._show_gateway_status()
         elif canonical == "status":
             self._show_session_status()
+        elif canonical == "repos":
+            from hermes_cli.repo_status import format_repo_status_gateway
+            parts = cmd_original.split(maxsplit=1)
+            args = parts[1] if len(parts) > 1 else ""
+            self._console_print(
+                format_repo_status_gateway(args),
+                markup=False,
+                highlight=False,
+            )
         elif canonical == "statusbar":
             self._status_bar_visible = not self._status_bar_visible
             state = "visible" if self._status_bar_visible else "hidden"
