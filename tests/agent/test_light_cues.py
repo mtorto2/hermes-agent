@@ -8,6 +8,7 @@ from agent.light_cues import (
     LightCueMode,
     LightCueService,
     NullLightCueBackend,
+    WiZLightCueBackend,
     build_light_cue_service_from_config,
     load_light_cue_mode,
     save_light_cue_mode,
@@ -36,7 +37,7 @@ def test_light_cue_event_mapping_for_all_modes(tmp_path, monkeypatch):
         ],
         LightCueMode.NIGHT: [
             ("working", "night_working", 10, False),
-            ("human_intervention", "intervention", 10, True),
+            ("human_intervention", "night_intervention", 10, True),
             ("final_answer", "final", 10, False),
         ],
         LightCueMode.DIM_DEFAULT: [
@@ -64,8 +65,197 @@ def test_no_light_mode_suppresses_cue_actions(tmp_path, monkeypatch):
     service = LightCueService(backend=backend)
 
     service.set_mode(LightCueMode.NO_LIGHT)
-    assert service.emit(LightCueEvent.WORKING) is False
+    for event in LightCueEvent:
+        assert service.emit(event) is False
     assert backend.actions == []
+
+
+def test_default_prompt_waiting_cue_preserves_full_brightness_alarm_scene(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from gateway.wiz_light import WiZNotificationLightConfig
+
+    seen = []
+
+    def fake_setter(config, mode):
+        seen.append((config, mode))
+        return True
+
+    config = WiZNotificationLightConfig.from_mapping({
+        "enabled": True,
+        "hosts": ["192.0.2.10"],
+        "busy_mode": "scene",
+        "busy_scene_id": 11,
+        "busy_dimming": 100,
+    })
+    service = LightCueService(
+        backend=WiZLightCueBackend(config, setter=fake_setter),
+        mode=LightCueMode.DEFAULT,
+    )
+
+    assert service.emit(LightCueEvent.WORKING) is True
+
+    cue_config, cue_mode = seen[-1]
+    assert cue_mode == "busy"
+    assert cue_config.busy_mode == "scene"
+    assert cue_config.busy_scene_id == 11
+    assert cue_config.busy_dimming == 100
+
+
+def test_default_human_intervention_cue_uses_busy_flashing_surface(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from gateway.wiz_light import WiZNotificationLightConfig
+
+    seen = []
+
+    def fake_setter(config, mode):
+        seen.append((config, mode))
+        return True
+
+    config = WiZNotificationLightConfig.from_mapping({
+        "enabled": True,
+        "hosts": ["192.0.2.10"],
+        "busy_mode": "scene",
+        "busy_scene_id": 11,
+        "busy_dimming": 100,
+        "ready_rgb": [255, 0, 0],
+    })
+    service = LightCueService(
+        backend=WiZLightCueBackend(config, setter=fake_setter),
+        mode=LightCueMode.DEFAULT,
+    )
+
+    assert service.emit(LightCueEvent.HUMAN_INTERVENTION) is True
+
+    cue_config, cue_mode = seen[-1]
+    assert cue_mode == "busy"
+    assert cue_config.busy_mode == "scene"
+    assert cue_config.busy_scene_id == 11
+    assert cue_config.busy_dimming == 100
+
+
+def test_dim_default_human_intervention_cue_uses_dimmed_busy_surface(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from gateway.wiz_light import WiZNotificationLightConfig
+
+    seen = []
+
+    def fake_setter(config, mode):
+        seen.append((config, mode))
+        return True
+
+    config = WiZNotificationLightConfig.from_mapping({
+        "enabled": True,
+        "hosts": ["192.0.2.10"],
+        "busy_mode": "scene",
+        "busy_scene_id": 11,
+        "busy_dimming": 100,
+    })
+    service = LightCueService(
+        backend=WiZLightCueBackend(config, setter=fake_setter),
+        mode=LightCueMode.DIM_DEFAULT,
+    )
+
+    assert service.emit(LightCueEvent.HUMAN_INTERVENTION) is True
+
+    cue_config, cue_mode = seen[-1]
+    assert cue_mode == "busy"
+    assert cue_config.busy_mode == "scene"
+    assert cue_config.busy_scene_id == 11
+    assert cue_config.busy_dimming == 35
+
+
+def test_night_prompt_waiting_cue_uses_low_brightness_blue_not_alarm_scene(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from gateway.wiz_light import WiZNotificationLightConfig
+
+    seen = []
+
+    def fake_setter(config, mode):
+        seen.append((config, mode))
+        return True
+
+    config = WiZNotificationLightConfig.from_mapping({
+        "enabled": True,
+        "hosts": ["192.0.2.10"],
+        "busy_mode": "scene",
+        "busy_scene_id": 11,
+        "busy_dimming": 100,
+        "busy_rgb": [255, 255, 255],
+    })
+    service = LightCueService(
+        backend=WiZLightCueBackend(config, setter=fake_setter),
+        mode=LightCueMode.NIGHT,
+    )
+
+    assert service.emit(LightCueEvent.WORKING) is True
+
+    cue_config, cue_mode = seen[-1]
+    assert cue_mode == "busy"
+    assert cue_config.busy_mode == "rgb"
+    assert cue_config.busy_dimming == 10
+    assert cue_config.busy_rgb == (0, 64, 255)
+
+
+def test_night_human_intervention_cue_uses_low_brightness_blue_not_alarm_scene(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from gateway.wiz_light import WiZNotificationLightConfig
+
+    seen = []
+
+    def fake_setter(config, mode):
+        seen.append((config, mode))
+        return True
+
+    config = WiZNotificationLightConfig.from_mapping({
+        "enabled": True,
+        "hosts": ["192.0.2.10"],
+        "busy_mode": "scene",
+        "busy_scene_id": 35,
+        "busy_dimming": 100,
+        "busy_rgb": [255, 255, 255],
+    })
+    service = LightCueService(
+        backend=WiZLightCueBackend(config, setter=fake_setter),
+        mode=LightCueMode.NIGHT,
+    )
+
+    assert service.emit(LightCueEvent.HUMAN_INTERVENTION) is True
+
+    cue_config, cue_mode = seen[-1]
+    assert cue_mode == "busy"
+    assert cue_config.busy_mode == "rgb"
+    assert cue_config.busy_scene_id == 35
+    assert cue_config.busy_dimming == 10
+    assert cue_config.busy_rgb == (0, 64, 255)
+
+
+def test_night_final_reply_cue_uses_low_brightness_red(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from gateway.wiz_light import WiZNotificationLightConfig
+
+    seen = []
+
+    def fake_setter(config, mode):
+        seen.append((config, mode))
+        return True
+
+    config = WiZNotificationLightConfig.from_mapping({
+        "enabled": True,
+        "hosts": ["192.0.2.10"],
+        "ready_rgb": [255, 0, 0],
+        "ready_dimming": 100,
+    })
+    service = LightCueService(
+        backend=WiZLightCueBackend(config, setter=fake_setter),
+        mode=LightCueMode.NIGHT,
+    )
+
+    assert service.emit(LightCueEvent.FINAL_ANSWER) is True
+
+    cue_config, cue_mode = seen[-1]
+    assert cue_mode == "ready"
+    assert cue_config.ready_rgb == (255, 0, 0)
+    assert cue_config.ready_dimming == 10
 
 
 def test_light_cue_mode_persists_stickily_in_profile_home(tmp_path, monkeypatch):
