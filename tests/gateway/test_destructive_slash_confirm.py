@@ -18,6 +18,7 @@ import pytest
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent
 from gateway.session import SessionEntry, SessionSource, build_session_key
+from agent.light_cues import LightCueEvent
 
 
 def _make_source() -> SessionSource:
@@ -47,6 +48,7 @@ def _make_runner():
     # No send_slash_confirm override -> button render returns None,
     # _request_slash_confirm falls back to text path.
     adapter.send_slash_confirm = AsyncMock(return_value=None)
+    adapter.emit_light_cue_for_chat = AsyncMock(return_value=True)
     runner.adapters = {Platform.TELEGRAM: adapter}
 
     session_entry = SessionEntry(
@@ -119,6 +121,11 @@ async def test_gate_on_text_fallback_returns_prompt_without_executing(monkeypatc
     )
 
     execute.assert_not_awaited()
+    emit_assert = getattr(
+        runner.adapters[Platform.TELEGRAM].emit_light_cue_for_chat,
+        "assert_awaited_once_with",
+    )
+    emit_assert("c1", LightCueEvent.HUMAN_INTERVENTION)
     assert isinstance(result, str)
     assert "Confirm /new" in result
     assert "Approve Once" in result

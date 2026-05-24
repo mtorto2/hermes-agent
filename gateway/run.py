@@ -53,6 +53,7 @@ from typing import Dict, Optional, Any, List, Union
 from agent.account_usage import fetch_account_usage, render_account_usage_lines
 from agent.async_utils import safe_schedule_threadsafe
 from agent.i18n import t
+from agent.light_cues import LightCueEvent
 from hermes_cli.config import cfg_get
 
 # --- Agent cache tuning ---------------------------------------------------
@@ -13408,6 +13409,10 @@ class GatewayRunner:
         used_buttons = False
         if adapter is not None:
             try:
+                await adapter.emit_light_cue_for_chat(source.chat_id, LightCueEvent.HUMAN_INTERVENTION)
+            except Exception:
+                pass
+            try:
                 button_result = await adapter.send_slash_confirm(
                     chat_id=source.chat_id,
                     title=title,
@@ -16513,6 +16518,18 @@ class GatewayRunner:
                     pass
 
                 send_ok = False
+                try:
+                    safe_schedule_threadsafe(
+                        _status_adapter.emit_light_cue_for_chat(
+                            _status_chat_id,
+                            LightCueEvent.HUMAN_INTERVENTION,
+                        ),
+                        _loop_for_step,
+                        logger=logger,
+                        log_message="Clarify light-cue scheduling error",
+                    )
+                except Exception:
+                    pass
                 fut = safe_schedule_threadsafe(
                     _status_adapter.send_clarify(
                         chat_id=_status_chat_id,
@@ -16655,6 +16672,19 @@ class GatewayRunner:
 
                 cmd = approval_data.get("command", "")
                 desc = approval_data.get("description", "dangerous command")
+                if _status_adapter is not None:
+                    try:
+                        safe_schedule_threadsafe(
+                            _status_adapter.emit_light_cue_for_chat(
+                                _status_chat_id,
+                                LightCueEvent.HUMAN_INTERVENTION,
+                            ),
+                            _loop_for_step,
+                            logger=logger,
+                            log_message="Approval light-cue scheduling error",
+                        )
+                    except Exception:
+                        pass
 
                 # Prefer button-based approval when the adapter supports it.
                 # Check the *class* for the method, not the instance — avoids

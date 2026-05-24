@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from agent.light_cues import LightCueEvent
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent, MessageType, ProcessingOutcome
 from gateway.session import SessionSource
@@ -44,7 +45,7 @@ def _event(chat_id="8609641275"):
 
 
 @pytest.mark.asyncio
-async def test_telegram_notification_light_starts_busy_immediately_when_text_is_received(monkeypatch):
+async def test_telegram_text_handler_leaves_busy_light_to_shared_lifecycle(monkeypatch):
     calls = []
     enqueued = []
 
@@ -79,7 +80,7 @@ async def test_telegram_notification_light_starts_busy_immediately_when_text_is_
 
     await adapter._handle_text_message(update, None)
 
-    assert calls == ["busy"]
+    assert calls == []
     assert enqueued == [event]
 
 
@@ -115,14 +116,7 @@ async def test_telegram_notification_light_does_not_change_on_processing_start(m
 
 
 @pytest.mark.asyncio
-async def test_telegram_notification_light_sets_ready_only_for_success(monkeypatch):
-    calls = []
-
-    def fake_set(config, mode):
-        calls.append(mode)
-        return True
-
-    monkeypatch.setattr("gateway.platforms.telegram.set_wiz_notification_light", fake_set)
+async def test_shared_processing_lifecycle_emits_light_cue_events(monkeypatch):
     monkeypatch.setenv("TELEGRAM_REACTIONS", "false")
     adapter = TelegramAdapter(
         PlatformConfig(
@@ -131,12 +125,44 @@ async def test_telegram_notification_light_sets_ready_only_for_success(monkeypat
             extra={"notification_light": {"enabled": True, "hosts": ["192.168.7.170"]}},
         )
     )
+    emitted = []
+    adapter._get_light_cue_service().emit = MagicMock(side_effect=lambda event: emitted.append(event) or True)
 
-    await adapter.on_processing_complete(_event(), ProcessingOutcome.SUCCESS)
-    await adapter.on_processing_complete(_event(), ProcessingOutcome.FAILURE)
-    await adapter.on_processing_complete(_event(), ProcessingOutcome.CANCELLED)
+    await adapter._run_processing_hook("on_processing_start", _event())
+    await adapter._run_processing_hook("on_processing_complete", _event(), ProcessingOutcome.SUCCESS)
+    await adapter._run_processing_hook("on_processing_complete", _event(), ProcessingOutcome.FAILURE)
+    await adapter._run_processing_hook("on_processing_complete", _event(), ProcessingOutcome.CANCELLED)
 
-    assert calls == ["ready", "default", "default"]
+    assert emitted == [
+        LightCueEvent.WORKING,
+        LightCueEvent.FINAL_ANSWER,
+        LightCueEvent.ERROR,
+        LightCueEvent.IDLE,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_shared_processing_lifecycle_preserves_telegram_allowed_chat_scope(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_REACTIONS", "false")
+    adapter = TelegramAdapter(
+        PlatformConfig(
+            enabled=True,
+            token="fake-token",
+            extra={
+                "notification_light": {
+                    "enabled": True,
+                    "hosts": ["192.168.7.170"],
+                    "allowed_chat_ids": ["8609641275"],
+                }
+            },
+        )
+    )
+    service = adapter._get_light_cue_service()
+    service.emit = MagicMock(return_value=True)
+
+    await adapter._run_processing_hook("on_processing_start", _event(chat_id="other"))
+
+    service.emit.assert_not_called()
 
 
 def test_telegram_notification_light_ignores_unlisted_chat():

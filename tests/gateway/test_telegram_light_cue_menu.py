@@ -39,7 +39,7 @@ _ensure_telegram_mock()
 
 from gateway.config import PlatformConfig
 from gateway.platforms.telegram import TelegramAdapter
-from agent.light_cues import LightCueMode, LightCueService, load_light_cue_mode
+from agent.light_cues import LightCueEvent, LightCueMode, LightCueService, load_light_cue_mode
 
 
 class RecordingBackend:
@@ -219,11 +219,9 @@ async def test_human_intervention_light_cue_respects_allowed_chat_ids(tmp_path, 
     })
     backend = RecordingBackend()
     adapter._light_cue_service = LightCueService(backend=backend)
-    assert adapter._bot is not None
-    adapter._bot.send_message = AsyncMock(return_value=MagicMock(message_id=1))
 
-    await adapter.send_clarify("222", "Outside scoped chat?", [], "clarify-1", "session-1")
+    await adapter.emit_light_cue_for_chat("222", LightCueEvent.HUMAN_INTERVENTION)
     assert backend.actions == []
 
-    await adapter.send_clarify("111", "Inside scoped chat?", [], "clarify-2", "session-1")
+    await adapter.emit_light_cue_for_chat("111", LightCueEvent.HUMAN_INTERVENTION)
     assert [action.cue for action in backend.actions] == ["intervention"]

@@ -87,7 +87,7 @@ from gateway.platforms.telegram_network import (
     parse_fallback_ip_env,
 )
 from gateway.wiz_light import WiZNotificationLightConfig, set_wiz_notification_light
-from agent.light_cues import LightCueEvent, LightCueMode, LightCueService, WiZLightCueBackend
+from agent.light_cues import LightCueMode, LightCueService, WiZLightCueBackend
 from utils import atomic_replace
 
 _TELEGRAM_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
@@ -2406,7 +2406,6 @@ class TelegramAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Not connected")
 
         try:
-            await self._emit_light_cue_for_chat(chat_id, LightCueEvent.HUMAN_INTERVENTION)
             cmd_preview = command[:3800] + "..." if len(command) > 3800 else command
             text = (
                 f"⚠️ <b>Command Approval Required</b>\n\n"
@@ -2474,7 +2473,6 @@ class TelegramAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Not connected")
 
         try:
-            await self._emit_light_cue_for_chat(chat_id, LightCueEvent.HUMAN_INTERVENTION)
             preview = self.format_message(message if len(message) <= 3800 else message[:3800] + "...")
 
             keyboard = InlineKeyboardMarkup([
@@ -2582,7 +2580,6 @@ class TelegramAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Not connected")
 
         try:
-            await self._emit_light_cue_for_chat(chat_id, LightCueEvent.HUMAN_INTERVENTION)
             text = f"❓ {_html.escape(question)}"
             thread_id = self._metadata_thread_id(metadata)
 
@@ -4870,7 +4867,6 @@ class TelegramAdapter(BasePlatformAdapter):
         await self._ensure_forum_commands(update.message)
 
         event = self._build_message_event(msg, MessageType.TEXT, update_id=update.update_id)
-        await self._set_notification_light(event, "busy")
         event.text = self._clean_bot_trigger_text(event.text) or ""
         event = self._apply_telegram_group_observe_attribution(event)
         self._enqueue_text_event(event)
@@ -4904,7 +4900,6 @@ class TelegramAdapter(BasePlatformAdapter):
                 },
             )
             return
-        await self._set_notification_light(event, "busy")
         event = self._apply_telegram_group_observe_attribution(event)
         await self.handle_message(event)
 
@@ -4944,7 +4939,6 @@ class TelegramAdapter(BasePlatformAdapter):
         parts.append("Ask what they'd like to find nearby (restaurants, cafes, etc.) and any preferences.")
 
         event = self._build_message_event(msg, MessageType.LOCATION, update_id=update.update_id)
-        await self._set_notification_light(event, "busy")
         event.text = "\n".join(parts)
         event = self._apply_telegram_group_observe_attribution(event)
         await self.handle_message(event)
@@ -5127,7 +5121,6 @@ class TelegramAdapter(BasePlatformAdapter):
             msg_type = MessageType.DOCUMENT
         
         event = self._build_message_event(msg, msg_type, update_id=update.update_id)
-        await self._set_notification_light(event, "busy")
         
         # Add caption as text
         if msg.caption:
@@ -5751,38 +5744,12 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.debug("[%s] clear reactions failed: %s", self.name, e)
             return False
 
-    async def _set_notification_light(self, event: MessageEvent, mode: str) -> None:
-        """Best-effort shared light-cue update for Telegram activity."""
+    def _light_cue_applies_to_chat(self, chat_id: Any) -> bool:
+        """Preserve Telegram WiZ notification-light chat scoping."""
         config = getattr(self, "_notification_light_config", None)
         if not isinstance(config, WiZNotificationLightConfig):
-            return
-        chat_id = getattr(event.source, "chat_id", None)
-        if not config.applies_to_chat(chat_id):
-            return
-        event_map = {
-            "busy": LightCueEvent.WORKING,
-            "ready": LightCueEvent.FINAL_ANSWER,
-            "default": LightCueEvent.IDLE,
-        }
-        cue_event = event_map.get(mode, LightCueEvent.IDLE)
-        try:
-            await asyncio.to_thread(self._get_light_cue_service().emit, cue_event)
-        except Exception as exc:
-            # The light is a convenience notifier. Never let LAN/UDP failures
-            # interfere with message processing or delivery.
-            logger.debug("[%s] light cue update failed: %s", self.name, exc)
-
-    async def _emit_light_cue_for_chat(self, chat_id: Any, event: LightCueEvent | str) -> None:
-        """Best-effort light cue that preserves Telegram WiZ chat scoping."""
-        config = getattr(self, "_notification_light_config", None)
-        if not isinstance(config, WiZNotificationLightConfig):
-            return
-        if not config.applies_to_chat(chat_id):
-            return
-        try:
-            await asyncio.to_thread(self._get_light_cue_service().emit, event)
-        except Exception as exc:
-            logger.debug("[%s] light cue update failed: %s", self.name, exc)
+            return False
+        return config.applies_to_chat(chat_id)
 
     async def on_processing_start(self, event: MessageEvent) -> None:
         """Add an in-progress reaction when message processing begins."""
@@ -5809,10 +5776,6 @@ class TelegramAdapter(BasePlatformAdapter):
         another agent run to swap it to 👍/👎 — which never happens if the
         cancellation was the last activity in the chat.
         """
-        await self._set_notification_light(
-            event,
-            "ready" if outcome == ProcessingOutcome.SUCCESS else "default",
-        )
         chat_id = getattr(event.source, "chat_id", None)
         message_id = getattr(event, "message_id", None)
         if not self._reactions_enabled():

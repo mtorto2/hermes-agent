@@ -20,7 +20,7 @@ from abc import ABC, abstractmethod
 from urllib.parse import urlsplit
 
 from utils import normalize_proxy_url
-from agent.light_cues import LightCueService
+from agent.light_cues import LightCueEvent, LightCueService
 
 logger = logging.getLogger(__name__)
 
@@ -1368,6 +1368,54 @@ class BasePlatformAdapter(ABC):
             self._light_cue_service = service
         return service
 
+    def _light_cue_applies_to_chat(self, chat_id: Any) -> bool:
+        """Return whether shared light cues should fire for *chat_id*.
+
+        Adapters with platform-specific scoping (Telegram's
+        ``allowed_chat_ids`` for the WiZ light, for example) override this
+        hook.  The lifecycle emission itself stays in the shared adapter
+        runtime so busy/final/error cues are not duplicated in every platform
+        adapter.
+        """
+        return True
+
+    async def emit_light_cue_for_chat(self, chat_id: Any, event: LightCueEvent | str) -> bool:
+        """Best-effort shared light cue emission with per-chat scoping."""
+        if not self._light_cue_applies_to_chat(chat_id):
+            return False
+        try:
+            return bool(await asyncio.to_thread(self._get_light_cue_service().emit, event))
+        except Exception as exc:
+            # Light cues are a convenience notifier. Never let LAN/UDP/backend
+            # failures interfere with message processing or delivery.
+            logger.debug("[%s] light cue update failed: %s", self.name, exc)
+            return False
+
+    async def _emit_processing_light_cue(
+        self,
+        hook_name: str,
+        event: MessageEvent | None,
+        outcome: ProcessingOutcome | None = None,
+    ) -> None:
+        """Emit shared turn-lifecycle light cues before platform hooks."""
+        if event is None:
+            return
+        chat_id = getattr(getattr(event, "source", None), "chat_id", None)
+        if chat_id is None:
+            return
+        if hook_name == "on_processing_start":
+            cue_event = LightCueEvent.WORKING
+        elif hook_name == "on_processing_complete":
+            if outcome == ProcessingOutcome.SUCCESS:
+                cue_event = LightCueEvent.FINAL_ANSWER
+            elif outcome == ProcessingOutcome.FAILURE:
+                cue_event = LightCueEvent.ERROR
+            else:
+                cue_event = LightCueEvent.IDLE
+        else:
+            return
+        await self.emit_light_cue_for_chat(chat_id, cue_event)
+
     def supports_draft_streaming(
         self,
         chat_type: Optional[str] = None,
@@ -2493,6 +2541,9 @@ class BasePlatformAdapter(ABC):
 
     async def _run_processing_hook(self, hook_name: str, *args: Any, **kwargs: Any) -> None:
         """Run a lifecycle hook without letting failures break message flow."""
+        event = args[0] if args else None
+        outcome = args[1] if len(args) > 1 and isinstance(args[1], ProcessingOutcome) else None
+        await self._emit_processing_light_cue(hook_name, event, outcome)
         hook = getattr(self, hook_name, None)
         if not callable(hook):
             return
