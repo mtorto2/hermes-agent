@@ -5,6 +5,7 @@ from __future__ import annotations
 import concurrent.futures
 import os
 import sqlite3
+import subprocess
 import time
 from pathlib import Path
 
@@ -1564,8 +1565,198 @@ def test_worktree_workspace_returns_intended_path(kanban_home, tmp_path):
         )
         task = kb.get_task(conn, t)
         ws = kb.resolve_workspace(task)
-    # We do NOT auto-create worktrees; the worker's skill handles that.
+    # Resolution preserves the intended path; dispatcher preflight decides
+    # whether it is safe to spawn into it.
     assert str(ws) == target
+
+
+def _git(cwd: Path, *args: str) -> str:
+    res = subprocess.run(
+        ["git", *args],
+        cwd=str(cwd),
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    return res.stdout.strip()
+
+
+def _make_repo_with_worktree(tmp_path: Path) -> tuple[Path, Path]:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.email", "kanban-test@example.com")
+    _git(repo, "config", "user.name", "Kanban Test")
+    (repo / "README.md").write_text("seed\n")
+    _git(repo, "add", "README.md")
+    _git(repo, "commit", "-q", "-m", "seed")
+    worktree = tmp_path / ".worktrees" / "task-wt"
+    _git(repo, "worktree", "add", "-q", "-b", "wt/task-wt", str(worktree), "HEAD")
+    return repo, worktree
+
+
+def test_dispatch_blocks_missing_worktree_before_spawn(
+    kanban_home, tmp_path, all_assignees_spawnable
+):
+    missing = tmp_path / ".worktrees" / "missing"
+    spawns: list[str] = []
+
+    def fake_spawn(task, workspace):
+        spawns.append(workspace)
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="missing wt",
+            assignee="alice",
+            workspace_kind="worktree",
+            workspace_path=str(missing),
+            branch_name="wt/missing",
+        )
+        res = kb.dispatch_once(conn, spawn_fn=fake_spawn, failure_limit=1)
+        task = kb.get_task(conn, tid)
+        runs = kb.list_runs(conn, tid)
+
+    assert spawns == []
+    assert res.auto_blocked == [tid]
+    assert task is not None
+    assert task.status == "blocked"
+    assert runs[-1].error is not None
+    assert runs[-1].metadata is not None
+    assert runs[-1].metadata["workspace_preflight"]["result"] == "block"
+    assert "worktree path does not exist" in runs[-1].error
+    assert str(missing) in runs[-1].error
+
+
+def test_dispatch_blocks_main_checkout_when_worktree_requested(
+    kanban_home, tmp_path, all_assignees_spawnable
+):
+    repo, _worktree = _make_repo_with_worktree(tmp_path)
+    spawns: list[str] = []
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="main masquerade",
+            assignee="alice",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+            branch_name=_git(repo, "branch", "--show-current"),
+        )
+        res = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda task, workspace: spawns.append(workspace),
+            failure_limit=1,
+        )
+        task = kb.get_task(conn, tid)
+        run = kb.list_runs(conn, tid)[-1]
+
+    assert spawns == []
+    assert res.auto_blocked == [tid]
+    assert task is not None
+    assert task.status == "blocked"
+    assert run.error is not None
+    assert "workspace=worktree points at a main checkout" in run.error
+
+
+def test_dispatch_blocks_worktree_branch_mismatch_before_spawn(
+    kanban_home, tmp_path, all_assignees_spawnable
+):
+    _repo, worktree = _make_repo_with_worktree(tmp_path)
+    spawns: list[str] = []
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="wrong branch wt",
+            assignee="alice",
+            workspace_kind="worktree",
+            workspace_path=str(worktree),
+            branch_name="wt/expected-other-branch",
+        )
+        res = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda task, workspace: spawns.append(workspace),
+            failure_limit=1,
+        )
+        task = kb.get_task(conn, tid)
+        run = kb.list_runs(conn, tid)[-1]
+
+    assert spawns == []
+    assert res.auto_blocked == [tid]
+    assert task is not None
+    assert task.status == "blocked"
+    assert run.error is not None
+    assert "worktree branch mismatch" in run.error
+    assert "expected wt/expected-other-branch" in run.error
+    assert "found wt/task-wt" in run.error
+    assert run.metadata is not None
+    preflight = run.metadata["workspace_preflight"]
+    assert preflight["result"] == "block"
+    assert preflight["actual"]["branch"] == "wt/task-wt"
+
+
+def test_dispatch_blocks_dirty_worktree_before_spawn(
+    kanban_home, tmp_path, all_assignees_spawnable
+):
+    _repo, worktree = _make_repo_with_worktree(tmp_path)
+    (worktree / "dirty.txt").write_text("uncommitted\n")
+    spawns: list[str] = []
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="dirty wt",
+            assignee="alice",
+            workspace_kind="worktree",
+            workspace_path=str(worktree),
+            branch_name="wt/task-wt",
+        )
+        res = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda task, workspace: spawns.append(workspace),
+            failure_limit=1,
+        )
+        task = kb.get_task(conn, tid)
+        run = kb.list_runs(conn, tid)[-1]
+
+    assert spawns == []
+    assert res.auto_blocked == [tid]
+    assert task is not None
+    assert task.status == "blocked"
+    assert run.error is not None
+    assert "worktree checkout is dirty" in run.error
+    assert run.metadata is not None
+    preflight = run.metadata["workspace_preflight"]
+    assert preflight["result"] == "block"
+    assert preflight["actual"]["dirty"] is True
+
+
+def test_dispatch_records_workspace_preflight_metadata_for_valid_worktree(
+    kanban_home, tmp_path, all_assignees_spawnable
+):
+    _repo, worktree = _make_repo_with_worktree(tmp_path)
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="valid wt",
+            assignee="alice",
+            workspace_kind="worktree",
+            workspace_path=str(worktree),
+            branch_name="wt/task-wt",
+        )
+        res = kb.dispatch_once(conn, spawn_fn=lambda task, workspace: None)
+        run = kb.list_runs(conn, tid)[-1]
+
+    assert res.spawned == [(tid, "alice", str(worktree))]
+    assert run.metadata is not None
+    preflight = run.metadata["workspace_preflight"]
+    assert preflight["result"] == "pass"
+    assert preflight["intended"]["kind"] == "worktree"
+    assert preflight["actual"]["git_toplevel"] == str(worktree)
+    assert preflight["actual"]["branch"] == "wt/task-wt"
+    assert preflight["actual"]["separate_worktree"] is True
 
 
 # ---------------------------------------------------------------------------

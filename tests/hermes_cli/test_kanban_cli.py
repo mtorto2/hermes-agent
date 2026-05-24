@@ -132,16 +132,65 @@ def test_run_slash_create_with_parent_and_cascade(kanban_home):
 def test_run_slash_show_includes_comments(kanban_home):
     out = kc.run_slash("create 'x'")
     import re
-    tid = re.search(r"(t_[a-f0-9]+)", out).group(1)
+    match = re.search(r"(t_[a-f0-9]+)", out)
+    assert match is not None
+    tid = match.group(1)
     kc.run_slash(f"comment {tid} 'remember to include performance section'")
     show = kc.run_slash(f"show {tid}")
     assert "performance section" in show
 
 
+def test_run_slash_show_renders_latest_comments_first(kanban_home):
+    out = kc.run_slash("create 'x'")
+    import re
+    match = re.search(r"(t_[a-f0-9]+)", out)
+    assert match is not None
+    tid = match.group(1)
+    kc.run_slash(f"comment {tid} 'older note'")
+    kc.run_slash(f"comment {tid} 'newer note'")
+
+    show = kc.run_slash(f"show {tid}")
+
+    assert show.index("newer note") < show.index("older note")
+
+
+def test_run_slash_show_includes_workspace_safety_section(kanban_home, tmp_path):
+    target = tmp_path / ".worktrees" / "task"
+    evidence = {
+        "result": "block",
+        "intended": {"kind": "worktree", "path": str(target), "branch": "wt/task"},
+        "actual": {"exists": False, "git_toplevel": None},
+        "blockers": [f"worktree path does not exist: {target}"],
+        "advisories": [],
+        "checked_at": 123,
+    }
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="unsafe wt",
+            assignee="alice",
+            workspace_kind="worktree",
+            workspace_path=str(target),
+            branch_name="wt/task",
+        )
+        kb.claim_task(conn, tid)
+        kb.record_workspace_preflight(conn, tid, evidence)
+
+    show = kc.run_slash(f"show {tid}")
+
+    assert "Workspace safety:" in show
+    assert "result: block" in show
+    assert "intended: worktree" in show
+    assert str(target) in show
+    assert "worktree path does not exist" in show
+
+
 def test_run_slash_comment_max_len_trims_long_body(kanban_home):
     out = kc.run_slash("create 'x'")
     import re
-    tid = re.search(r"(t_[a-f0-9]+)", out).group(1)
+    match = re.search(r"(t_[a-f0-9]+)", out)
+    assert match is not None
+    tid = match.group(1)
     kc.run_slash(f"comment {tid} '{'x' * 30}' --max-len 20")
     show = kc.run_slash(f"show {tid}")
     assert "trimmed to 20 chars by --max-len" in show
@@ -151,7 +200,9 @@ def test_run_slash_comment_max_len_trims_long_body(kanban_home):
 def test_run_slash_block_unblock_cycle(kanban_home):
     out = kc.run_slash("create 'x' --assignee alice")
     import re
-    tid = re.search(r"(t_[a-f0-9]+)", out).group(1)
+    match = re.search(r"(t_[a-f0-9]+)", out)
+    assert match is not None
+    tid = match.group(1)
     # Claim first so block() finds it running
     kc.run_slash(f"claim {tid}")
     assert "Blocked" in kc.run_slash(f"block {tid} 'need decision'")
@@ -176,7 +227,9 @@ def test_run_slash_dispatch_dry_run_counts(kanban_home):
 def test_run_slash_context_output_format(kanban_home):
     out = kc.run_slash("create 'tech spec' --assignee alice --body 'write an RFC'")
     import re
-    tid = re.search(r"(t_[a-f0-9]+)", out).group(1)
+    match = re.search(r"(t_[a-f0-9]+)", out)
+    assert match is not None
+    tid = match.group(1)
     kc.run_slash(f"comment {tid} 'remember to include performance section'")
     ctx = kc.run_slash(f"context {tid}")
     assert "tech spec" in ctx
@@ -244,7 +297,9 @@ def test_run_slash_usage_error_returns_message(kanban_home):
 def test_run_slash_assign_reassigns(kanban_home):
     out = kc.run_slash("create 'x' --assignee alice")
     import re
-    tid = re.search(r"(t_[a-f0-9]+)", out).group(1)
+    match = re.search(r"(t_[a-f0-9]+)", out)
+    assert match is not None
+    tid = match.group(1)
     assert "Assigned" in kc.run_slash(f"assign {tid} bob")
     show = kc.run_slash(f"show {tid}")
     assert "bob" in show

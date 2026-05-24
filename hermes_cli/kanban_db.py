@@ -2099,6 +2099,23 @@ def _end_run(
     if not row or not row["current_run_id"]:
         return None
     run_id = int(row["current_run_id"])
+    existing_meta_row = conn.execute(
+        "SELECT metadata FROM task_runs WHERE id = ?", (run_id,)
+    ).fetchone()
+    existing_metadata: Optional[dict] = None
+    if existing_meta_row and existing_meta_row["metadata"]:
+        try:
+            parsed_meta = json.loads(existing_meta_row["metadata"])
+            if isinstance(parsed_meta, dict):
+                existing_metadata = parsed_meta
+        except Exception:
+            existing_metadata = None
+    effective_metadata = metadata
+    if existing_metadata is not None:
+        if metadata:
+            effective_metadata = {**existing_metadata, **metadata}
+        else:
+            effective_metadata = existing_metadata
     conn.execute(
         """
         UPDATE task_runs
@@ -2119,7 +2136,7 @@ def _end_run(
             outcome,
             summary,
             error,
-            json.dumps(metadata, ensure_ascii=False) if metadata else None,
+            json.dumps(effective_metadata, ensure_ascii=False) if effective_metadata else None,
             now,
             run_id,
         ),
@@ -4031,6 +4048,165 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
     raise ValueError(f"unknown workspace_kind: {kind}")
 
 
+def _git_capture(cwd: Path, *args: str) -> tuple[Optional[str], Optional[str]]:
+    """Run a short git probe and return ``(stdout, error)``.
+
+    Dispatcher preflight must be best-effort and non-interactive: never hang
+    on credential prompts, never leak stderr as an exception traceback, and
+    keep errors as compact evidence for task/run metadata.
+    """
+    try:
+        res = subprocess.run(
+            ["git", "-C", str(cwd), *args],
+            text=True,
+            capture_output=True,
+            timeout=5,
+            check=False,
+            env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+        )
+    except Exception as exc:
+        return None, str(exc)
+    if res.returncode != 0:
+        err = (res.stderr or res.stdout or f"git exited {res.returncode}").strip()
+        return None, err[:500]
+    return res.stdout.strip(), None
+
+
+def collect_workspace_preflight(task: Task, workspace: Path | str) -> dict[str, Any]:
+    """Return dispatcher workspace-safety evidence for a claimed task.
+
+    ``result`` is one of:
+    - ``pass``: no blockers/advisories
+    - ``advisory``: safe to spawn, but noteworthy state exists (e.g. dirty
+      ``dir`` checkout)
+    - ``block``: dispatcher must not spawn the worker
+    """
+    kind = task.workspace_kind or "scratch"
+    p = Path(workspace).expanduser()
+    intended = {
+        "kind": kind,
+        "path": str(p),
+        "branch": task.branch_name,
+    }
+    actual: dict[str, Any] = {
+        "exists": p.exists(),
+        "is_dir": p.is_dir(),
+    }
+    blockers: list[str] = []
+    advisories: list[str] = []
+
+    def probe_git() -> None:
+        top, err = _git_capture(p, "rev-parse", "--show-toplevel")
+        actual["git_toplevel"] = top
+        if err:
+            actual["git_error"] = err
+            return
+        branch, _ = _git_capture(p, "branch", "--show-current")
+        status, _ = _git_capture(p, "status", "--short", "--branch")
+        porcelain, _ = _git_capture(p, "status", "--porcelain")
+        remotes, _ = _git_capture(p, "remote", "-v")
+        worktrees, _ = _git_capture(p, "worktree", "list", "--porcelain")
+        actual["branch"] = branch or None
+        actual["status_short_branch"] = status or ""
+        actual["dirty"] = bool((porcelain or "").strip())
+        actual["remotes"] = remotes or ""
+        actual["worktree_list"] = worktrees or ""
+        actual["git_dir_kind"] = (
+            "file" if (p / ".git").is_file()
+            else "directory" if (p / ".git").is_dir()
+            else "missing"
+        )
+
+    if kind == "worktree":
+        if not p.exists():
+            blockers.append(f"worktree path does not exist: {p}")
+        elif not p.is_dir():
+            blockers.append(f"worktree path is not a directory: {p}")
+        else:
+            probe_git()
+            if actual.get("git_toplevel") is None:
+                blockers.append(f"worktree path is not a git checkout: {p}")
+            else:
+                separate = actual.get("git_dir_kind") == "file"
+                actual["separate_worktree"] = separate
+                if not separate:
+                    blockers.append(
+                        f"workspace=worktree points at a main checkout, not a linked worktree: {p}"
+                    )
+                if task.branch_name and actual.get("branch") != task.branch_name:
+                    blockers.append(
+                        f"worktree branch mismatch: expected {task.branch_name}, "
+                        f"found {actual.get('branch') or '(detached)'}"
+                    )
+                if actual.get("dirty"):
+                    blockers.append(f"worktree checkout is dirty: {p}")
+    elif kind == "dir":
+        if p.exists() and p.is_dir():
+            probe_git()
+            if actual.get("git_toplevel") and actual.get("dirty"):
+                advisories.append(f"dir workspace git checkout is dirty: {p}")
+    result = "block" if blockers else "advisory" if advisories else "pass"
+    return {
+        "result": result,
+        "intended": intended,
+        "actual": actual,
+        "blockers": blockers,
+        "advisories": advisories,
+        "checked_at": int(time.time()),
+    }
+
+
+def record_workspace_preflight(
+    conn: sqlite3.Connection, task_id: str, evidence: dict[str, Any]
+) -> None:
+    """Merge workspace preflight evidence into the active run metadata."""
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT current_run_id FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if not row or row["current_run_id"] is None:
+            return
+        run_id = int(row["current_run_id"])
+        run = conn.execute(
+            "SELECT metadata FROM task_runs WHERE id = ?", (run_id,)
+        ).fetchone()
+        metadata: dict[str, Any] = {}
+        if run and run["metadata"]:
+            try:
+                parsed = json.loads(run["metadata"])
+                if isinstance(parsed, dict):
+                    metadata = parsed
+            except Exception:
+                metadata = {}
+        metadata["workspace_preflight"] = evidence
+        conn.execute(
+            "UPDATE task_runs SET metadata = ? WHERE id = ?",
+            (json.dumps(metadata, ensure_ascii=False), run_id),
+        )
+        _append_event(
+            conn,
+            task_id,
+            "workspace_preflight",
+            {
+                "result": evidence.get("result"),
+                "blockers": evidence.get("blockers") or [],
+                "advisories": evidence.get("advisories") or [],
+            },
+            run_id=run_id,
+        )
+
+
+def _preflight_workspace_for_spawn(
+    conn: sqlite3.Connection, task: Task, workspace: Path | str
+) -> dict[str, Any]:
+    evidence = collect_workspace_preflight(task, workspace)
+    record_workspace_preflight(conn, task.id, evidence)
+    if evidence.get("result") == "block":
+        blockers = evidence.get("blockers") or ["workspace preflight blocked"]
+        raise ValueError("; ".join(str(b) for b in blockers))
+    return evidence
+
+
 def set_workspace_path(
     conn: sqlite3.Connection, task_id: str, path: Path | str
 ) -> None:
@@ -5348,6 +5524,16 @@ def dispatch_once(
                 result.auto_blocked.append(claimed.id)
             continue
         # Persist the resolved workspace path so the worker can cd there.
+        try:
+            _preflight_workspace_for_spawn(conn, claimed, workspace)
+        except Exception as exc:
+            auto = _record_spawn_failure(
+                conn, claimed.id, f"workspace: {exc}",
+                failure_limit=failure_limit,
+            )
+            if auto:
+                result.auto_blocked.append(claimed.id)
+            continue
         set_workspace_path(conn, claimed.id, str(workspace))
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
@@ -5427,6 +5613,16 @@ def dispatch_once(
                 result.auto_blocked.append(claimed.id)
             continue
         # Persist the resolved workspace path so the worker can cd there.
+        try:
+            _preflight_workspace_for_spawn(conn, claimed, workspace)
+        except Exception as exc:
+            auto = _record_spawn_failure(
+                conn, claimed.id, f"workspace: {exc}",
+                failure_limit=failure_limit,
+            )
+            if auto:
+                result.auto_blocked.append(claimed.id)
+            continue
         set_workspace_path(conn, claimed.id, str(workspace))
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
         # Force-load sdlc-review skill for review agents.  The
