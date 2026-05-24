@@ -20,6 +20,7 @@ from abc import ABC, abstractmethod
 from urllib.parse import urlsplit
 
 from utils import normalize_proxy_url
+from agent.light_cues import LightCueService
 
 logger = logging.getLogger(__name__)
 
@@ -1348,6 +1349,7 @@ class BasePlatformAdapter(ABC):
         # Chats where typing indicator is paused (e.g. during approval waits).
         # _keep_typing skips send_typing when the chat_id is in this set.
         self._typing_paused: set = set()
+        self._light_cue_service: LightCueService | None = None
 
     @property
     def message_len_fn(self) -> Callable[[str], int]:
@@ -1357,6 +1359,14 @@ class BasePlatformAdapter(ABC):
         Python ``len`` (e.g. Telegram counts UTF-16 code units).
         """
         return len
+
+    def _get_light_cue_service(self) -> LightCueService:
+        """Return this adapter's shared light cue service."""
+        service = getattr(self, "_light_cue_service", None)
+        if not isinstance(service, LightCueService):
+            service = LightCueService()
+            self._light_cue_service = service
+        return service
 
     def supports_draft_streaming(
         self,

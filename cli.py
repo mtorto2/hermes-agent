@@ -92,6 +92,7 @@ from agent.markdown_tables import (
     looks_like_table_row,
     realign_markdown_tables,
 )
+from agent.light_cues import LightCueEvent, LightCueService, build_light_cue_service_from_config
 # NOTE: `from agent.account_usage import ...` is deliberately NOT at module
 # top — it transitively pulls the OpenAI SDK chain (~230 ms cold) and is only
 # needed when the user runs `/limits`. Lazy-imported inside the handler below.
@@ -10565,6 +10566,7 @@ class HermesCLI:
         response_queue = queue.Queue()
         is_open_ended = not choices
 
+        self._emit_light_cue(LightCueEvent.HUMAN_INTERVENTION)
         self._clarify_state = {
             "question": question,
             "choices": choices if not is_open_ended else [],
@@ -10684,6 +10686,7 @@ class HermesCLI:
             timeout = int(CLI_CONFIG.get("approvals", {}).get("timeout", 60))
             response_queue = queue.Queue()
 
+            self._emit_light_cue(LightCueEvent.HUMAN_INTERVENTION)
             self._approval_state = {
                 "command": command,
                 "description": description,
@@ -10984,6 +10987,21 @@ class HermesCLI:
             except Exception:
                 pass
 
+    def _get_light_cue_service(self) -> LightCueService:
+        """Return the shared light cue service for terminal surfaces."""
+        service = getattr(self, "_light_cue_service", None)
+        if not isinstance(service, LightCueService):
+            service = build_light_cue_service_from_config(getattr(self, "config", {}))
+            self._light_cue_service = service
+        return service
+
+    def _emit_light_cue(self, event: LightCueEvent | str) -> None:
+        """Best-effort terminal light cue emission."""
+        try:
+            self._get_light_cue_service().emit(event)
+        except Exception:
+            logger.debug("Terminal light cue emission failed", exc_info=True)
+
     def chat(self, message, images: list = None) -> Optional[str]:
         """
         Send a message to the agent and get a response.
@@ -11127,6 +11145,7 @@ class HermesCLI:
         try:
             # Run the conversation with interrupt monitoring
             result = None
+            self._emit_light_cue(LightCueEvent.WORKING)
 
             # Reset streaming display state for this turn
             self._reset_stream_state()
@@ -11474,6 +11493,11 @@ class HermesCLI:
                         display_reasoning = reasoning.strip()
                     _cprint(f"\n{r_top}\n{_DIM}{display_reasoning}{_RST}\n{r_bot}")
 
+            if result and (result.get("failed") or result.get("partial")):
+                self._emit_light_cue(LightCueEvent.ERROR)
+            elif response and not _interrupted_this_turn:
+                self._emit_light_cue(LightCueEvent.FINAL_ANSWER)
+
             if response and not response_previewed:
                 # Use skin engine for label/color with fallback
                 try:
@@ -11568,6 +11592,7 @@ class HermesCLI:
             return response
             
         except Exception as e:
+            self._emit_light_cue(LightCueEvent.ERROR)
             print(f"Error: {e}")
             return None
         finally:
