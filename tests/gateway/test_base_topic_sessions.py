@@ -283,13 +283,23 @@ class TestTelegramAutoTtsCaptionDelivery:
         tts_path = tmp_path / "reply.ogg"
         tts_path.write_text("audio", encoding="utf-8")
         event = self._make_voice_event()
+        captured = {}
+
+        def fake_tts(*, text):
+            from gateway.session_context import get_session_env
+
+            captured["platform"] = get_session_env("HERMES_SESSION_PLATFORM")
+            captured["chat_id"] = get_session_env("HERMES_SESSION_CHAT_ID")
+            captured["thread_id"] = get_session_env("HERMES_SESSION_THREAD_ID")
+            return json.dumps({"file_path": str(tts_path)})
 
         with patch("tools.tts_tool.check_tts_requirements", return_value=True), patch(
             "tools.tts_tool.text_to_speech_tool",
-            return_value=json.dumps({"file_path": str(tts_path)}),
+            side_effect=fake_tts,
         ):
             await adapter._process_message_background(event, build_session_key(event.source))
 
+        assert captured == {"platform": "telegram", "chat_id": "-1001", "thread_id": "17585"}
         adapter.play_tts.assert_awaited_once()
         assert adapter.play_tts.await_args.kwargs["caption"] == "Short reply"
         assert adapter.sent == []

@@ -11153,8 +11153,27 @@ class GatewayRunner:
             )
             os.makedirs(os.path.dirname(audio_path), exist_ok=True)
 
+            def _synthesize_voice_reply_with_context():
+                from gateway.session_context import set_session_vars, clear_session_vars
+
+                source = event.source
+                tokens = set_session_vars(
+                    platform=str(getattr(source.platform, "value", source.platform) or ""),
+                    chat_id=source.chat_id,
+                    chat_name=source.chat_name or "",
+                    thread_id=str(source.thread_id) if source.thread_id else "",
+                    user_id=str(source.user_id) if source.user_id else "",
+                    user_name=str(source.user_name) if source.user_name else "",
+                    session_key="",
+                    message_id=str(event.message_id) if event.message_id else "",
+                )
+                try:
+                    return text_to_speech_tool(text=tts_text, output_path=audio_path)
+                finally:
+                    clear_session_vars(tokens)
+
             result_json = await asyncio.to_thread(
-                text_to_speech_tool, text=tts_text, output_path=audio_path
+                _synthesize_voice_reply_with_context
             )
             try:
                 result = json.loads(result_json)

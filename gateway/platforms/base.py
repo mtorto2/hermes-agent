@@ -3213,8 +3213,37 @@ class BasePlatformAdapter(ABC):
                             speech_text = self.prepare_tts_text(text_content)
                             if not speech_text:
                                 raise ValueError("Empty text after markdown cleanup")
+                            def _synthesize_auto_tts_with_context():
+                                # Be explicit about the originating platform while
+                                # running in the worker thread.  The TTS tool uses
+                                # this session context to choose Telegram-compatible
+                                # Opus/OGG output for voice bubbles; without it Edge
+                                # TTS falls back to MP3, which Telegram renders as a
+                                # plain audio attachment with no voice-message speed
+                                # controls.
+                                from gateway.session_context import (
+                                    set_session_vars,
+                                    clear_session_vars,
+                                )
+
+                                source = event.source
+                                tokens = set_session_vars(
+                                    platform=str(getattr(source.platform, "value", source.platform) or ""),
+                                    chat_id=source.chat_id,
+                                    chat_name=source.chat_name or "",
+                                    thread_id=str(source.thread_id) if source.thread_id else "",
+                                    user_id=str(source.user_id) if source.user_id else "",
+                                    user_name=str(source.user_name) if source.user_name else "",
+                                    session_key="",
+                                    message_id=str(event.message_id) if event.message_id else "",
+                                )
+                                try:
+                                    return text_to_speech_tool(text=speech_text)
+                                finally:
+                                    clear_session_vars(tokens)
+
                             tts_result_str = await asyncio.to_thread(
-                                text_to_speech_tool, text=speech_text
+                                _synthesize_auto_tts_with_context
                             )
                             tts_data = _json.loads(tts_result_str)
                             _tts_path = tts_data.get("file_path")
