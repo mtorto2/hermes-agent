@@ -290,6 +290,54 @@ def test_list_rejects_bad_include_archived(monkeypatch, worker_env):
     assert "include_archived must be" in json.loads(out).get("error", "")
 
 
+def test_complete_captures_active_agent_usage(worker_env):
+    from types import SimpleNamespace
+
+    from model_tools import handle_function_call
+
+    agent = SimpleNamespace(
+        provider="openrouter",
+        model="anthropic/claude-sonnet-4",
+        session_input_tokens=10,
+        session_output_tokens=5,
+        session_cache_read_tokens=2,
+        session_cache_write_tokens=1,
+        session_reasoning_tokens=3,
+        session_prompt_tokens=13,
+        session_completion_tokens=5,
+        session_total_tokens=18,
+        session_api_calls=2,
+        session_estimated_cost_usd=0.0123,
+        session_cost_status="estimated",
+        session_cost_source="pricing_table",
+    )
+
+    out = handle_function_call(
+        "kanban_complete",
+        {"summary": "usage captured", "metadata": {"manual": True}},
+        agent=agent,
+    )
+    assert json.loads(out)["ok"] is True
+
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        run = kb.latest_run(conn, worker_env)
+        usage = run.metadata["run_usage"]
+        assert usage["provider"] == "openrouter"
+        assert usage["model"] == "anthropic/claude-sonnet-4"
+        assert usage["input_tokens"] == 10
+        assert usage["output_tokens"] == 5
+        assert usage["cache_read_tokens"] == 2
+        assert usage["cache_write_tokens"] == 1
+        assert usage["reasoning_tokens"] == 3
+        assert usage["request_count"] == 2
+        assert usage["estimated_cost_usd"] == 0.0123
+        assert run.metadata["manual"] is True
+    finally:
+        conn.close()
+
+
 def test_complete_happy_path(worker_env):
     from tools import kanban_tools as kt
     out = kt._handle_complete({

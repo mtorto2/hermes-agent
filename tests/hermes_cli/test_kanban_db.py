@@ -202,6 +202,85 @@ def test_create_task_persists_worktree_branch_name(kanban_home, tmp_path):
     assert "Branch:   wt/t6-wire" in context
 
 
+def test_complete_task_normalizes_run_usage_and_writes_ledger(kanban_home, monkeypatch):
+    """Completed runs should persist dashboard-ready usage metadata and a JSONL receipt."""
+    import json
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="measure me", assignee="worker")
+        kb.claim_task(conn, tid)
+        run = kb.active_run(conn, tid)
+        conn.execute("UPDATE task_runs SET started_at = ? WHERE id = ?", (100, run.id))
+        conn.commit()
+
+        monkeypatch.setattr(kb.time, "time", lambda: 130)
+        assert kb.complete_task(
+            conn,
+            tid,
+            summary="done",
+            metadata={
+                "kept": "yes",
+                "run_usage": {
+                    "provider": "openrouter",
+                    "model": "anthropic/claude-sonnet-4",
+                    "prompt_tokens": "10",
+                    "completion_tokens": 5,
+                    "estimated_cost_usd": "0.0123",
+                    "cost_status": "estimated",
+                    "cost_source": "pricing_table",
+                },
+            },
+        )
+        completed = kb.latest_run(conn, tid)
+
+    assert completed.metadata["kept"] == "yes"
+    usage = completed.metadata["run_usage"]
+    assert usage["provider"] == "openrouter"
+    assert usage["model"] == "anthropic/claude-sonnet-4"
+    assert usage["runtime_seconds"] == 30
+    assert usage["runtime_status"] == "ok"
+    assert usage["prompt_tokens"] == 10
+    assert usage["completion_tokens"] == 5
+    assert usage["total_tokens"] == 15
+    assert usage["estimated_cost_usd"] == 0.0123
+    assert usage["cost_status"] == "estimated"
+    assert usage["cost_source"] == "pricing_table"
+
+    ledger = kb.worker_logs_dir() / "run_usage.jsonl"
+    assert ledger.exists()
+    line = ledger.read_text().strip().splitlines()[-1]
+    receipt = json.loads(line)
+    assert receipt["task_id"] == tid
+    assert receipt["run_id"] == completed.id
+    assert receipt["run_usage"]["total_tokens"] == 15
+
+
+def test_format_run_usage_summary_for_cli_surfaces():
+    from hermes_cli import kanban
+
+    text = kanban._format_run_usage_summary({
+        "provider": "openrouter",
+        "model": "anthropic/claude-sonnet-4",
+        "runtime_seconds": 30,
+        "prompt_tokens": 10,
+        "completion_tokens": 5,
+        "cache_read_tokens": 2,
+        "cache_write_tokens": 1,
+        "total_tokens": 18,
+        "estimated_cost_usd": 0.0123,
+        "cost_status": "estimated",
+    })
+
+    assert "openrouter" in text
+    assert "anthropic/claude-sonnet-4" in text
+    assert "30s" in text
+    assert "tokens 18" in text
+    assert "in 10" in text
+    assert "out 5" in text
+    assert "cache r/w 2/1" in text
+    assert "$0.0123 estimated" in text
+
+
 def test_branch_name_requires_worktree_workspace(kanban_home):
     with kb.connect() as conn, pytest.raises(ValueError, match="worktree"):
         kb.create_task(

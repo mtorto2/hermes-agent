@@ -115,17 +115,85 @@ def _worker_run_id(task_id: str) -> Optional[int]:
         return None
 
 
+def _int_usage_attr(agent: Any, name: str) -> int:
+    try:
+        return max(0, int(getattr(agent, name, 0) or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _float_usage_attr(agent: Any, name: str) -> Optional[float]:
+    value = getattr(agent, name, None)
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _agent_run_usage(agent: Any) -> dict[str, Any]:
+    """Extract best-effort run_usage from the live agent object."""
+    if agent is None:
+        return {}
+    usage: dict[str, Any] = {}
+    for field in ("provider", "model"):
+        value = getattr(agent, field, None)
+        if value:
+            usage[field] = str(value)
+    input_tokens = _int_usage_attr(agent, "session_input_tokens")
+    output_tokens = _int_usage_attr(agent, "session_output_tokens")
+    cache_read = _int_usage_attr(agent, "session_cache_read_tokens")
+    cache_write = _int_usage_attr(agent, "session_cache_write_tokens")
+    reasoning = _int_usage_attr(agent, "session_reasoning_tokens")
+    prompt_tokens = _int_usage_attr(agent, "session_prompt_tokens") or input_tokens + cache_read + cache_write
+    completion_tokens = _int_usage_attr(agent, "session_completion_tokens") or output_tokens
+    total_tokens = _int_usage_attr(agent, "session_total_tokens") or prompt_tokens + completion_tokens
+    request_count = _int_usage_attr(agent, "session_api_calls")
+    if any([input_tokens, output_tokens, cache_read, cache_write, reasoning, prompt_tokens, completion_tokens, total_tokens]):
+        usage.update({
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "cache_read_tokens": cache_read,
+            "cache_write_tokens": cache_write,
+            "reasoning_tokens": reasoning,
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_tokens,
+        })
+    if request_count:
+        usage["request_count"] = request_count
+    cost = _float_usage_attr(agent, "session_estimated_cost_usd")
+    if cost is not None:
+        usage["estimated_cost_usd"] = cost
+    for src, dst in (
+        ("session_cost_status", "cost_status"),
+        ("session_cost_source", "cost_source"),
+    ):
+        value = getattr(agent, src, None)
+        if value:
+            usage[dst] = str(value)
+    return usage
+
+
 def _stamp_worker_session_metadata(
-    task_id: str, metadata: Optional[dict]
+    task_id: str, metadata: Optional[dict], *, agent: Any = None
 ) -> Optional[dict]:
-    """Add trusted worker session id metadata for this worker's own task."""
+    """Add trusted worker session/usage metadata for this worker's own task."""
     if os.environ.get("HERMES_KANBAN_TASK") != task_id:
         return metadata
     session_id = os.environ.get("HERMES_SESSION_ID")
-    if not session_id:
+    usage = _agent_run_usage(agent)
+    if not session_id and not usage:
         return metadata
     stamped = dict(metadata or {})
-    stamped["worker_session_id"] = session_id
+    if session_id:
+        stamped["worker_session_id"] = session_id
+    if usage:
+        existing = stamped.get("run_usage")
+        merged = dict(existing) if isinstance(existing, dict) else {}
+        merged.update(usage)
+        stamped["run_usage"] = merged
     return stamped
 
 
@@ -464,7 +532,7 @@ def _handle_complete(args: dict, **kw) -> str:
         return tool_error(
             f"metadata must be an object/dict, got {type(metadata).__name__}"
         )
-    metadata = _stamp_worker_session_metadata(tid, metadata)
+    metadata = _stamp_worker_session_metadata(tid, metadata, agent=kw.get("agent"))
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)

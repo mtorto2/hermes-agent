@@ -56,6 +56,67 @@ def _fmt_task_line(t: kb.Task) -> str:
     return f"{icon} {t.id}  {t.status:8s}  {assignee:20s}{tenant}  {t.title}"
 
 
+def _format_duration(seconds: Any) -> str:
+    try:
+        sec = max(0, int(seconds))
+    except (TypeError, ValueError):
+        return "n/a"
+    if sec < 60:
+        return f"{sec}s"
+    if sec < 3600:
+        return f"{sec // 60}m{sec % 60:02d}s"
+    return f"{sec / 3600:.1f}h"
+
+
+def _format_cost(value: Any, status: Any = None) -> str:
+    try:
+        amount = float(value)
+    except (TypeError, ValueError):
+        return "cost n/a"
+    text = f"${amount:.4f}"
+    if status:
+        text += f" {status}"
+    return text
+
+
+def _format_run_usage_summary(usage: Any) -> str:
+    """Compact one-line run_usage formatter for CLI run surfaces."""
+    if not isinstance(usage, dict) or not usage:
+        return ""
+    bits: list[str] = []
+    provider = usage.get("provider")
+    model = usage.get("model")
+    if provider or model:
+        bits.append("/".join(str(x) for x in (provider, model) if x))
+    runtime = usage.get("runtime_seconds")
+    if runtime is not None:
+        bits.append(_format_duration(runtime))
+    total = usage.get("total_tokens")
+    token_parts: list[str] = []
+    if total is not None:
+        token_parts.append(f"tokens {total}")
+    if usage.get("prompt_tokens") is not None:
+        token_parts.append(f"in {usage.get('prompt_tokens')}")
+    if usage.get("completion_tokens") is not None:
+        token_parts.append(f"out {usage.get('completion_tokens')}")
+    cache_read = usage.get("cache_read_tokens")
+    cache_write = usage.get("cache_write_tokens")
+    if cache_read or cache_write:
+        token_parts.append(f"cache r/w {cache_read or 0}/{cache_write or 0}")
+    if token_parts:
+        bits.append(", ".join(token_parts))
+    if usage.get("estimated_cost_usd") is not None:
+        bits.append(_format_cost(usage.get("estimated_cost_usd"), usage.get("cost_status")))
+    return " | ".join(bits)
+
+
+def _run_usage_from_metadata(metadata: Any) -> dict[str, Any]:
+    if not isinstance(metadata, dict):
+        return {}
+    usage = metadata.get("run_usage")
+    return usage if isinstance(usage, dict) else {}
+
+
 def _task_to_dict(t: kb.Task) -> dict[str, Any]:
     return {
         "id": t.id,
@@ -1569,6 +1630,9 @@ def _cmd_show(args: argparse.Namespace) -> int:
                   f"{_fmt_ts(r.started_at)}")
             if r.summary:
                 print(f"        → {r.summary.splitlines()[0][:160]}")
+            usage_summary = _format_run_usage_summary(_run_usage_from_metadata(r.metadata))
+            if usage_summary:
+                print(f"        usage: {usage_summary}")
             if r.error:
                 print(f"        ! {r.error.splitlines()[0][:160]}")
     return 0
@@ -2365,6 +2429,9 @@ def _cmd_runs(args: argparse.Namespace) -> int:
             # Indent and truncate long summaries to keep the table readable.
             summary = r.summary.splitlines()[0][:100]
             print(f"     → {summary}")
+        usage_summary = _format_run_usage_summary(_run_usage_from_metadata(r.metadata))
+        if usage_summary:
+            print(f"     usage: {usage_summary}")
         if r.error:
             print(f"     ✖ {r.error[:100]}")
     return 0

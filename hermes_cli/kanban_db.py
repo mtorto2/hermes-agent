@@ -2004,6 +2004,151 @@ def _current_run_id(conn: sqlite3.Connection, task_id: str) -> Optional[int]:
     return int(row["current_run_id"]) if row and row["current_run_id"] else None
 
 
+def _int_or_none(value: Any) -> Optional[int]:
+    if value is None or value == "":
+        return None
+    try:
+        iv = int(value)
+    except (TypeError, ValueError):
+        return None
+    return iv if iv >= 0 else None
+
+
+def _float_or_none(value: Any) -> Optional[float]:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalize_run_usage(
+    raw: Optional[dict],
+    *,
+    started_at: Optional[int],
+    ended_at: Optional[int],
+) -> dict[str, Any]:
+    """Return compact, dashboard-ready usage metadata for a closed run."""
+    usage: dict[str, Any] = dict(raw) if isinstance(raw, dict) else {}
+
+    # Canonical runtime is the task_runs timestamp delta. Worker-supplied
+    # runtime hints may remain in other metadata fields, but run_usage uses
+    # the DB row as source of truth.
+    runtime_status = "not_available"
+    runtime_seconds: Optional[int] = None
+    if started_at is not None and ended_at is not None:
+        runtime_seconds = max(0, int(ended_at) - int(started_at))
+        runtime_status = "ok"
+    usage["runtime_seconds"] = runtime_seconds
+    usage["runtime_status"] = runtime_status
+
+    # Normalize token aliases while preserving the compact prompt/completion
+    # fields expected by OpenAI-style surfaces and the richer canonical fields
+    # used by Hermes accounting.
+    input_tokens = _int_or_none(usage.get("input_tokens"))
+    output_tokens = _int_or_none(usage.get("output_tokens"))
+    prompt_tokens = _int_or_none(usage.get("prompt_tokens"))
+    completion_tokens = _int_or_none(usage.get("completion_tokens"))
+    cache_read = _int_or_none(usage.get("cache_read_tokens")) or 0
+    cache_write = _int_or_none(usage.get("cache_write_tokens")) or 0
+    reasoning = _int_or_none(usage.get("reasoning_tokens"))
+    request_count = _int_or_none(usage.get("request_count"))
+
+    if input_tokens is None and prompt_tokens is not None:
+        input_tokens = max(0, prompt_tokens - cache_read - cache_write)
+    if output_tokens is None and completion_tokens is not None:
+        output_tokens = completion_tokens
+    if prompt_tokens is None:
+        prompt_tokens = (input_tokens or 0) + cache_read + cache_write
+    if completion_tokens is None and output_tokens is not None:
+        completion_tokens = output_tokens
+
+    token_values = [prompt_tokens, completion_tokens, cache_read, cache_write]
+    total_tokens = _int_or_none(usage.get("total_tokens"))
+    if total_tokens is None and any(v is not None and v > 0 for v in token_values):
+        total_tokens = (prompt_tokens or 0) + (completion_tokens or 0)
+
+    for key, val in (
+        ("input_tokens", input_tokens),
+        ("output_tokens", output_tokens),
+        ("prompt_tokens", prompt_tokens),
+        ("completion_tokens", completion_tokens),
+        ("cache_read_tokens", cache_read),
+        ("cache_write_tokens", cache_write),
+        ("reasoning_tokens", reasoning),
+        ("request_count", request_count),
+        ("total_tokens", total_tokens),
+    ):
+        if val is not None:
+            usage[key] = val
+
+    cost = _float_or_none(usage.get("estimated_cost_usd"))
+    if cost is not None:
+        usage["estimated_cost_usd"] = cost
+    if "cost_status" not in usage or usage.get("cost_status") in (None, ""):
+        usage["cost_status"] = "not_available"
+    if "cost_source" not in usage or usage.get("cost_source") in (None, ""):
+        usage["cost_source"] = "not_available"
+    return usage
+
+
+def _completion_metadata_with_run_usage(
+    conn: sqlite3.Connection,
+    task_id: str,
+    metadata: Optional[dict],
+    *,
+    ended_at: int,
+) -> dict:
+    out: dict[str, Any] = dict(metadata) if isinstance(metadata, dict) else {}
+    row = conn.execute(
+        """
+        SELECT tr.started_at
+          FROM tasks t
+          LEFT JOIN task_runs tr ON tr.id = t.current_run_id
+         WHERE t.id = ?
+        """,
+        (task_id,),
+    ).fetchone()
+    started_at = int(row["started_at"]) if row and row["started_at"] is not None else ended_at
+    existing = out.get("run_usage")
+    if isinstance(existing, dict):
+        out["run_usage"] = _normalize_run_usage(
+            existing,
+            started_at=started_at,
+            ended_at=ended_at,
+        )
+    return out
+
+
+def _append_run_usage_ledger(conn: sqlite3.Connection, run_id: Optional[int]) -> None:
+    if not run_id:
+        return
+    try:
+        run = get_run(conn, run_id)
+        if not run or not isinstance(run.metadata, dict):
+            return
+        usage = run.metadata.get("run_usage")
+        if not isinstance(usage, dict):
+            return
+        path = worker_logs_dir() / "run_usage.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        receipt = {
+            "task_id": run.task_id,
+            "run_id": run.id,
+            "profile": run.profile,
+            "status": run.status,
+            "outcome": run.outcome,
+            "started_at": run.started_at,
+            "ended_at": run.ended_at,
+            "run_usage": usage,
+        }
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(receipt, ensure_ascii=False, sort_keys=True) + "\n")
+    except Exception as exc:
+        _log.warning("failed to append kanban run usage ledger receipt: %s", exc)
+
+
 def _synthesize_ended_run(
     conn: sqlite3.Connection,
     task_id: str,
@@ -2823,6 +2968,12 @@ def complete_task(
             )
         if cur.rowcount != 1:
             return False
+        metadata = _completion_metadata_with_run_usage(
+            conn,
+            task_id,
+            metadata,
+            ended_at=now,
+        )
         run_id = _end_run(
             conn, task_id,
             outcome="completed", status="done",
@@ -2897,6 +3048,7 @@ def complete_task(
     # just tracks "is there a current pathology the breaker should
     # care about", and a success resets that question.
     _clear_failure_counter(conn, task_id)
+    _append_run_usage_ledger(conn, run_id)
     # Recompute ready status for dependents (separate txn so children see done).
     recompute_ready(conn)
     # Clean up the scratch workspace and any stale tmux session for the worker.
