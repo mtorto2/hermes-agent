@@ -86,6 +86,7 @@ from gateway.platforms.telegram_network import (
     discover_fallback_ips,
     parse_fallback_ip_env,
 )
+from gateway.wiz_light import WiZNotificationLightConfig, set_wiz_notification_light
 from utils import atomic_replace
 
 _TELEGRAM_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
@@ -435,6 +436,14 @@ class TelegramAdapter(BasePlatformAdapter):
         self._forum_command_registered: set[int] = set()
         # Lock per la registrazione sicura dei comandi nei forum supergroup
         self._forum_lock = asyncio.Lock()
+        _notification_light_cfg = (
+            self.config.extra.get("notification_light")
+            or self.config.extra.get("wiz_notification_light")
+            or {}
+        )
+        self._notification_light_config = WiZNotificationLightConfig.from_mapping(
+            _notification_light_cfg
+        )
         # DM Topics config from extra.dm_topics
         self._dm_topics_config: List[Dict[str, Any]] = self.config.extra.get("dm_topics", [])
         # Precomputed chat_ids that have DM topics configured (for O(1) root-DM ignore check)
@@ -4759,6 +4768,7 @@ class TelegramAdapter(BasePlatformAdapter):
         await self._ensure_forum_commands(update.message)
 
         event = self._build_message_event(msg, MessageType.TEXT, update_id=update.update_id)
+        await self._set_notification_light(event, "default")
         event.text = self._clean_bot_trigger_text(event.text)
         event = self._apply_telegram_group_observe_attribution(event)
         self._enqueue_text_event(event)
@@ -4773,6 +4783,7 @@ class TelegramAdapter(BasePlatformAdapter):
         await self._ensure_forum_commands(msg)
 
         event = self._build_message_event(msg, MessageType.COMMAND, update_id=update.update_id)
+        await self._set_notification_light(event, "default")
         event.text = self._clean_bot_trigger_text(event.text)
         event = self._apply_telegram_group_observe_attribution(event)
         await self.handle_message(event)
@@ -4813,6 +4824,7 @@ class TelegramAdapter(BasePlatformAdapter):
         parts.append("Ask what they'd like to find nearby (restaurants, cafes, etc.) and any preferences.")
 
         event = self._build_message_event(msg, MessageType.LOCATION, update_id=update.update_id)
+        await self._set_notification_light(event, "default")
         event.text = "\n".join(parts)
         event = self._apply_telegram_group_observe_attribution(event)
         await self.handle_message(event)
@@ -4995,6 +5007,7 @@ class TelegramAdapter(BasePlatformAdapter):
             msg_type = MessageType.DOCUMENT
         
         event = self._build_message_event(msg, msg_type, update_id=update.update_id)
+        await self._set_notification_light(event, "default")
         
         # Add caption as text
         if msg.caption:
@@ -5618,8 +5631,26 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.debug("[%s] clear reactions failed: %s", self.name, e)
             return False
 
+    async def _set_notification_light(self, event: MessageEvent, mode: str) -> None:
+        """Best-effort WiZ notification-light update for Matt's Telegram DM."""
+        config = getattr(self, "_notification_light_config", None)
+        if not isinstance(config, WiZNotificationLightConfig):
+            return
+        chat_id = getattr(event.source, "chat_id", None)
+        if not config.applies_to_chat(chat_id):
+            return
+        try:
+            await asyncio.to_thread(set_wiz_notification_light, config, mode)
+        except Exception as exc:
+            # The light is a convenience notifier. Never let LAN/UDP failures
+            # interfere with message processing or delivery.
+            logger.debug("[%s] WiZ notification light update failed: %s", self.name, exc)
+
     async def on_processing_start(self, event: MessageEvent) -> None:
         """Add an in-progress reaction when message processing begins."""
+        # WiZ reset happens immediately on inbound Telegram updates instead of
+        # processing start so the light does not change during internal agent
+        # progress/tool activity.
         if not self._reactions_enabled():
             return
         chat_id = getattr(event.source, "chat_id", None)
@@ -5640,10 +5671,14 @@ class TelegramAdapter(BasePlatformAdapter):
         another agent run to swap it to 👍/👎 — which never happens if the
         cancellation was the last activity in the chat.
         """
-        if not self._reactions_enabled():
-            return
+        await self._set_notification_light(
+            event,
+            "ready" if outcome == ProcessingOutcome.SUCCESS else "default",
+        )
         chat_id = getattr(event.source, "chat_id", None)
         message_id = getattr(event, "message_id", None)
+        if not self._reactions_enabled():
+            return
         if not (chat_id and message_id):
             return
         if outcome == ProcessingOutcome.CANCELLED:

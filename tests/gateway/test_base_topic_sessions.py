@@ -303,6 +303,10 @@ class TestTelegramAutoTtsCaptionDelivery:
         adapter.play_tts.assert_awaited_once()
         assert adapter.play_tts.await_args.kwargs["caption"] == "Short reply"
         assert adapter.sent == []
+        assert adapter.processing_hooks == [
+            ("start", "voice-1"),
+            ("complete", "voice-1", ProcessingOutcome.SUCCESS),
+        ]
 
     @pytest.mark.asyncio
     async def test_long_telegram_auto_tts_keeps_followup_text_when_caption_would_truncate(self, tmp_path):
