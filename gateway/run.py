@@ -9501,10 +9501,78 @@ class GatewayRunner:
                 except Exception as exc:
                     logger.warning("kanban create auto-subscribe failed: %s", exc)
 
+        def _is_status_audio_request(raw_tokens: list[str]) -> bool:
+            if "--json" in raw_tokens:
+                return False
+            idx = 0
+            while idx < len(raw_tokens):
+                tok = raw_tokens[idx]
+                if tok == "--board":
+                    idx += 2
+                    continue
+                if tok.startswith("--board="):
+                    idx += 1
+                    continue
+                break
+            if idx + 1 >= len(raw_tokens):
+                return False
+            if raw_tokens[idx] not in {"boards", "board"}:
+                return False
+            if raw_tokens[idx + 1] != "status":
+                return False
+            return "audio" in raw_tokens[idx + 2:]
+
+        wants_status_audio = _is_status_audio_request(tokens)
+        if wants_status_audio and output.startswith("Kanban morning report."):
+            try:
+                from tools.tts_tool import check_tts_requirements, text_to_speech_tool
+                if check_tts_requirements():
+                    import json as _json
+                    from gateway.session_context import clear_session_vars, set_session_vars
+
+                    def _synthesize_kanban_status_audio():
+                        source = event.source
+                        tokens_ctx = set_session_vars(
+                            platform=str(getattr(source.platform, "value", source.platform) or ""),
+                            chat_id=source.chat_id,
+                            chat_name=source.chat_name or "",
+                            thread_id=str(source.thread_id) if source.thread_id else "",
+                            user_id=str(source.user_id) if source.user_id else "",
+                            user_name=str(source.user_name) if source.user_name else "",
+                            session_key="",
+                            message_id=str(event.message_id) if event.message_id else "",
+                        )
+                        try:
+                            return text_to_speech_tool(text=output)
+                        finally:
+                            clear_session_vars(tokens_ctx)
+
+                    tts_result_str = await asyncio.to_thread(_synthesize_kanban_status_audio)
+                    tts_data = _json.loads(tts_result_str)
+                    audio_path = tts_data.get("file_path")
+                    if audio_path:
+                        output = output.rstrip() + f"\n\n[[audio_as_voice]]\nMEDIA:{audio_path}"
+            except Exception as exc:
+                logger.warning("kanban boards status audio TTS failed: %s", exc)
+
         # Gateway messages have practical length caps; truncate long
-        # listings to keep the UX reasonable.
+        # listings to keep the UX reasonable. If we appended a native media
+        # directive, preserve it at the end so truncation does not corrupt
+        # delivery of generated audio.
         if len(output) > 3800:
-            output = output[:3800] + "\n" + t("gateway.kanban.truncated_suffix")
+            media_marker = "\n\n[[audio_as_voice]]\nMEDIA:"
+            marker_start = output.find(media_marker)
+            if marker_start != -1:
+                text_part = output[:marker_start].rstrip()
+                media_part = output[marker_start:]
+                suffix = "\n" + t("gateway.kanban.truncated_suffix")
+                budget = 3800 - len(media_part) - len(suffix)
+                if budget > 0:
+                    output = text_part[:budget].rstrip() + suffix + media_part
+                else:
+                    output = media_part[-3800:]
+            else:
+                output = output[:3800] + "\n" + t("gateway.kanban.truncated_suffix")
         return output or t("gateway.kanban.no_output")
 
     async def _handle_status_command(self, event: MessageEvent) -> str:

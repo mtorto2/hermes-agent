@@ -90,6 +90,69 @@ def test_run_slash_create_and_list(kanban_home):
     assert "alice" in out
 
 
+def test_run_slash_boards_status_summarizes_all_boards(kanban_home):
+    kc.run_slash("boards create alpha --name Alpha")
+    kc.run_slash("boards create beta --name Beta")
+    with kb.connect(board="alpha") as conn:
+        ready_id = kb.create_task(conn, title="alpha ready item", initial_status="running")
+        kb.create_task(conn, title="alpha blocked item", initial_status="blocked")
+        conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (ready_id,))
+    with kb.connect(board="beta") as conn:
+        running_id = kb.create_task(conn, title="beta running item", assignee="worker", initial_status="running")
+        conn.execute("UPDATE tasks SET status = 'running' WHERE id = ?", (running_id,))
+
+    out = kc.run_slash("boards status")
+
+    assert "Global Kanban status" in out
+    assert "Boards: 3 total" in out
+    assert "Running: 1" in out
+    assert "Ready: 1" in out
+    assert "Blocked: 1" in out
+    assert "alpha:" in out
+    assert "ready=1" in out
+    assert "blocked=1" in out
+    assert "ready: alpha ready item (unassigned)" in out
+    assert "beta:" in out
+    assert "running: beta running item (worker)" in out
+    assert "default:" in out
+    assert "empty" in out
+
+
+def test_run_slash_boards_status_audio_renders_spoken_morning_report(kanban_home):
+    kc.run_slash("boards create alpha --name Alpha")
+    with kb.connect(board="alpha") as conn:
+        ready_id = kb.create_task(conn, title="approve alpha launch", initial_status="running")
+        blocked_id = kb.create_task(conn, title="decide alpha packaging", initial_status="blocked")
+        conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (ready_id,))
+        conn.execute("UPDATE tasks SET status = 'blocked' WHERE id = ?", (blocked_id,))
+
+    out = kc.run_slash("boards status audio")
+
+    assert "Kanban morning report." in out
+    assert "Across 2 boards" in out
+    assert "1 ready" in out
+    assert "1 blocked" in out
+    assert "On alpha" in out
+    assert "ready for a decision: approve alpha launch" in out
+    assert "blocked: decide alpha packaging" in out
+    assert "MEDIA:" not in out
+
+
+def test_run_slash_board_status_audio_matches_boards_alias(kanban_home):
+    kc.run_slash("boards create alpha --name Alpha")
+    with kb.connect(board="alpha") as conn:
+        ready_id = kb.create_task(conn, title="approve alpha launch", initial_status="running")
+        conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (ready_id,))
+
+    out = kc.run_slash("board status audio")
+
+    assert "Kanban morning report." in out
+    assert "Across 2 boards" in out
+    assert "1 ready" in out
+    assert "On alpha" in out
+    assert "ready for a decision: approve alpha launch" in out
+
+
 def test_run_slash_create_worktree_path_and_branch(kanban_home, tmp_path):
     target = tmp_path / ".worktrees" / "t6-wire"
     target_arg = target.as_posix()

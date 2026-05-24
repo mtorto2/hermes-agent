@@ -400,6 +400,41 @@ def _status_update(sid: str, kind: str, text: str | None = None):
     )
 
 
+def _get_tui_light_cue_service(session: dict | None):
+    """Return the shared light cue service for a TUI session.
+
+    TUI runs through ``tui_gateway`` instead of ``cli.py``, so classic CLI's
+    terminal light-cue hooks are not available here.  Keep this helper lazy and
+    best-effort: light cues are a convenience notifier and must never break the
+    JSON-RPC bridge or prompt execution.
+    """
+    if session is None:
+        session = {}
+    try:
+        from agent.light_cues import LightCueService, build_light_cue_service_from_config
+
+        service = session.get("_light_cue_service")
+        if not isinstance(service, LightCueService):
+            service = build_light_cue_service_from_config(_load_cfg())
+            session["_light_cue_service"] = service
+        return service
+    except Exception:
+        logger.debug("TUI light cue service unavailable", exc_info=True)
+        return None
+
+
+def _emit_tui_light_cue(sid: str, event: Any) -> bool:
+    """Best-effort TUI prompt lifecycle light cue emission."""
+    try:
+        service = _get_tui_light_cue_service(_sessions.get(sid))
+        if service is None:
+            return False
+        return bool(service.emit(event))
+    except Exception:
+        logger.debug("TUI light cue emission failed", exc_info=True)
+        return False
+
+
 def _estimate_image_tokens(width: int, height: int) -> int:
     """Very rough UI estimate for image prompt cost.
 
@@ -573,9 +608,16 @@ def _start_agent_build(sid: str, session: dict) -> None:
                     load_permanent_allowlist,
                 )
 
-                register_gateway_notify(
-                    key, lambda data: _emit("approval.request", sid, data)
-                )
+                def _approval_request(data):
+                    try:
+                        from agent.light_cues import LightCueEvent
+
+                        _emit_tui_light_cue(sid, LightCueEvent.HUMAN_INTERVENTION)
+                    except Exception:
+                        pass
+                    _emit("approval.request", sid, data)
+
+                register_gateway_notify(key, _approval_request)
                 notify_registered = True
                 load_permanent_allowlist()
             except Exception:
@@ -733,6 +775,16 @@ def _block(event: str, sid: str, payload: dict, timeout: int = 300) -> str:
     ev.wait(timeout=timeout)
     _pending.pop(rid, None)
     return _answers.pop(rid, "")
+
+
+def _block_with_light_cue(event: str, sid: str, payload: dict, timeout: int = 300) -> str:
+    try:
+        from agent.light_cues import LightCueEvent
+
+        _emit_tui_light_cue(sid, LightCueEvent.HUMAN_INTERVENTION)
+    except Exception:
+        pass
+    return _block(event, sid, payload, timeout=timeout)
 
 
 def _clear_pending(sid: str | None = None) -> None:
@@ -1783,7 +1835,7 @@ def _agent_cbs(sid: str) -> dict:
         "status_callback": lambda kind, text=None: _status_update(
             sid, str(kind), None if text is None else str(text)
         ),
-        "clarify_callback": lambda q, c: _block(
+        "clarify_callback": lambda q, c: _block_with_light_cue(
             "clarify.request", sid, {"question": q, "choices": c}
         ),
     }
@@ -1793,13 +1845,13 @@ def _wire_callbacks(sid: str):
     from tools.terminal_tool import set_sudo_password_callback
     from tools.skills_tool import set_secret_capture_callback
 
-    set_sudo_password_callback(lambda: _block("sudo.request", sid, {}, timeout=120))
+    set_sudo_password_callback(lambda: _block_with_light_cue("sudo.request", sid, {}, timeout=120))
 
     def secret_cb(env_var, prompt, metadata=None):
         pl = {"prompt": prompt, "env_var": env_var}
         if metadata:
             pl["metadata"] = metadata
-        val = _block("secret.request", sid, pl)
+        val = _block_with_light_cue("secret.request", sid, pl)
         if not val:
             return {
                 "success": True,
@@ -3293,6 +3345,7 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                 set_current_session_key,
             )
 
+            _emit_tui_light_cue(sid, "working")
             approval_token = set_current_session_key(session["session_key"])
             session_tokens = _set_session_context(session["session_key"])
             cols = session.get("cols", 80)
@@ -3319,6 +3372,7 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                     context_length=ctx_len,
                 )
                 if ctx.blocked:
+                    _emit_tui_light_cue(sid, "error")
                     _emit(
                         "error",
                         sid,
@@ -3439,10 +3493,13 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                 )
 
                 raw = result.get("final_response", "")
+                is_error_result = bool(
+                    result.get("error") or result.get("failed") or result.get("partial")
+                )
                 status = (
                     "interrupted"
                     if result.get("interrupted")
-                    else "error" if result.get("error") else "complete"
+                    else "error" if is_error_result else "complete"
                 )
                 # When the backend produced no visible response AND reported a
                 # real error (e.g. invalid model slug → provider 4xx), surface
@@ -3472,6 +3529,10 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
             if rendered:
                 payload["rendered"] = rendered
             _emit("message.complete", sid, payload)
+            if status == "error":
+                _emit_tui_light_cue(sid, "error")
+            elif status == "complete" and isinstance(raw, str) and raw.strip():
+                _emit_tui_light_cue(sid, "final_answer")
 
             # ── /goal continuation (Ralph-style loop) ─────────────────
             # After every TUI turn, if a /goal is active, ask the judge
@@ -3598,6 +3659,7 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
             print(
                 f"[gateway-turn] {type(e).__name__}: {e}", file=sys.stderr, flush=True
             )
+            _emit_tui_light_cue(sid, "error")
             _emit("error", sid, {"message": str(e)})
         finally:
             try:

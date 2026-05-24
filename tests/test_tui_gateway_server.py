@@ -2132,6 +2132,111 @@ def test_prompt_submit_sets_approval_session_key(monkeypatch):
     assert captured["session_key"] == "session-key"
 
 
+def test_prompt_submit_emits_tui_light_cues_on_success(monkeypatch):
+    class _Agent:
+        def run_conversation(
+            self, prompt, conversation_history=None, stream_callback=None
+        ):
+            return {
+                "final_response": "ok",
+                "messages": [{"role": "assistant", "content": "ok"}],
+            }
+
+    class _ImmediateThread:
+        def __init__(self, target=None, daemon=None):
+            self._target = target
+
+        def start(self):
+            assert self._target is not None
+            self._target()
+
+    cues = []
+    server._sessions["sid"] = _session(agent=_Agent())
+    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+    monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        server, "_emit_tui_light_cue", lambda sid, event: cues.append(event) or True
+    )
+    monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
+    monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
+
+    try:
+        server.handle_request(
+            {
+                "id": "1",
+                "method": "prompt.submit",
+                "params": {"session_id": "sid", "text": "ping"},
+            }
+        )
+
+        assert cues == ["working", "final_answer"]
+    finally:
+        server._sessions.pop("sid", None)
+
+
+def test_prompt_submit_emits_tui_light_cues_on_error(monkeypatch):
+    class _Agent:
+        def run_conversation(
+            self, prompt, conversation_history=None, stream_callback=None
+        ):
+            return {
+                "final_response": "",
+                "messages": [],
+                "failed": True,
+                "error": "boom",
+            }
+
+    class _ImmediateThread:
+        def __init__(self, target=None, daemon=None):
+            self._target = target
+
+        def start(self):
+            assert self._target is not None
+            self._target()
+
+    cues = []
+    server._sessions["sid"] = _session(agent=_Agent())
+    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+    monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        server, "_emit_tui_light_cue", lambda sid, event: cues.append(event) or True
+    )
+    monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
+    monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
+
+    try:
+        server.handle_request(
+            {
+                "id": "1",
+                "method": "prompt.submit",
+                "params": {"session_id": "sid", "text": "ping"},
+            }
+        )
+
+        assert cues == ["working", "error"]
+    finally:
+        server._sessions.pop("sid", None)
+
+
+def test_block_with_light_cue_marks_human_intervention(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        server, "_emit_tui_light_cue", lambda sid, event: calls.append((sid, event)) or True
+    )
+    monkeypatch.setattr(
+        server,
+        "_block",
+        lambda event, sid, payload, timeout=300: f"{event}:{sid}:{timeout}",
+    )
+
+    answer = server._block_with_light_cue("clarify.request", "sid", {}, timeout=12)
+
+    assert answer == "clarify.request:sid:12"
+    assert len(calls) == 1
+    assert calls[0][0] == "sid"
+    assert getattr(calls[0][1], "value", calls[0][1]) == "human_intervention"
+
+
 def test_prompt_submit_expands_context_refs(monkeypatch):
     captured = {}
 
@@ -4078,6 +4183,10 @@ def test_browser_manage_connect_default_local_reports_launch_hint(monkeypatch):
             patch(
                 "hermes_cli.browser_connect.get_chrome_debug_candidates",
                 return_value=[],
+            ),
+            patch(
+                "hermes_cli.browser_connect.manual_chrome_debug_command",
+                return_value=None,
             ),
         ):
             resp = server.handle_request(

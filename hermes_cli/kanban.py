@@ -289,6 +289,7 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     # --- boards (new in v2: multi-project support) ---
     p_boards = sub.add_parser(
         "boards",
+        aliases=["board"],
         help="Manage kanban boards (one board per project / workstream)",
         description=(
             "Boards let you separate unrelated streams of work "
@@ -307,6 +308,18 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     b_list.add_argument("--json", action="store_true")
     b_list.add_argument("--all", action="store_true",
                         help="Include archived boards too")
+
+    b_status = boards_sub.add_parser(
+        "status",
+        help="Show an operational summary across all boards",
+    )
+    b_status.add_argument("--json", action="store_true")
+    b_status.add_argument("--all", action="store_true",
+                          help="Include archived boards too")
+    b_status.add_argument("--limit", type=int, default=3,
+                          help="Max ready/running/blocked task titles to show per board (default: 3)")
+    b_status.add_argument("mode", nargs="?", choices=["audio"],
+                          help="Render a spoken morning-report transcript for TTS")
 
     b_create = boards_sub.add_parser(
         "create", aliases=["new"],
@@ -918,7 +931,7 @@ def kanban_command(args: argparse.Namespace) -> int:
     # task-routing override; otherwise `/kanban --board beta boards show`
     # reports beta as the current board even when the on-disk pointer is
     # alpha.
-    if action == "boards":
+    if action in {"boards", "board"}:
         return _dispatch_boards(args)
 
     # `--board <slug>` applies to every subcommand below by way of an
@@ -1060,6 +1073,8 @@ def _dispatch_boards(args: argparse.Namespace) -> int:
     sub = getattr(args, "boards_action", None) or "list"
     if sub in {"list", "ls"}:
         return _cmd_boards_list(args)
+    if sub == "status":
+        return _cmd_boards_status(args)
     if sub in {"create", "new"}:
         return _cmd_boards_create(args)
     if sub in {"rm", "remove", "delete"}:
@@ -1123,6 +1138,201 @@ def _cmd_boards_list(args: argparse.Namespace) -> int:
     print(f"Current board: {current}")
     if len(boards) > 1:
         print("Switch boards with `hermes kanban boards switch <slug>`.")
+    return 0
+
+
+def _board_status_snapshot(slug: str, *, limit: int = 3) -> dict[str, Any]:
+    """Return counts plus operator-relevant open cards for one board."""
+    counts: dict[str, int] = {}
+    highlights: dict[str, list[dict[str, Any]]] = {"running": [], "ready": [], "blocked": []}
+    try:
+        path = kb.kanban_db_path(board=slug)
+        if not path.exists():
+            return {"counts": counts, "total": 0, "highlights": highlights}
+        with kb.connect(board=slug) as conn:
+            rows = conn.execute(
+                "SELECT status, COUNT(*) AS n FROM tasks GROUP BY status"
+            ).fetchall()
+            counts = {r["status"]: int(r["n"]) for r in rows}
+            for status in highlights:
+                tasks = kb.list_tasks(conn, status=status, order_by="priority")[:max(limit, 0)]
+                highlights[status] = [_task_to_dict(t) for t in tasks]
+    except Exception as exc:
+        return {
+            "counts": counts,
+            "total": sum(counts.values()),
+            "highlights": highlights,
+            "error": str(exc),
+        }
+    return {"counts": counts, "total": sum(counts.values()), "highlights": highlights}
+
+
+def _fmt_board_counts(counts: dict[str, int]) -> str:
+    return ", ".join(f"{k}={v}" for k, v in sorted(counts.items())) or "empty"
+
+
+def _fmt_highlight_task(task: dict[str, Any]) -> str:
+    assignee = task.get("assignee") or "unassigned"
+    return f"{task.get('title') or task.get('id')} ({assignee})"
+
+
+def _plural(n: int, singular: str, plural: str | None = None) -> str:
+    word = singular if n == 1 else (plural or f"{singular}s")
+    return f"{n} {word}"
+
+
+def _first_highlight(board: dict[str, Any], status: str) -> dict[str, Any] | None:
+    tasks = (board.get("highlights", {}) or {}).get(status) or []
+    return tasks[0] if tasks else None
+
+
+def _render_boards_status_audio(payload: dict[str, Any]) -> str:
+    """Render board status as a spoken report for TTS / driving use."""
+    overall = payload.get("overall", {}) or {}
+    boards = payload.get("boards", []) or []
+    current = payload.get("current_board") or "default"
+    lines: list[str] = []
+    lines.append("Kanban morning report.")
+    lines.append(
+        f"Across {_plural(int(overall.get('boards', 0)), 'board')}, "
+        f"there are {_plural(int(overall.get('running', 0)), 'running task')}, "
+        f"{_plural(int(overall.get('ready', 0)), 'ready task')}, "
+        f"and {_plural(int(overall.get('blocked', 0)), 'blocked task')}. "
+        f"The current board is {current}."
+    )
+    diagnostics = int(overall.get("diagnostics", 0) or 0)
+    if diagnostics:
+        lines.append(f"There are {_plural(diagnostics, 'board diagnostic')} to check before dispatching work.")
+
+    actionable = [
+        b for b in boards
+        if (b.get("counts", {}) or {}).get("running", 0)
+        or (b.get("counts", {}) or {}).get("ready", 0)
+        or (b.get("counts", {}) or {}).get("blocked", 0)
+        or b.get("error")
+    ]
+    if not actionable:
+        lines.append("There is no ready, running, or blocked work on the visible boards.")
+        return "\n\n".join(lines)
+
+    for board in actionable:
+        slug = board.get("slug") or "unknown"
+        counts = board.get("counts", {}) or {}
+        count_bits = []
+        for status in ("running", "ready", "blocked", "todo"):
+            n = int(counts.get(status, 0) or 0)
+            if n:
+                count_bits.append(_plural(n, f"{status} task"))
+        count_text = ", ".join(count_bits) if count_bits else "open work"
+        prefix = f"On {slug}"
+        if board.get("is_current"):
+            prefix += ", the current board,"
+        else:
+            prefix += ","
+        lines.append(f"{prefix} there are {count_text}.")
+        if board.get("error"):
+            lines.append(f"The board has a diagnostic: {board['error']}.")
+            continue
+        running = _first_highlight(board, "running")
+        ready = _first_highlight(board, "ready")
+        blocked = _first_highlight(board, "blocked")
+        if running:
+            assignee = running.get("assignee") or "unassigned"
+            lines.append(f"Currently running: {running.get('title') or running.get('id')}, assigned to {assignee}.")
+        if ready:
+            assignee = ready.get("assignee") or "unassigned"
+            lines.append(f"Next ready for a decision: {ready.get('title') or ready.get('id')}, assigned to {assignee}.")
+        if blocked:
+            assignee = blocked.get("assignee") or "unassigned"
+            lines.append(f"Currently blocked: {blocked.get('title') or blocked.get('id')}, assigned to {assignee}.")
+            blocked_count = int(counts.get("blocked", 0) or 0)
+            shown = len((board.get("highlights", {}) or {}).get("blocked") or [])
+            if blocked_count > shown:
+                remaining = blocked_count - shown
+                verb = "is" if remaining == 1 else "are"
+                lines.append(f"There {verb} {_plural(remaining, 'additional blocked task')} on {slug}.")
+
+    lines.append("Use slash kanban boards status for the compact text view, or show a specific card when you want the full task details.")
+    return "\n\n".join(lines)
+
+
+def _cmd_boards_status(args: argparse.Namespace) -> int:
+    include_archived = bool(getattr(args, "all", False))
+    limit = max(int(getattr(args, "limit", 3) or 0), 0)
+    boards = kb.list_boards(include_archived=include_archived)
+    current = kb.get_current_board()
+    overall = {
+        "boards": len(boards),
+        "active_project_boards": 0,
+        "running": 0,
+        "ready": 0,
+        "blocked": 0,
+        "diagnostics": 0,
+    }
+    enriched: list[dict[str, Any]] = []
+    for board in boards:
+        item = dict(board)
+        item["is_current"] = item["slug"] == current
+        snap = _board_status_snapshot(item["slug"], limit=limit)
+        item.update(snap)
+        if item.get("total", 0) > 0 and not item.get("archived"):
+            overall["active_project_boards"] += 1
+        counts = item.get("counts", {}) or {}
+        overall["running"] += int(counts.get("running", 0))
+        overall["ready"] += int(counts.get("ready", 0))
+        overall["blocked"] += int(counts.get("blocked", 0))
+        if item.get("error"):
+            overall["diagnostics"] += 1
+        enriched.append(item)
+
+    payload = {"overall": overall, "current_board": current, "boards": enriched}
+    if getattr(args, "json", False):
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+        return 0
+    if getattr(args, "mode", None) == "audio":
+        print(_render_boards_status_audio(payload))
+        return 0
+
+    print("Global Kanban status")
+    print()
+    print("Overall:")
+    print(
+        f"- Boards: {overall['boards']} total, "
+        f"{overall['active_project_boards']} active project boards"
+    )
+    print(f"- Running: {overall['running']}")
+    print(f"- Ready: {overall['ready']}")
+    print(f"- Blocked: {overall['blocked']}")
+    print(f"- Diagnostics: {overall['diagnostics']}")
+    print(f"- Current board: {current}")
+
+    for board in enriched:
+        marker = " ●" if board.get("is_current") else ""
+        archived = " [archived]" if board.get("archived") else ""
+        print()
+        print(f"{board['slug']}:{marker}{archived}")
+        if board.get("error"):
+            print(f"- {_fmt_board_counts(board.get('counts', {}) or {})}")
+            print(f"- diagnostic: could not inspect board ({board['error']})")
+            continue
+        if not board.get("total"):
+            print("- empty")
+            continue
+        print(f"- {_fmt_board_counts(board.get('counts', {}) or {})}")
+        highlights = board.get("highlights", {}) or {}
+        any_active = False
+        for status in ("running", "ready", "blocked"):
+            tasks = highlights.get(status) or []
+            if not tasks:
+                continue
+            any_active = True
+            rendered = "; ".join(_fmt_highlight_task(t) for t in tasks)
+            more = int((board.get("counts", {}) or {}).get(status, 0)) - len(tasks)
+            if more > 0:
+                rendered += f"; +{more} more"
+            print(f"- {status}: {rendered}")
+        if not any_active:
+            print("- no ready/running/blocked work")
     return 0
 
 
@@ -2782,6 +2992,8 @@ Common subcommands:
   `block <id> [reason]` Mark blocked; `schedule <id> [reason]` parks time-delay work; `unblock <id>` to revive
   `assign <id> <profile>`  Reassign
   `boards list`         Show all boards
+  `boards status`       Global board summary (running/ready/blocked)
+  `boards status audio` Spoken morning-report transcript; Telegram also sends TTS audio
   `assignees`           Known profiles + counts
   `context <id>`        Full worker-context dump
   `runs <id>`           Attempt history
