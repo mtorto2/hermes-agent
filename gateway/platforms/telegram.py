@@ -4768,7 +4768,7 @@ class TelegramAdapter(BasePlatformAdapter):
         await self._ensure_forum_commands(update.message)
 
         event = self._build_message_event(msg, MessageType.TEXT, update_id=update.update_id)
-        await self._set_notification_light(event, "default")
+        await self._set_notification_light(event, "busy")
         event.text = self._clean_bot_trigger_text(event.text)
         event = self._apply_telegram_group_observe_attribution(event)
         self._enqueue_text_event(event)
@@ -4783,7 +4783,7 @@ class TelegramAdapter(BasePlatformAdapter):
         await self._ensure_forum_commands(msg)
 
         event = self._build_message_event(msg, MessageType.COMMAND, update_id=update.update_id)
-        await self._set_notification_light(event, "default")
+        await self._set_notification_light(event, "busy")
         event.text = self._clean_bot_trigger_text(event.text)
         event = self._apply_telegram_group_observe_attribution(event)
         await self.handle_message(event)
@@ -4824,7 +4824,7 @@ class TelegramAdapter(BasePlatformAdapter):
         parts.append("Ask what they'd like to find nearby (restaurants, cafes, etc.) and any preferences.")
 
         event = self._build_message_event(msg, MessageType.LOCATION, update_id=update.update_id)
-        await self._set_notification_light(event, "default")
+        await self._set_notification_light(event, "busy")
         event.text = "\n".join(parts)
         event = self._apply_telegram_group_observe_attribution(event)
         await self.handle_message(event)
@@ -5007,7 +5007,7 @@ class TelegramAdapter(BasePlatformAdapter):
             msg_type = MessageType.DOCUMENT
         
         event = self._build_message_event(msg, msg_type, update_id=update.update_id)
-        await self._set_notification_light(event, "default")
+        await self._set_notification_light(event, "busy")
         
         # Add caption as text
         if msg.caption:
@@ -5648,7 +5648,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
     async def on_processing_start(self, event: MessageEvent) -> None:
         """Add an in-progress reaction when message processing begins."""
-        # WiZ reset happens immediately on inbound Telegram updates instead of
+        # WiZ busy animation starts immediately on inbound Telegram updates instead of
         # processing start so the light does not change during internal agent
         # progress/tool activity.
         if not self._reactions_enabled():

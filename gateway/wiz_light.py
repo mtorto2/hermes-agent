@@ -68,6 +68,11 @@ class WiZNotificationLightConfig:
     default_dimming: int = 100
     ready_rgb: tuple[int, int, int] = (255, 0, 0)
     ready_dimming: int = 100
+    busy_mode: str = "default"
+    busy_scene_id: int | None = None
+    busy_rgb: tuple[int, int, int] = (255, 128, 0)
+    busy_kelvin: int = 2700
+    busy_dimming: int = 100
     discover_timeout: float = 0.8
 
     @classmethod
@@ -95,6 +100,35 @@ class WiZNotificationLightConfig:
                 _coerce_int(parts[2], 0, minimum=0, maximum=255),
             )
 
+        busy_rgb_value = os.getenv("HERMES_WIZ_LIGHT_BUSY_RGB") or data.get("busy_rgb")
+        busy_rgb = (255, 128, 0)
+        parts = _split_csv(busy_rgb_value)
+        if len(parts) == 3:
+            busy_rgb = (
+                _coerce_int(parts[0], 255, minimum=0, maximum=255),
+                _coerce_int(parts[1], 128, minimum=0, maximum=255),
+                _coerce_int(parts[2], 0, minimum=0, maximum=255),
+            )
+
+        busy_scene_value = os.getenv("HERMES_WIZ_LIGHT_BUSY_SCENE_ID") or data.get("busy_scene_id")
+        busy_scene_id = (
+            _coerce_int(
+                busy_scene_value,
+                0,
+                minimum=1,
+                maximum=255,
+            )
+            if busy_scene_value is not None
+            else None
+        )
+        busy_mode = str(os.getenv("HERMES_WIZ_LIGHT_BUSY_MODE") or data.get("busy_mode") or "").strip().lower()
+        if busy_mode in {"color", "colour"}:
+            busy_mode = "rgb"
+        elif busy_mode in {"temp", "kelvin"}:
+            busy_mode = "temperature"
+        elif busy_mode not in {"scene", "rgb", "temperature", "default"}:
+            busy_mode = "scene" if busy_scene_id is not None else "default"
+
         return cls(
             enabled=enabled,
             hosts=tuple(hosts),
@@ -109,6 +143,16 @@ class WiZNotificationLightConfig:
             default_dimming=_coerce_int(data.get("default_dimming"), 100, minimum=1, maximum=100),
             ready_rgb=ready_rgb,
             ready_dimming=_coerce_int(data.get("ready_dimming"), 100, minimum=1, maximum=100),
+            busy_mode=busy_mode,
+            busy_scene_id=busy_scene_id,
+            busy_rgb=busy_rgb,
+            busy_kelvin=_coerce_int(
+                os.getenv("HERMES_WIZ_LIGHT_BUSY_KELVIN") or data.get("busy_kelvin"),
+                2700,
+                minimum=2200,
+                maximum=6500,
+            ),
+            busy_dimming=_coerce_int(data.get("busy_dimming"), 100, minimum=1, maximum=100),
             discover_timeout=float(data.get("discover_timeout", 0.8) or 0.8),
         )
 
@@ -196,7 +240,7 @@ def _send_set_pilot(host: str, params: dict[str, Any], *, port: int = _WIZ_PORT,
 
 
 def set_wiz_notification_light(config: WiZNotificationLightConfig, mode: str) -> bool:
-    """Set configured WiZ bulb(s) to ``default`` daylight or ``ready`` red."""
+    """Set configured WiZ bulb(s) to ``busy`` animation, ``default`` daylight, or ``ready`` red."""
     if not config.enabled:
         return False
 
@@ -214,6 +258,30 @@ def set_wiz_notification_light(config: WiZNotificationLightConfig, mode: str) ->
             "b": b,
             "dimming": config.ready_dimming,
         }
+    elif mode == "busy":
+        if config.busy_mode == "scene" and config.busy_scene_id is not None:
+            params = {
+                "state": True,
+                "sceneId": config.busy_scene_id,
+                "dimming": config.busy_dimming,
+            }
+        elif config.busy_mode == "rgb":
+            r, g, b = config.busy_rgb
+            params = {
+                "state": True,
+                "r": r,
+                "g": g,
+                "b": b,
+                "dimming": config.busy_dimming,
+            }
+        elif config.busy_mode in {"temperature", "default"}:
+            params = {
+                "state": True,
+                "temp": config.busy_kelvin if config.busy_mode == "temperature" else config.default_kelvin,
+                "dimming": config.busy_dimming,
+            }
+        else:
+            raise ValueError(f"unknown WiZ notification light busy mode: {config.busy_mode}")
     elif mode == "default":
         params = {
             "state": True,

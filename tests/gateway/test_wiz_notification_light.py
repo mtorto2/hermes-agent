@@ -44,7 +44,7 @@ def _event(chat_id="8609641275"):
 
 
 @pytest.mark.asyncio
-async def test_telegram_notification_light_resets_immediately_when_text_is_received(monkeypatch):
+async def test_telegram_notification_light_starts_busy_immediately_when_text_is_received(monkeypatch):
     calls = []
     enqueued = []
 
@@ -79,7 +79,7 @@ async def test_telegram_notification_light_resets_immediately_when_text_is_recei
 
     await adapter._handle_text_message(update, None)
 
-    assert calls == ["default"]
+    assert calls == ["busy"]
     assert enqueued == [event]
 
 
@@ -150,11 +150,58 @@ def test_telegram_notification_light_ignores_unlisted_chat():
 
 def test_telegram_notification_light_accepts_json_string_config_values():
     config = WiZNotificationLightConfig.from_mapping(
-        {"enabled": True, "hosts": '["192.168.7.170"]', "ready_rgb": "[255,0,0]"}
+        {
+            "enabled": True,
+            "hosts": '["192.168.7.170"]',
+            "ready_rgb": "[255,0,0]",
+            "busy_mode": "scene",
+            "busy_scene_id": "35",
+            "busy_rgb": "[0,64,255]",
+        }
     )
 
     assert config.hosts == ("192.168.7.170",)
     assert config.ready_rgb == (255, 0, 0)
+    assert config.busy_mode == "scene"
+    assert config.busy_scene_id == 35
+    assert config.busy_rgb == (0, 64, 255)
+
+
+def test_wiz_notification_light_busy_mode_can_use_rgb_or_temperature(monkeypatch):
+    sent = []
+
+    def fake_send(host, params, *, port=38899, timeout=0.4):
+        sent.append((host, params, port))
+        return True
+
+    monkeypatch.setattr("gateway.wiz_light._send_set_pilot", fake_send)
+
+    rgb_config = WiZNotificationLightConfig.from_mapping(
+        {
+            "enabled": True,
+            "hosts": ["192.168.7.170"],
+            "busy_mode": "rgb",
+            "busy_rgb": [0, 64, 255],
+            "busy_dimming": 75,
+        }
+    )
+    temp_config = WiZNotificationLightConfig.from_mapping(
+        {
+            "enabled": True,
+            "hosts": ["192.168.7.170"],
+            "busy_mode": "temperature",
+            "busy_kelvin": 3000,
+            "busy_dimming": 60,
+        }
+    )
+
+    assert set_wiz_notification_light(rgb_config, "busy")
+    assert set_wiz_notification_light(temp_config, "busy")
+
+    assert sent == [
+        ("192.168.7.170", {"state": True, "r": 0, "g": 64, "b": 255, "dimming": 75}, 38899),
+        ("192.168.7.170", {"state": True, "temp": 3000, "dimming": 60}, 38899),
+    ]
 
 
 def test_wiz_notification_light_payloads_are_best_effort(monkeypatch):
@@ -172,14 +219,17 @@ def test_wiz_notification_light_payloads_are_best_effort(monkeypatch):
             "default_kelvin": 5500,
             "default_dimming": 80,
             "ready_rgb": [255, 0, 0],
-            "ready_dimming": 100,
+            "busy_scene_id": 11,
+            "busy_dimming": 100,
         }
     )
 
     assert set_wiz_notification_light(config, "default")
+    assert set_wiz_notification_light(config, "busy")
     assert set_wiz_notification_light(config, "ready")
 
     assert sent == [
         ("192.168.7.170", {"state": True, "temp": 5500, "dimming": 80}, 38899),
+        ("192.168.7.170", {"state": True, "sceneId": 11, "dimming": 100}, 38899),
         ("192.168.7.170", {"state": True, "r": 255, "g": 0, "b": 0, "dimming": 100}, 38899),
     ]
