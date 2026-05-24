@@ -19,7 +19,6 @@ _STATE_FILE = "light_cues.json"
 class LightCueMode(str, Enum):
     DEFAULT = "default"
     NIGHT = "night"
-    DIM_DEFAULT = "dim-default"
     NO_LIGHT = "no-light"
 
     @classmethod
@@ -31,9 +30,11 @@ class LightCueMode(str, Enum):
             "normal": cls.DEFAULT,
             "default": cls.DEFAULT,
             "night": cls.NIGHT,
-            "dim": cls.DIM_DEFAULT,
-            "dim-default": cls.DIM_DEFAULT,
-            "dimmed": cls.DIM_DEFAULT,
+            # Preserve compatibility with the removed dim-default option by
+            # folding old persisted/menu values back to day/default mode.
+            "dim": cls.DEFAULT,
+            "dim-default": cls.DEFAULT,
+            "dimmed": cls.DEFAULT,
             "off": cls.NO_LIGHT,
             "none": cls.NO_LIGHT,
             "no-light": cls.NO_LIGHT,
@@ -118,7 +119,6 @@ class LightCueService:
         brightness = {
             LightCueMode.DEFAULT: 100,
             LightCueMode.NIGHT: 10,
-            LightCueMode.DIM_DEFAULT: 35,
         }.get(self.mode, 100)
 
         if event is LightCueEvent.WORKING:
@@ -127,6 +127,8 @@ class LightCueService:
                 brightness=brightness,
             )
         if event is LightCueEvent.HUMAN_INTERVENTION:
+            if self.mode is LightCueMode.NIGHT:
+                return LightCueAction(cue="night_intervention", brightness=brightness, flashing=True)
             return LightCueAction(cue="intervention", brightness=brightness, flashing=True)
         if event is LightCueEvent.FINAL_ANSWER:
             return LightCueAction(cue="final", brightness=brightness)
@@ -196,10 +198,39 @@ class WiZLightCueBackend:
         if not isinstance(config, WiZNotificationLightConfig):
             return False
         dimming = max(1, min(100, int(action.brightness)))
-        if action.cue in {"busy", "night_working"}:
+        if action.cue == "night_working":
+            # Night mode must never use the configured alarm/busy scene: WiZ
+            # scenes can ignore dimming and produce a harsh full-power white
+            # flash. Force a low-brightness blue RGB waiting glow instead.
+            config = replace(
+                config,
+                busy_mode="rgb",
+                busy_rgb=(0, 64, 255),
+                busy_dimming=min(dimming, 10),
+            )
+            mode = "busy"
+        elif action.cue == "night_intervention":
+            # Human-intervention in night mode should be visible but gentle:
+            # avoid the alarm scene and use the same low-blue waiting surface.
+            config = replace(
+                config,
+                busy_mode="rgb",
+                busy_rgb=(0, 64, 255),
+                busy_dimming=min(dimming, 10),
+            )
+            mode = "busy"
+        elif action.cue == "busy":
+            # Day/default mode intentionally preserves the configured busy
+            # scene (Matt's alarm preset) at full brightness.
             config = replace(config, busy_dimming=dimming)
             mode = "busy"
-        elif action.cue in {"final", "intervention", "error"}:
+        elif action.cue == "intervention":
+            # Waiting on a human answer should remain attention-grabbing, not
+            # collapse to the same red ready cue as a final answer. Reuse the
+            # configured busy/flashing surface, honoring the active dimming.
+            config = replace(config, busy_dimming=dimming)
+            mode = "busy"
+        elif action.cue in {"final", "error"}:
             config = replace(config, ready_dimming=dimming)
             mode = "ready"
         else:

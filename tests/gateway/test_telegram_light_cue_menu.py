@@ -83,7 +83,6 @@ async def test_light_cue_menu_renders_all_modes_with_short_callbacks(tmp_path, m
     assert [button.callback_data for button in buttons] == [
         "lc:default",
         "lc:night",
-        "lc:dim-default",
         "lc:no-light",
     ]
     assert all(len(button.callback_data.encode("utf-8")) <= 64 for button in buttons)

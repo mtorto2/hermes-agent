@@ -2526,7 +2526,6 @@ class TelegramAdapter(BasePlatformAdapter):
         labels = {
             LightCueMode.DEFAULT: "Default",
             LightCueMode.NIGHT: "Night",
-            LightCueMode.DIM_DEFAULT: "Dim default",
             LightCueMode.NO_LIGHT: "No light",
         }
         rows = []
@@ -2973,7 +2972,6 @@ class TelegramAdapter(BasePlatformAdapter):
         label = {
             LightCueMode.DEFAULT: "Default",
             LightCueMode.NIGHT: "Night",
-            LightCueMode.DIM_DEFAULT: "Dim default",
             LightCueMode.NO_LIGHT: "No light",
         }[mode]
         await query.answer(text=f"Light cue mode set to {label}.")
