@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from enum import Enum
 import json
 import logging
 from pathlib import Path
 from typing import Any, Protocol
+
+from agent.wiz_light import WiZLightCueBackend, WiZLightCueConfig
 
 from hermes_constants import get_hermes_home
 
@@ -155,85 +157,37 @@ class LightCueService:
 def build_light_cue_service_from_config(config: dict[str, Any] | None = None) -> LightCueService:
     """Build the profile-wide light cue service from Hermes config.
 
-    The v1 light surface reuses Telegram's existing WiZ notification-light
-    configuration so terminal and Telegram cues drive the same backend without
-    introducing a second config namespace.
+    Prefer the platform-neutral ``light_cues.wiz`` namespace.  For existing
+    local installs, keep accepting Telegram's historical ``notification_light``
+    stanza as a compatibility source, but still route it through the core WiZ
+    backend rather than platform adapter code.
     """
     config = config or {}
-    notification_cfg: Any = None
+    mode = LightCueMode.from_value((config.get("light_cues") or {}).get("mode")) if isinstance(config, dict) else LightCueMode.DEFAULT
+    wiz_cfg: Any = None
     try:
-        platforms = config.get("platforms") if isinstance(config, dict) else None
-        telegram = (platforms or {}).get("telegram") if isinstance(platforms, dict) else None
-        extra = getattr(telegram, "extra", None) if telegram is not None else None
-        if extra is None and isinstance(telegram, dict):
-            extra = telegram.get("extra") or telegram
-        if isinstance(extra, dict):
-            notification_cfg = extra.get("notification_light") or extra.get("wiz_notification_light")
+        light_cues = config.get("light_cues") if isinstance(config, dict) else None
+        if isinstance(light_cues, dict):
+            wiz_cfg = light_cues.get("wiz")
     except Exception:
-        notification_cfg = None
+        wiz_cfg = None
 
-    if notification_cfg:
+    if wiz_cfg is None:
         try:
-            from gateway.wiz_light import WiZNotificationLightConfig
+            platforms = config.get("platforms") if isinstance(config, dict) else None
+            telegram = (platforms or {}).get("telegram") if isinstance(platforms, dict) else None
+            extra = getattr(telegram, "extra", None) if telegram is not None else None
+            if extra is None and isinstance(telegram, dict):
+                extra = telegram.get("extra") or telegram
+            if isinstance(extra, dict):
+                wiz_cfg = extra.get("notification_light") or extra.get("wiz_notification_light")
+        except Exception:
+            wiz_cfg = None
 
-            wiz_config = WiZNotificationLightConfig.from_mapping(notification_cfg)
-            return LightCueService(backend=WiZLightCueBackend(wiz_config))
+    if wiz_cfg:
+        try:
+            wiz_config = WiZLightCueConfig.from_mapping(wiz_cfg)
+            return LightCueService(backend=WiZLightCueBackend(wiz_config), mode=mode)
         except Exception as exc:
             logger.debug("Failed to build WiZ light cue backend from config: %s", exc)
-    return LightCueService()
-
-
-class WiZLightCueBackend:
-    """Adapter from abstract light cue actions to the existing WiZ LAN backend."""
-
-    def __init__(self, config, setter=None):
-        self.config = config
-        self._setter = setter
-
-    def emit(self, action: LightCueAction) -> bool:
-        from gateway.wiz_light import WiZNotificationLightConfig, set_wiz_notification_light
-
-        setter = self._setter or set_wiz_notification_light
-        config = self.config
-        if not isinstance(config, WiZNotificationLightConfig):
-            return False
-        dimming = max(1, min(100, int(action.brightness)))
-        if action.cue == "night_working":
-            # Night mode must never use the configured alarm/busy scene: WiZ
-            # scenes can ignore dimming and produce a harsh full-power white
-            # flash. Force a low-brightness blue RGB waiting glow instead.
-            config = replace(
-                config,
-                busy_mode="rgb",
-                busy_rgb=(0, 64, 255),
-                busy_dimming=min(dimming, 10),
-            )
-            mode = "busy"
-        elif action.cue == "night_intervention":
-            # Human-intervention in night mode should be visible but gentle:
-            # avoid the alarm scene and use the same low-blue waiting surface.
-            config = replace(
-                config,
-                busy_mode="rgb",
-                busy_rgb=(0, 64, 255),
-                busy_dimming=min(dimming, 10),
-            )
-            mode = "busy"
-        elif action.cue == "busy":
-            # Day/default mode intentionally preserves the configured busy
-            # scene (Matt's alarm preset) at full brightness.
-            config = replace(config, busy_dimming=dimming)
-            mode = "busy"
-        elif action.cue == "intervention":
-            # Waiting on a human answer should remain attention-grabbing, not
-            # collapse to the same red ready cue as a final answer. Reuse the
-            # configured busy/flashing surface, honoring the active dimming.
-            config = replace(config, busy_dimming=dimming)
-            mode = "busy"
-        elif action.cue in {"final", "error"}:
-            config = replace(config, ready_dimming=dimming)
-            mode = "ready"
-        else:
-            config = replace(config, default_dimming=dimming)
-            mode = "default"
-        return setter(config, mode)
+    return LightCueService(mode=mode)

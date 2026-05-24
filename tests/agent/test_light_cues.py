@@ -297,7 +297,7 @@ def test_config_builder_reuses_telegram_wiz_notification_light(monkeypatch):
             seen["data"] = data
             return "wiz-config"
 
-    monkeypatch.setattr("gateway.wiz_light.WiZNotificationLightConfig", FakeWiZConfig)
+    monkeypatch.setattr("agent.light_cues.WiZLightCueConfig", FakeWiZConfig)
     service = build_light_cue_service_from_config({
         "platforms": {
             "telegram": {
