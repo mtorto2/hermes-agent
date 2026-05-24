@@ -1497,6 +1497,15 @@ def _cmd_list(args: argparse.Namespace) -> int:
     return 0
 
 
+def _workspace_preflight_from_runs(runs: list[Any]) -> dict[str, Any] | None:
+    """Return the latest workspace_preflight blob from run metadata."""
+    for run in reversed(runs or []):
+        meta = getattr(run, "metadata", None)
+        if isinstance(meta, dict) and isinstance(meta.get("workspace_preflight"), dict):
+            return meta["workspace_preflight"]
+    return None
+
+
 def _cmd_show(args: argparse.Namespace) -> int:
     rsk = _run_state_kwargs(args)
     if rsk is None:
@@ -1520,16 +1529,19 @@ def _cmd_show(args: argparse.Namespace) -> int:
         # ``result=``. Surfacing the latest summary here keeps ``show`` from
         # looking like a no-op when the worker actually did real work.
         latest_summary = kb.latest_summary(conn, args.task_id)
+        workspace_safety = _workspace_preflight_from_runs(runs)
+        comments_display = list(reversed(comments))
 
     if getattr(args, "json", False):
         payload = {
             "task": _task_to_dict(task),
             "latest_summary": latest_summary,
+            "workspace_safety": workspace_safety,
             "parents": parents,
             "children": children,
             "comments": [
                 {"author": c.author, "body": c.body, "created_at": c.created_at}
-                for c in comments
+                for c in comments_display
             ],
             "events": [
                 {
@@ -1618,6 +1630,35 @@ def _cmd_show(args: argparse.Namespace) -> int:
                     print(f"       → {a.label}")
     if task.started_at:
         print(f"  started:   {_fmt_ts(task.started_at)}")
+    if workspace_safety:
+        intended = workspace_safety.get("intended") or {}
+        actual = workspace_safety.get("actual") or {}
+        print("\n  Workspace safety:")
+        print(f"    result: {workspace_safety.get('result') or 'unknown'}")
+        intended_line = str(intended.get("kind") or task.workspace_kind)
+        if intended.get("path"):
+            intended_line += f" @ {intended.get('path')}"
+        if intended.get("branch"):
+            intended_line += f" (branch {intended.get('branch')})"
+        print(f"    intended: {intended_line}")
+        actual_bits = []
+        if actual.get("git_toplevel"):
+            actual_bits.append(f"git={actual.get('git_toplevel')}")
+        if actual.get("branch"):
+            actual_bits.append(f"branch={actual.get('branch')}")
+        if "dirty" in actual:
+            actual_bits.append("dirty" if actual.get("dirty") else "clean")
+        if "separate_worktree" in actual:
+            actual_bits.append(
+                "separate-worktree" if actual.get("separate_worktree")
+                else "not-separate-worktree"
+            )
+        if actual_bits:
+            print(f"    actual: {' | '.join(actual_bits)}")
+        for blocker in workspace_safety.get("blockers") or []:
+            print(f"    BLOCKER: {blocker}")
+        for advisory in workspace_safety.get("advisories") or []:
+            print(f"    advisory: {advisory}")
     if task.completed_at:
         print(f"  completed: {_fmt_ts(task.completed_at)}")
     if parents:
@@ -1642,7 +1683,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
     if comments:
         print()
         print(f"Comments ({len(comments)}):")
-        for c in comments:
+        for c in comments_display:
             print(f"  [{_fmt_ts(c.created_at)}] {c.author}: {c.body}")
     if events:
         print()
