@@ -2277,7 +2277,7 @@ class TestSharedBoardPaths:
 
         task = kb.Task(
             id="t_dispatch_env",
-            title="x",
+            title="Investigate menu rings",
             body=None,
             assignee="coder",
             status="ready",
@@ -2292,6 +2292,7 @@ class TestSharedBoardPaths:
             claim_expires=None,
             tenant=None,
             branch_name="wt/t_dispatch_env",
+            model_override="openai-codex/gpt-5.5",
         )
         kb._default_spawn(task, str(tmp_path / "ws"))
 
@@ -2301,6 +2302,10 @@ class TestSharedBoardPaths:
             default_home / "kanban" / "workspaces"
         )
         assert env["HERMES_KANBAN_TASK"] == "t_dispatch_env"
+        assert env["HERMES_KANBAN_TASK_TITLE"] == "Investigate menu rings"
+        assert env["HERMES_PROFILE"] == "coder"
+        assert env["HERMES_MODEL"] == "openai-codex/gpt-5.5"
+        assert env["HERMES_INFERENCE_MODEL"] == "openai-codex/gpt-5.5"
         assert env["HERMES_KANBAN_BRANCH"] == "wt/t_dispatch_env"
 
 

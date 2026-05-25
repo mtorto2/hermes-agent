@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 from agent.light_cues import (
+    AgentLightsMenuBarLauncher,
     LightCueEvent,
     LightCueMode,
     LightCueService,
@@ -303,8 +304,69 @@ def test_slot_status_file_backend_writes_per_slot_status_atomically(tmp_path, mo
     assert payload["state"] == "working"
     assert payload["pid"] > 0
     assert payload["process_started_at"]
+    assert payload["source"] == "hermes"
     assert payload["updated_at"]
     assert not status_path.with_suffix(".json.tmp").exists()
+
+
+def test_slot_status_file_backend_marks_kanban_workers(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_SLOT", "2")
+    monkeypatch.setenv("HERMES_MODEL", "openai-codex/gpt-5.5")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_ring1234")
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "voice-clipboard")
+    monkeypatch.setenv("HERMES_KANBAN_TASK_TITLE", "Investigate menu rings")
+    monkeypatch.setenv("HERMES_PROFILE", "matt-codex")
+
+    service = LightCueService(backend=RecordingBackend(), slot_status_backend=SlotStatusFileBackend.from_env())
+
+    assert service.emit(LightCueEvent.WORKING) is True
+    payload = json.loads((tmp_path / "agent-lights" / "slots" / "2.json").read_text(encoding="utf-8"))
+    assert payload["source"] == "kanban_worker"
+    assert payload["model_name"] == "openai-codex/gpt-5.5"
+    assert payload["kanban_task_id"] == "t_ring1234"
+    assert payload["kanban_board"] == "voice-clipboard"
+    assert payload["kanban_task_title"] == "Investigate menu rings"
+    assert payload["profile"] == "matt-codex"
+
+
+def test_slot_status_file_backend_uses_config_model_when_env_model_absent(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_SLOT", "1")
+    monkeypatch.delenv("HERMES_MODEL", raising=False)
+    monkeypatch.delenv("HERMES_INFERENCE_MODEL", raising=False)
+
+    service = build_light_cue_service_from_config({"model": "anthropic/claude-sonnet-4.6", "light_cues": {"mode": "no-light"}})
+
+    assert service.emit(LightCueEvent.WORKING) is False
+    payload = json.loads((tmp_path / "agent-lights" / "slots" / "1.json").read_text(encoding="utf-8"))
+    assert payload["model_name"] == "anthropic/claude-sonnet-4.6"
+
+
+def test_slot_status_backend_clears_owned_slot_and_lock(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    backend = SlotStatusFileBackend(slot=1)
+    assert backend.emit_event(LightCueEvent.WORKING) is True
+    lock_path = tmp_path / "agent-lights" / "slots" / "1.lock"
+    lock_path.write_text((tmp_path / "agent-lights" / "slots" / "1.json").read_text(encoding="utf-8"), encoding="utf-8")
+
+    assert backend.clear_if_owned() is True
+
+    assert not (tmp_path / "agent-lights" / "slots" / "1.json").exists()
+    assert not lock_path.exists()
+
+
+def test_slot_status_backend_does_not_clear_unowned_slot(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    backend = SlotStatusFileBackend(slot=1)
+    assert backend.emit_event(LightCueEvent.WORKING) is True
+    path = tmp_path / "agent-lights" / "slots" / "1.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["pid"] = 999999
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    assert backend.clear_if_owned() is False
+    assert path.exists()
 
 
 def test_mark_slot_online_writes_idle_status_without_physical_light_action(tmp_path, monkeypatch):
@@ -322,6 +384,75 @@ def test_mark_slot_online_writes_idle_status_without_physical_light_action(tmp_p
     assert payload["state"] == "idle"
     assert payload["pid"] > 0
     assert payload["process_started_at"]
+
+
+class RecordingMenuBarLauncher:
+    def __init__(self):
+        self.calls = 0
+
+    def ensure_running(self) -> bool:
+        self.calls += 1
+        return True
+
+
+def test_mark_slot_online_attempts_menu_bar_launch_before_idle_status(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_SLOT", "1")
+    launcher = RecordingMenuBarLauncher()
+    service = LightCueService(
+        backend=RecordingBackend(),
+        slot_status_backend=SlotStatusFileBackend.from_env(),
+        menu_bar_launcher=launcher,
+    )
+
+    assert service.mark_slot_online() is True
+
+    assert launcher.calls == 1
+    assert (tmp_path / "agent-lights" / "slots" / "1.json").exists()
+
+
+def test_agent_lights_menu_bar_launcher_prepares_app_bundle_from_existing_debug_binary(tmp_path):
+    binary_path = tmp_path / "apps" / "agent-lights-menu-bar" / ".build" / "debug" / "AgentLightsMenuBar"
+    binary_path.parent.mkdir(parents=True)
+    binary_path.write_bytes(b"debug-binary")
+    launcher = AgentLightsMenuBarLauncher(repo_root=tmp_path)
+
+    app_path = launcher._ensure_app_bundle()
+
+    assert app_path is not None
+    assert app_path == tmp_path / "apps" / "agent-lights-menu-bar" / ".build" / "AgentLightsMenuBar.app"
+    executable_path = app_path / "Contents" / "MacOS" / "AgentLightsMenuBar"
+    assert executable_path.read_bytes() == b"debug-binary"
+    assert "LSUIElement" in (app_path / "Contents" / "Info.plist").read_text(encoding="utf-8")
+
+
+def test_agent_lights_menu_bar_launcher_refreshes_existing_bundle_from_debug_binary(tmp_path):
+    binary_path = tmp_path / "apps" / "agent-lights-menu-bar" / ".build" / "debug" / "AgentLightsMenuBar"
+    binary_path.parent.mkdir(parents=True)
+    binary_path.write_bytes(b"new-binary")
+    executable_path = (
+        tmp_path
+        / "apps"
+        / "agent-lights-menu-bar"
+        / ".build"
+        / "AgentLightsMenuBar.app"
+        / "Contents"
+        / "MacOS"
+        / "AgentLightsMenuBar"
+    )
+    executable_path.parent.mkdir(parents=True)
+    executable_path.write_bytes(b"old-binary")
+    launcher = AgentLightsMenuBarLauncher(repo_root=tmp_path)
+
+    assert launcher._ensure_app_bundle() is not None
+
+    assert executable_path.read_bytes() == b"new-binary"
+
+
+def test_agent_lights_menu_bar_launcher_returns_none_without_built_binary(tmp_path):
+    launcher = AgentLightsMenuBarLauncher(repo_root=tmp_path)
+
+    assert launcher._ensure_app_bundle() is None
 
 
 def test_slot_status_file_backend_ignores_missing_or_invalid_slot_without_auto_assign(tmp_path, monkeypatch):
@@ -369,6 +500,23 @@ def test_slot_status_file_backend_auto_assign_removes_dead_lock_claim(tmp_path, 
     slots = tmp_path / "agent-lights" / "slots"
     slots.mkdir(parents=True)
     (slots / "1.lock").write_text(json.dumps({"pid": 111, "process_started_at": "started-111"}), encoding="utf-8")
+    monkeypatch.setattr(SlotStatusFileBackend, "_pid_is_running", staticmethod(lambda pid: False))
+
+    backend = SlotStatusFileBackend.from_env(auto_assign=True)
+
+    assert backend is not None
+    assert backend.slot == 1
+
+
+def test_slot_status_file_backend_auto_assign_reclaims_dead_recent_slot(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv("HERMES_SLOT", raising=False)
+    slots = tmp_path / "agent-lights" / "slots"
+    slots.mkdir(parents=True)
+    (slots / "1.json").write_text(
+        json.dumps({"slot": 1, "pid": 111, "state": "final_answer", "source": "kanban_worker"}),
+        encoding="utf-8",
+    )
     monkeypatch.setattr(SlotStatusFileBackend, "_pid_is_running", staticmethod(lambda pid: False))
 
     backend = SlotStatusFileBackend.from_env(auto_assign=True)

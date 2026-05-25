@@ -6050,6 +6050,8 @@ def _default_spawn(
     if task.tenant:
         env["HERMES_TENANT"] = task.tenant
     env["HERMES_KANBAN_TASK"] = task.id
+    if task.title:
+        env["HERMES_KANBAN_TASK_TITLE"] = task.title
     env["HERMES_KANBAN_WORKSPACE"] = workspace
     if task.branch_name:
         env["HERMES_KANBAN_BRANCH"] = task.branch_name
@@ -6125,6 +6127,8 @@ def _default_spawn(
             if sk and sk != "kanban-worker":
                 cmd.extend(["--skills", sk])
     if task.model_override:
+        env["HERMES_MODEL"] = task.model_override
+        env["HERMES_INFERENCE_MODEL"] = task.model_override
         cmd.extend(["-m", task.model_override])
     cmd.extend([
         "chat",

@@ -7,6 +7,7 @@ private final class AgentLightsApp: NSObject, NSApplicationDelegate, NSMenuDeleg
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private let statusMenu = NSMenu()
     private let statusSummaryItem = NSMenuItem(title: "No active Hermes slots", action: nil, keyEquivalent: "")
+    private var statusRowItems: [NSMenuItem] = []
     private var timer: Timer?
     private let slotsDirectory: URL
 
@@ -60,18 +61,26 @@ private final class AgentLightsApp: NSObject, NSApplicationDelegate, NSMenuDeleg
     private func render() {
         let statuses = (1...4).compactMap(loadRenderableStatus(slot:))
         statusItem.button?.image = DotRenderer.image(for: statuses)
-        let summary = statusSummary(for: statuses)
-        statusItem.button?.toolTip = summary
-        statusSummaryItem.title = summary
+        let menuModel = SlotStatusMenuModel(statuses: statuses)
+        statusItem.button?.toolTip = menuModel.tooltip
+        statusSummaryItem.title = menuModel.summaryTitle
+        replaceStatusRows(with: menuModel.rowTitles)
     }
 
-    private func statusSummary(for statuses: [SlotStatus]) -> String {
-        guard !statuses.isEmpty else {
-            return "Hermes Agent Lights: no active slots"
+    private func replaceStatusRows(with rowTitles: [String]) {
+        for item in statusRowItems {
+            statusMenu.removeItem(item)
         }
-        let slotSummaries = statuses.map { "\($0.slot): \($0.state.rawValue)" }.joined(separator: ", ")
-        return "Hermes Agent Lights: " + slotSummaries
+        statusRowItems = rowTitles.map { title in
+            let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+            item.isEnabled = false
+            return item
+        }
+        for (offset, item) in statusRowItems.enumerated() {
+            statusMenu.insertItem(item, at: 1 + offset)
+        }
     }
+
 
     @objc private func refreshNow(_ sender: NSMenuItem) {
         render()
@@ -95,7 +104,20 @@ private final class AgentLightsApp: NSObject, NSApplicationDelegate, NSMenuDeleg
         }
 
         let modifiedAt = try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
-        return status.shouldRender(fileModifiedAt: modifiedAt) ? status : nil
+        if status.shouldRender(fileModifiedAt: modifiedAt) {
+            return status
+        }
+        if status.shouldPrune(fileModifiedAt: modifiedAt) {
+            pruneSlotFiles(slot: slot)
+        }
+        return nil
+    }
+
+    private func pruneSlotFiles(slot: Int) {
+        let jsonURL = slotsDirectory.appendingPathComponent("\(slot).json")
+        let lockURL = slotsDirectory.appendingPathComponent("\(slot).lock")
+        try? FileManager.default.removeItem(at: jsonURL)
+        try? FileManager.default.removeItem(at: lockURL)
     }
 }
 
@@ -114,8 +136,15 @@ private enum DotRenderer {
             let x = CGFloat(4 + index * 14)
             let rect = NSRect(x: x, y: 5, width: 8, height: 8)
             let path = NSBezierPath(ovalIn: rect)
-            color(for: status.state).setFill()
-            path.fill()
+            let color = color(for: status.state)
+            if status.isKanbanWorker {
+                color.setStroke()
+                path.lineWidth = 2.4
+                path.stroke()
+            } else {
+                color.setFill()
+                path.fill()
+            }
         }
 
         image.unlockFocus()

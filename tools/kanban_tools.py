@@ -33,6 +33,7 @@ import logging
 import os
 from typing import Any, Optional
 
+from agent.light_cues import LightCueEvent, build_light_cue_service_from_config
 from tools.registry import registry, tool_error
 
 logger = logging.getLogger(__name__)
@@ -174,6 +175,14 @@ def _agent_run_usage(agent: Any) -> dict[str, Any]:
         if value:
             usage[dst] = str(value)
     return usage
+
+
+def _emit_human_intervention_light_cue() -> None:
+    """Best-effort yellow Agent Lights cue when a Kanban worker blocks."""
+    try:
+        build_light_cue_service_from_config({}, auto_assign_slot=True).emit(LightCueEvent.HUMAN_INTERVENTION)
+    except Exception:
+        logger.debug("Kanban block light cue failed", exc_info=True)
 
 
 def _stamp_worker_session_metadata(
@@ -606,6 +615,7 @@ def _handle_block(args: dict, **kw) -> str:
                     f"could not block {tid} (unknown id or not in "
                     f"running/ready)"
                 )
+            _emit_human_intervention_light_cue()
             run = kb.latest_run(conn, tid)
             return _ok(task_id=tid, run_id=run.id if run else None)
         finally:

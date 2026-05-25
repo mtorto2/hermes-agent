@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import atexit
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
@@ -77,9 +78,100 @@ class SlotStatusBackend(Protocol):
         ...
 
 
+class MenuBarLauncher(Protocol):
+    def ensure_running(self) -> bool:
+        ...
+
+
 class NullLightCueBackend:
     def emit(self, action: LightCueAction) -> bool:
         return False
+
+
+class AgentLightsMenuBarLauncher:
+    """Best-effort launcher for the native Hermes Agent Lights status item."""
+
+    executable_name = "AgentLightsMenuBar"
+    bundle_relative_path = Path("apps/agent-lights-menu-bar/.build/AgentLightsMenuBar.app")
+    binary_relative_path = Path("apps/agent-lights-menu-bar/.build/debug/AgentLightsMenuBar")
+
+    def __init__(self, *, repo_root: Path | None = None):
+        self.repo_root = repo_root or Path(__file__).resolve().parents[1]
+
+    def ensure_running(self) -> bool:
+        if str(os.environ.get("HERMES_AGENT_LIGHTS_AUTO_LAUNCH", "true")).lower() in {"0", "false", "no", "off"}:
+            return False
+        if self._is_running():
+            return True
+        app_path = self._ensure_app_bundle()
+        if app_path is None:
+            return False
+        try:
+            completed = subprocess.run(
+                ["/usr/bin/open", "-g", str(app_path)],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=3,
+            )
+        except Exception as exc:
+            logger.debug("Failed to launch Agent Lights menu bar app: %s", exc)
+            return False
+        return completed.returncode == 0
+
+    def _is_running(self) -> bool:
+        try:
+            completed = subprocess.run(
+                ["/usr/bin/pgrep", "-x", self.executable_name],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=1,
+            )
+        except Exception:
+            return False
+        return completed.returncode == 0
+
+    def _ensure_app_bundle(self) -> Path | None:
+        app_path = self.repo_root / self.bundle_relative_path
+        executable_path = app_path / "Contents" / "MacOS" / self.executable_name
+        binary_path = self.repo_root / self.binary_relative_path
+        if not binary_path.exists():
+            return app_path if executable_path.exists() else None
+
+        try:
+            executable_path.parent.mkdir(parents=True, exist_ok=True)
+            executable_path.write_bytes(binary_path.read_bytes())
+            executable_path.chmod(0o755)
+            plist_path = app_path / "Contents" / "Info.plist"
+            plist_path.write_text(
+                """<?xml version=\"1.0\" encoding=\"UTF-8\"?>
+<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">
+<plist version=\"1.0\">
+<dict>
+  <key>CFBundleExecutable</key>
+  <string>AgentLightsMenuBar</string>
+  <key>CFBundleIdentifier</key>
+  <string>com.savant.hermes-agent-lights</string>
+  <key>CFBundleName</key>
+  <string>Hermes Agent Lights</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>CFBundleShortVersionString</key>
+  <string>0.1</string>
+  <key>CFBundleVersion</key>
+  <string>1</string>
+  <key>LSUIElement</key>
+  <true/>
+</dict>
+</plist>
+""",
+                encoding="utf-8",
+            )
+        except Exception as exc:
+            logger.debug("Failed to prepare Agent Lights menu bar app bundle: %s", exc)
+            return None
+        return app_path
 
 
 @dataclass(frozen=True)
@@ -93,20 +185,32 @@ class SlotStatusFileBackend:
 
     slot: int
     directory: Path | None = None
+    model_name: str | None = None
 
     @classmethod
-    def from_env(cls, *, auto_assign: bool = False, directory: Path | None = None) -> "SlotStatusFileBackend | None":
+    def from_env(
+        cls,
+        *,
+        auto_assign: bool = False,
+        directory: Path | None = None,
+        model_name: str | None = None,
+    ) -> "SlotStatusFileBackend | None":
         raw_slot = os.environ.get("HERMES_SLOT", "").strip()
         try:
             slot = int(raw_slot)
         except ValueError:
             slot = 0
         if slot in {1, 2, 3, 4}:
-            return cls(slot=slot, directory=directory)
+            return cls._with_exit_cleanup(cls(slot=slot, directory=directory, model_name=model_name))
         if not auto_assign:
             return None
         slot = cls._claim_available_slot(directory or (Path(get_hermes_home()) / "agent-lights" / "slots"))
-        return cls(slot=slot, directory=directory) if slot is not None else None
+        return cls._with_exit_cleanup(cls(slot=slot, directory=directory, model_name=model_name)) if slot is not None else None
+
+    @classmethod
+    def _with_exit_cleanup(cls, backend: "SlotStatusFileBackend") -> "SlotStatusFileBackend":
+        atexit.register(backend.clear_if_owned)
+        return backend
 
     @classmethod
     def _claim_available_slot(cls, directory: Path) -> int | None:
@@ -152,11 +256,41 @@ class SlotStatusFileBackend:
         return True
 
     @classmethod
-    def _process_payload(cls) -> dict[str, Any]:
-        return {
+    def _process_payload(cls, model_name: str | None = None) -> dict[str, Any]:
+        payload = {
             "pid": os.getpid(),
             "process_started_at": cls._process_started_at(os.getpid()),
         }
+        resolved_model = cls._first_nonempty(
+            os.environ.get("HERMES_MODEL"),
+            os.environ.get("HERMES_INFERENCE_MODEL"),
+            model_name,
+        )
+        if resolved_model:
+            payload["model_name"] = resolved_model
+        profile = cls._first_nonempty(os.environ.get("HERMES_PROFILE"))
+        if profile:
+            payload["profile"] = profile
+        if os.environ.get("HERMES_KANBAN_TASK"):
+            payload["source"] = "kanban_worker"
+            payload["kanban_task_id"] = os.environ.get("HERMES_KANBAN_TASK")
+            if os.environ.get("HERMES_KANBAN_BOARD"):
+                payload["kanban_board"] = os.environ.get("HERMES_KANBAN_BOARD")
+            task_title = cls._first_nonempty(os.environ.get("HERMES_KANBAN_TASK_TITLE"))
+            if task_title:
+                payload["kanban_task_title"] = task_title
+        else:
+            payload["source"] = "hermes"
+        return payload
+
+    @staticmethod
+    def _first_nonempty(*values: str | None) -> str | None:
+        for value in values:
+            if isinstance(value, str):
+                stripped = value.strip()
+                if stripped:
+                    return stripped
+        return None
 
     @classmethod
     def _slot_payload(cls, path: Path) -> dict[str, Any] | None:
@@ -191,10 +325,7 @@ class SlotStatusFileBackend:
             return True
         if cls._payload_is_live(cls._slot_payload(path)):
             return False
-        try:
-            return (datetime.now(timezone.utc).timestamp() - path.stat().st_mtime) > 120
-        except Exception:
-            return True
+        return True
 
     @classmethod
     def _payload_is_live(cls, payload: dict[str, Any] | None) -> bool:
@@ -253,12 +384,27 @@ class SlotStatusFileBackend:
             "event": event.value,
             "state": event.value,
             "updated_at": datetime.now(timezone.utc).isoformat(),
-            **self._process_payload(),
+            **self._process_payload(self.model_name),
         }
         tmp = path.with_suffix(path.suffix + ".tmp")
         tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         tmp.replace(path)
         return True
+
+    def clear_if_owned(self) -> bool:
+        """Remove this process's slot and lock files during normal shutdown."""
+        removed = False
+        for path in (self._directory / f"{self.slot}.json", self._lock_path(self._directory, self.slot)):
+            if not self._slot_pid_matches(path, os.getpid()):
+                continue
+            try:
+                path.unlink()
+                removed = True
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                logger.debug("Failed to clear Agent Lights slot file %s: %s", path, exc)
+        return removed
 
 
 def _state_path() -> Path:
@@ -295,10 +441,12 @@ class LightCueService:
         *,
         mode: LightCueMode | str | None = None,
         slot_status_backend: SlotStatusBackend | None = None,
+        menu_bar_launcher: MenuBarLauncher | None = None,
     ):
         self.backend = backend or NullLightCueBackend()
         self.mode = LightCueMode.from_value(mode) if mode is not None else load_light_cue_mode()
         self.slot_status_backend = slot_status_backend
+        self.menu_bar_launcher = menu_bar_launcher
 
     def set_mode(self, mode: LightCueMode | str, *, persist: bool = True) -> LightCueMode:
         self.mode = LightCueMode.from_value(mode)
@@ -310,6 +458,11 @@ class LightCueService:
         """Write an idle slot status without touching physical light backends."""
         if self.slot_status_backend is None:
             return False
+        if self.menu_bar_launcher is not None:
+            try:
+                self.menu_bar_launcher.ensure_running()
+            except Exception as exc:
+                logger.debug("Agent Lights menu bar launch failed during startup idle mark: %s", exc)
         try:
             return bool(self.slot_status_backend.emit_event(LightCueEvent.IDLE))
         except Exception as exc:
@@ -373,7 +526,10 @@ def build_light_cue_service_from_config(config: dict[str, Any] | None = None, *,
     backend rather than platform adapter code.
     """
     config = config or {}
-    slot_status_backend = SlotStatusFileBackend.from_env(auto_assign=auto_assign_slot)
+    configured_model = config.get("model") if isinstance(config, dict) else None
+    configured_model = configured_model.strip() if isinstance(configured_model, str) and configured_model.strip() else None
+    slot_status_backend = SlotStatusFileBackend.from_env(auto_assign=auto_assign_slot, model_name=configured_model)
+    menu_bar_launcher = AgentLightsMenuBarLauncher() if slot_status_backend is not None else None
     mode = LightCueMode.from_value((config.get("light_cues") or {}).get("mode")) if isinstance(config, dict) else LightCueMode.DEFAULT
     wiz_cfg: Any = None
     try:
@@ -398,7 +554,12 @@ def build_light_cue_service_from_config(config: dict[str, Any] | None = None, *,
     if wiz_cfg:
         try:
             wiz_config = WiZLightCueConfig.from_mapping(wiz_cfg)
-            return LightCueService(backend=WiZLightCueBackend(wiz_config), mode=mode, slot_status_backend=slot_status_backend)
+            return LightCueService(
+                backend=WiZLightCueBackend(wiz_config),
+                mode=mode,
+                slot_status_backend=slot_status_backend,
+                menu_bar_launcher=menu_bar_launcher,
+            )
         except Exception as exc:
             logger.debug("Failed to build WiZ light cue backend from config: %s", exc)
-    return LightCueService(mode=mode, slot_status_backend=slot_status_backend)
+    return LightCueService(mode=mode, slot_status_backend=slot_status_backend, menu_bar_launcher=menu_bar_launcher)

@@ -657,6 +657,24 @@ def test_block_happy_path(worker_env):
         conn.close()
 
 
+def test_block_emits_human_intervention_light_cue(worker_env, monkeypatch):
+    from tools import kanban_tools as kt
+
+    emitted = []
+
+    class FakeLightCueService:
+        def emit(self, event):
+            emitted.append(getattr(event, "value", event))
+            return True
+
+    monkeypatch.setattr(kt, "build_light_cue_service_from_config", lambda *a, **k: FakeLightCueService(), raising=False)
+
+    out = kt._handle_block({"reason": "need clarification"})
+
+    assert json.loads(out)["ok"] is True
+    assert emitted == ["human_intervention"]
+
+
 def test_block_rejects_empty_reason(worker_env):
     from tools import kanban_tools as kt
     for bad in ["", "   ", None]:

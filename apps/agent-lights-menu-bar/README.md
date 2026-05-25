@@ -29,12 +29,43 @@ Left-to-right dots follow active slot order: slot 1, then slot 2, then slot 3, t
 | error | red steady for MVP; flashing/pulse is next polish |
 | idle | gray, but only when the slot's producing process is alive |
 
+Kanban worker slots use the same state colors, but render as thick unfilled rings
+instead of filled dots. Normal Hermes CLI/TUI instances remain filled dots.
+
 A slot renders when its status file is valid and either:
 
 - `pid` is set and that process is still alive, or
 - no live `pid` is available but the status file was modified in the last 120 seconds.
 
+After that grace window, the companion app prunes the stale `.json` and `.lock`
+files so completed/abandoned Kanban worker rings do not persist as ghosts. Normal
+Hermes shutdown also removes the slot owned by that process when shutdown is
+clean.
+
+Clicking the menu bar item opens a vertical status menu: the first row summarizes
+active slot count, then each active process gets its own disabled row. Rows include
+slot number, lifecycle state, dot/ring type, model/profile when available, and
+Kanban board/task/title details when the producer wrote them.
+
 ## Development
+
+Hermes will best-effort launch the companion app when a CLI/TUI instance claims
+an Agent Lights slot. The launcher uses the built Swift debug binary if present
+and packages it into `.build/AgentLightsMenuBar.app` before opening it in the
+background. If the Swift binary has not been built yet, run:
+
+```bash
+cd apps/agent-lights-menu-bar
+swift build
+```
+
+Then start a fresh Hermes instance; it should create/update its slot file and
+open the companion app if it is not already running.
+
+If Ice or another menu bar manager is installed, a freshly packaged app bundle
+may be treated as a new menu bar item and placed in the hidden section. The app
+can be running correctly while the dots are hidden by Ice; reveal the hidden menu
+bar items once and pin "Hermes Agent Lights" visible for human QA.
 
 ```bash
 cd apps/agent-lights-menu-bar
