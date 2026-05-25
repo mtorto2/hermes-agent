@@ -7612,6 +7612,75 @@ class HermesCLI:
         except Exception:
             return False
 
+    def _should_handle_queue_delete_command_inline(self, text: str, has_images: bool = False) -> bool:
+        """Return True when /queue delete should mutate the pending queue immediately.
+
+        Queue deletion must bypass normal _pending_input routing while the agent
+        is running; otherwise the deletion command is enqueued behind the prompt
+        it is trying to remove.
+        """
+        if not text or has_images or not _looks_like_slash_command(text):
+            return False
+        if not getattr(self, "_agent_running", False):
+            return False
+        try:
+            from hermes_cli.commands import resolve_command
+            parts = text.split()
+            if len(parts) < 2 or parts[1].lower() != "delete":
+                return False
+            base = parts[0].lower().lstrip('/')
+            cmd = resolve_command(base)
+            return bool(cmd and cmd.name == "queue")
+        except Exception:
+            return False
+
+    def _delete_queued_prompt(self, selector: str = "") -> None:
+        """Delete a queued prompt from _pending_input.
+
+        Bare delete removes the only queued prompt. If multiple prompts are
+        queued, require a 1-based selector so we don't guess wrong.
+        """
+        pending = getattr(self, "_pending_input", None)
+        if pending is None:
+            _cprint("  Queue unavailable.")
+            return
+        selector = (selector or "").strip()
+        with pending.mutex:
+            queued = list(pending.queue)
+            count = len(queued)
+            if count == 0:
+                _cprint("  Queue is empty.")
+                return
+            if selector:
+                try:
+                    index = int(selector)
+                except ValueError:
+                    _cprint("  Usage: /q delete [number]")
+                    return
+                if index < 1 or index > count:
+                    _cprint(f"  Queue item {index} not found. Choose 1-{count}.")
+                    return
+            elif count == 1:
+                index = 1
+            else:
+                _cprint("  Multiple prompts queued. Use /q delete <number>:")
+                for i, item in enumerate(queued, start=1):
+                    preview = item[0] if isinstance(item, tuple) else item
+                    preview = str(preview) if preview else "[attachment]"
+                    _cprint(f"    {i}. {preview[:80]}{'...' if len(preview) > 80 else ''}")
+                return
+
+            removed = queued.pop(index - 1)
+            pending.queue.clear()
+            pending.queue.extend(queued)
+            if getattr(pending, "unfinished_tasks", 0) > 0:
+                pending.unfinished_tasks = max(0, pending.unfinished_tasks - 1)
+            pending.not_full.notify()
+
+        preview = removed[0] if isinstance(removed, tuple) else removed
+        preview = str(preview) if preview else "[attachment]"
+        _cprint(f"  Deleted queued prompt {index}: {preview[:80]}{'...' if len(preview) > 80 else ''}")
+
     def _output_console(self):
         """Use prompt_toolkit-safe Rich rendering once the TUI is live."""
         if getattr(self, "_app", None):
@@ -8417,7 +8486,10 @@ class HermesCLI:
             parts = cmd_original.split(None, 1)
             payload = parts[1].strip() if len(parts) > 1 else ""
             if not payload:
-                _cprint("  Usage: /queue <prompt>")
+                _cprint("  Usage: /queue <prompt> or /q delete [number]")
+            elif payload == "delete" or payload.startswith("delete "):
+                selector = payload.split(None, 1)[1] if " " in payload else ""
+                self._delete_queued_prompt(selector)
             else:
                 self._pending_input.put(payload)
                 if self._agent_running:
@@ -12515,6 +12587,14 @@ class HermesCLI:
                         self._should_exit = True
                         if event.app.is_running:
                             event.app.exit()
+                    event.app.current_buffer.reset(append_to_history=True)
+                    return
+
+                # Handle /queue delete while the agent is running immediately on
+                # the UI thread. Queuing this command would put it behind the
+                # pending prompt it is trying to remove.
+                if self._should_handle_queue_delete_command_inline(text, has_images=has_images):
+                    self.process_command(text)
                     event.app.current_buffer.reset(append_to_history=True)
                     return
 

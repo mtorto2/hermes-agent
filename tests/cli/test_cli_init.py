@@ -150,6 +150,51 @@ class TestBusyInputMode:
         assert cli.process_command("/q follow up") is True
         assert cli._pending_input.get_nowait() == "follow up"
 
+    def test_q_delete_removes_only_queued_prompt_by_default(self):
+        """/q delete should remove the sole queued prompt instead of queuing text."""
+        cli = _make_cli()
+        cli._pending_input.put("do not run")
+        assert cli.process_command("/q delete") is True
+        assert cli._pending_input.empty()
+
+    def test_q_delete_number_removes_selected_queued_prompt(self):
+        """/q delete N should remove the 1-based selected queued prompt and keep order."""
+        cli = _make_cli()
+        cli._pending_input.put("first")
+        cli._pending_input.put("second")
+        cli._pending_input.put("third")
+        assert cli.process_command("/q delete 2") is True
+        assert cli._pending_input.get_nowait() == "first"
+        assert cli._pending_input.get_nowait() == "third"
+        assert cli._pending_input.empty()
+
+    def test_q_delete_requires_number_when_multiple_prompts_are_queued(self):
+        """Bare /q delete should not guess when multiple prompts are queued."""
+        cli = _make_cli()
+        cli._pending_input.put("first")
+        cli._pending_input.put("second")
+        assert cli.process_command("/q delete") is True
+        assert cli._pending_input.get_nowait() == "first"
+        assert cli._pending_input.get_nowait() == "second"
+        assert cli._pending_input.empty()
+
+    def test_queue_delete_alias_removes_selected_queued_prompt(self):
+        """The long /queue delete N form should match /q delete N."""
+        cli = _make_cli()
+        cli._pending_input.put("first")
+        cli._pending_input.put("second")
+        assert cli.process_command("/queue delete 1") is True
+        assert cli._pending_input.get_nowait() == "second"
+        assert cli._pending_input.empty()
+
+    def test_q_delete_is_handled_inline_while_agent_running(self):
+        """While busy, /q delete must bypass FIFO pending-input routing."""
+        cli = _make_cli()
+        cli._agent_running = True
+        assert cli._should_handle_queue_delete_command_inline("/q delete") is True
+        assert cli._should_handle_queue_delete_command_inline("/queue delete 2") is True
+        assert cli._should_handle_queue_delete_command_inline("/q follow up") is False
+
     def test_queue_mode_routes_busy_enter_to_pending(self):
         """In queue mode, Enter while busy should go to _pending_input, not _interrupt_queue."""
         cli = _make_cli(config_overrides={"display": {"busy_input_mode": "queue"}})
