@@ -80,7 +80,7 @@ Decision: `final_answer` stays red until the next prompt starts in that same slo
 3. Write atomic per-slot JSON under `~/.hermes/agent-lights/slots/`. — **done in branch**
 4. Include at least: `slot`, `event`, `state`, `updated_at`, `pid`, optional `session_id`, optional `title`. — **core fields done; optional fields later**
 5. Add tests for backend mapping and atomic writes. — **done in branch**
-6. Add/seed a minimal native macOS status item app only after the file contract is stable. — **next**
+6. Add/seed a minimal native macOS status item app only after the file contract is stable. — **seeded in branch**
 
 ## Non-goals for v1
 
