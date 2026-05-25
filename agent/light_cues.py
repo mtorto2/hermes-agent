@@ -9,6 +9,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import subprocess
 from typing import Any, Protocol
 
 from agent.wiz_light import WiZLightCueBackend, WiZLightCueConfig
@@ -94,15 +95,151 @@ class SlotStatusFileBackend:
     directory: Path | None = None
 
     @classmethod
-    def from_env(cls) -> "SlotStatusFileBackend | None":
+    def from_env(cls, *, auto_assign: bool = False, directory: Path | None = None) -> "SlotStatusFileBackend | None":
         raw_slot = os.environ.get("HERMES_SLOT", "").strip()
         try:
             slot = int(raw_slot)
         except ValueError:
+            slot = 0
+        if slot in {1, 2, 3, 4}:
+            return cls(slot=slot, directory=directory)
+        if not auto_assign:
             return None
-        if slot not in {1, 2, 3, 4}:
+        slot = cls._claim_available_slot(directory or (Path(get_hermes_home()) / "agent-lights" / "slots"))
+        return cls(slot=slot, directory=directory) if slot is not None else None
+
+    @classmethod
+    def _claim_available_slot(cls, directory: Path) -> int | None:
+        """Atomically claim the current process's slot or the first free slot."""
+        directory.mkdir(parents=True, exist_ok=True)
+        current_pid = os.getpid()
+        for slot in range(1, 5):
+            if cls._slot_pid_matches(directory / f"{slot}.json", current_pid) or cls._slot_pid_matches(
+                cls._lock_path(directory, slot), current_pid
+            ):
+                return slot
+        for slot in range(1, 5):
+            path = directory / f"{slot}.json"
+            lock_path = cls._lock_path(directory, slot)
+            if not cls._slot_is_available(path, lock_path=lock_path):
+                continue
+            if cls._try_claim_lock(lock_path):
+                return slot
+        return None
+
+    @staticmethod
+    def _lock_path(directory: Path, slot: int) -> Path:
+        return directory / f"{slot}.lock"
+
+    @classmethod
+    def _try_claim_lock(cls, lock_path: Path) -> bool:
+        payload = cls._process_payload()
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        try:
+            fd = os.open(lock_path, flags, 0o600)
+        except FileExistsError:
+            return False
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, indent=2, sort_keys=True)
+                handle.write("\n")
+        except Exception:
+            try:
+                lock_path.unlink()
+            except OSError:
+                pass
+            raise
+        return True
+
+    @classmethod
+    def _process_payload(cls) -> dict[str, Any]:
+        return {
+            "pid": os.getpid(),
+            "process_started_at": cls._process_started_at(os.getpid()),
+        }
+
+    @classmethod
+    def _slot_payload(cls, path: Path) -> dict[str, Any] | None:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
             return None
-        return cls(slot=slot)
+        return payload if isinstance(payload, dict) else None
+
+    @classmethod
+    def _slot_pid_matches(cls, path: Path, expected_pid: int) -> bool:
+        payload = cls._slot_payload(path)
+        if not payload:
+            return False
+        return cls._payload_pid(payload) == expected_pid and cls._payload_process_matches(payload)
+
+    @staticmethod
+    def _payload_pid(payload: dict[str, Any]) -> int | None:
+        pid = payload.get("pid")
+        return pid if isinstance(pid, int) and pid > 0 else None
+
+    @classmethod
+    def _slot_is_available(cls, path: Path, *, lock_path: Path | None = None) -> bool:
+        if lock_path is not None and lock_path.exists():
+            if cls._payload_is_live(cls._slot_payload(lock_path)):
+                return False
+            try:
+                lock_path.unlink()
+            except OSError:
+                return False
+        if not path.exists():
+            return True
+        if cls._payload_is_live(cls._slot_payload(path)):
+            return False
+        try:
+            return (datetime.now(timezone.utc).timestamp() - path.stat().st_mtime) > 120
+        except Exception:
+            return True
+
+    @classmethod
+    def _payload_is_live(cls, payload: dict[str, Any] | None) -> bool:
+        if not payload:
+            return False
+        pid = cls._payload_pid(payload)
+        return pid is not None and cls._pid_is_running(pid) and cls._payload_process_matches(payload)
+
+    @classmethod
+    def _payload_process_matches(cls, payload: dict[str, Any]) -> bool:
+        pid = cls._payload_pid(payload)
+        if pid is None:
+            return False
+        expected_started_at = payload.get("process_started_at")
+        if not isinstance(expected_started_at, str) or not expected_started_at:
+            return True
+        return cls._process_started_at(pid) == expected_started_at
+
+    @staticmethod
+    def _process_started_at(pid: int) -> str | None:
+        try:
+            completed = subprocess.run(
+                ["/bin/ps", "-o", "lstart=", "-p", str(pid)],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=1,
+            )
+        except Exception:
+            return None
+        started_at = completed.stdout.strip()
+        return started_at or None
+
+    @staticmethod
+    def _pid_is_running(pid: int) -> bool:
+        try:
+            os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except Exception:
+            return False
 
     @property
     def _directory(self) -> Path:
@@ -116,7 +253,7 @@ class SlotStatusFileBackend:
             "event": event.value,
             "state": event.value,
             "updated_at": datetime.now(timezone.utc).isoformat(),
-            "pid": os.getpid(),
+            **self._process_payload(),
         }
         tmp = path.with_suffix(path.suffix + ".tmp")
         tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -169,6 +306,16 @@ class LightCueService:
             save_light_cue_mode(self.mode)
         return self.mode
 
+    def mark_slot_online(self) -> bool:
+        """Write an idle slot status without touching physical light backends."""
+        if self.slot_status_backend is None:
+            return False
+        try:
+            return bool(self.slot_status_backend.emit_event(LightCueEvent.IDLE))
+        except Exception as exc:
+            logger.debug("Slot status backend failed during startup idle mark: %s", exc)
+            return False
+
     def action_for(self, event: LightCueEvent | str) -> LightCueAction | None:
         event = LightCueEvent.from_value(event)
         if self.mode is LightCueMode.NO_LIGHT:
@@ -217,7 +364,7 @@ class LightCueService:
             return False
 
 
-def build_light_cue_service_from_config(config: dict[str, Any] | None = None) -> LightCueService:
+def build_light_cue_service_from_config(config: dict[str, Any] | None = None, *, auto_assign_slot: bool = False) -> LightCueService:
     """Build the profile-wide light cue service from Hermes config.
 
     Prefer the platform-neutral ``light_cues.wiz`` namespace.  For existing
@@ -226,7 +373,7 @@ def build_light_cue_service_from_config(config: dict[str, Any] | None = None) ->
     backend rather than platform adapter code.
     """
     config = config or {}
-    slot_status_backend = SlotStatusFileBackend.from_env()
+    slot_status_backend = SlotStatusFileBackend.from_env(auto_assign=auto_assign_slot)
     mode = LightCueMode.from_value((config.get("light_cues") or {}).get("mode")) if isinstance(config, dict) else LightCueMode.DEFAULT
     wiz_cfg: Any = None
     try:

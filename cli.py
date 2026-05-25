@@ -11415,7 +11415,7 @@ class HermesCLI:
         """Return the shared light cue service for terminal surfaces."""
         service = getattr(self, "_light_cue_service", None)
         if not isinstance(service, LightCueService):
-            service = build_light_cue_service_from_config(getattr(self, "config", {}))
+            service = build_light_cue_service_from_config(getattr(self, "config", {}), auto_assign_slot=True)
             self._light_cue_service = service
         return service
 
@@ -12319,6 +12319,10 @@ class HermesCLI:
             pass
 
         self.show_banner()
+        try:
+            self._get_light_cue_service().mark_slot_online()
+        except Exception:
+            logger.debug("Terminal startup slot idle mark failed", exc_info=True)
         # Surface any active supply-chain security advisories right after the
         # welcome banner. Quiet/single-query paths call this themselves.
         self._show_security_advisories()
