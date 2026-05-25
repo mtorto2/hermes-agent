@@ -431,6 +431,13 @@ class TelegramAdapter(BasePlatformAdapter):
         self._polling_conflict_count: int = 0
         self._polling_network_error_count: int = 0
         self._polling_error_callback_ref = None
+        # After sustained reconnect storms the PTB httpx pool can return
+        # SendResult(success=True) for sends that never actually transmit.
+        # _handle_polling_network_error sets this; _verify_polling_after_reconnect
+        # clears it once getMe() confirms the Bot client is healthy.
+        # While True, send() short-circuits to a failure so callers
+        # (cron live-adapter branch) fall through to standalone delivery.
+        self._send_path_degraded: bool = False
         # DM Topics: map of topic_name -> message_thread_id (populated at startup)
         self._dm_topics: Dict[str, int] = {}
         # Track forum chats where we've already registered bot commands
@@ -887,6 +894,7 @@ class TelegramAdapter(BasePlatformAdapter):
         MAX_DELAY = 60
 
         self._polling_network_error_count += 1
+        self._send_path_degraded = True
         attempt = self._polling_network_error_count
 
         if attempt > MAX_NETWORK_RETRIES:
@@ -984,6 +992,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
         try:
             await asyncio.wait_for(self._app.bot.get_me(), PROBE_TIMEOUT)
+            self._send_path_degraded = False
         except Exception as probe_err:
             logger.warning(
                 "[%s] Polling heartbeat probe failed %ds after reconnect: %s",
@@ -1696,7 +1705,11 @@ class TelegramAdapter(BasePlatformAdapter):
         """Send a message to a Telegram chat."""
         if not self._bot:
             return SendResult(success=False, error="Not connected")
-        
+
+        # getattr() — tests build adapters via object.__new__() (no __init__).
+        if getattr(self, "_send_path_degraded", False):
+            return SendResult(success=False, error="send_path_degraded", retryable=True)
+
         # Skip whitespace-only text to prevent Telegram 400 empty-text errors.
         if not content or not content.strip():
             return SendResult(success=True, message_id=None)
@@ -5616,11 +5629,18 @@ class TelegramAdapter(BasePlatformAdapter):
         # Determine chat type.  Normalize through ``str`` so tests/mocks and
         # python-telegram-bot enum values both work (``ChatType.CHANNEL`` is
         # string-like, but mocks often provide plain strings).
-        telegram_chat_type = str(getattr(chat, "type", "")).split(".")[-1].lower()
+        raw_chat_type = getattr(chat, "type", "")
+        raw_chat_type = getattr(raw_chat_type, "value", raw_chat_type)
+        telegram_chat_type = str(raw_chat_type).split(".")[-1].lower()
+        # Some tests install MagicMock telegram constants after this module has
+        # already imported PTB.  In that case ``str(ChatType.SUPERGROUP)`` can
+        # include the full mock path rather than the bare value; substring
+        # matching keeps the runtime path and mixed test order robust.
+        chat_type_text = str(raw_chat_type).lower()
         chat_type = "dm"
-        if telegram_chat_type in {"group", "supergroup"}:
+        if telegram_chat_type in {"group", "supergroup"} or "supergroup" in chat_type_text:
             chat_type = "group"
-        elif telegram_chat_type == "channel":
+        elif telegram_chat_type == "channel" or "channel" in chat_type_text:
             chat_type = "channel"
 
         # Resolve Telegram topic name and skill binding.
