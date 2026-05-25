@@ -9,6 +9,8 @@ before the terminal query, which is the path most users hit.
 from __future__ import annotations
 
 import importlib
+import threading
+import time
 
 import pytest
 
@@ -152,3 +154,57 @@ class TestSkinConfigHook:
         cli_mod._LIGHT_MODE_CACHE = False
         skin = SkinConfig(name="test", colors={"banner_text": "#FFF8DC"})
         assert skin.get_color("banner_text") == "#FFF8DC"
+
+
+class TestLightCueHumanInterventionResume:
+    def _bare_cli(self, cli_mod, monkeypatch):
+        instance = cli_mod.HermesCLI.__new__(cli_mod.HermesCLI)
+        cues = []
+        monkeypatch.setattr(instance, "_emit_light_cue", lambda event: cues.append(getattr(event, "value", event)))
+        monkeypatch.setattr(instance, "_invalidate", lambda *args, **kwargs: None)
+        monkeypatch.setattr(cli_mod, "_cprint", lambda *args, **kwargs: None)
+        monkeypatch.setitem(cli_mod.CLI_CONFIG.setdefault("clarify", {}), "timeout", 5)
+        monkeypatch.setitem(cli_mod.CLI_CONFIG.setdefault("approvals", {}), "timeout", 5)
+        return instance, cues
+
+    def test_clarify_answer_switches_light_back_to_working(self, cli_mod, monkeypatch):
+        instance, cues = self._bare_cli(cli_mod, monkeypatch)
+        instance._clarify_state = None
+        instance._clarify_freetext = False
+        instance._clarify_deadline = 0
+
+        result_holder = {}
+        thread = threading.Thread(
+            target=lambda: result_holder.setdefault("result", instance._clarify_callback("Pick", ["A", "B"])),
+        )
+        thread.start()
+        deadline = time.time() + 2
+        while instance._clarify_state is None and time.time() < deadline:
+            time.sleep(0.01)
+        assert instance._clarify_state is not None
+        instance._clarify_state["response_queue"].put("A")
+        thread.join(timeout=2)
+
+        assert result_holder["result"] == "A"
+        assert cues == ["human_intervention", "working"]
+
+    def test_approval_answer_switches_light_back_to_working(self, cli_mod, monkeypatch):
+        instance, cues = self._bare_cli(cli_mod, monkeypatch)
+        instance._approval_state = None
+        instance._approval_deadline = 0
+        instance._approval_lock = threading.Lock()
+
+        result_holder = {}
+        thread = threading.Thread(
+            target=lambda: result_holder.setdefault("result", instance._approval_callback("echo ok", "test")),
+        )
+        thread.start()
+        deadline = time.time() + 2
+        while instance._approval_state is None and time.time() < deadline:
+            time.sleep(0.01)
+        assert instance._approval_state is not None
+        instance._approval_state["response_queue"].put("once")
+        thread.join(timeout=2)
+
+        assert result_holder["result"] == "once"
+        assert cues == ["human_intervention", "working"]

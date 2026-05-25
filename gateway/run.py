@@ -16829,10 +16829,34 @@ class GatewayRunner:
                     # sentinel so the agent can fall back to a sensible
                     # default rather than hanging.
                     _clarify_mod.clear_session(session_key or "")
+                    try:
+                        safe_schedule_threadsafe(
+                            _status_adapter.emit_light_cue_for_chat(
+                                _status_chat_id,
+                                LightCueEvent.WORKING,
+                            ),
+                            _loop_for_step,
+                            logger=logger,
+                            log_message="Clarify delivery-failure resume light-cue scheduling error",
+                        )
+                    except Exception:
+                        pass
                     return "[clarify prompt could not be delivered]"
 
                 timeout = _clarify_mod.get_clarify_timeout()
                 response = _clarify_mod.wait_for_response(clarify_id, timeout=float(timeout))
+                try:
+                    safe_schedule_threadsafe(
+                        _status_adapter.emit_light_cue_for_chat(
+                            _status_chat_id,
+                            LightCueEvent.WORKING,
+                        ),
+                        _loop_for_step,
+                        logger=logger,
+                        log_message="Clarify resume light-cue scheduling error",
+                    )
+                except Exception:
+                    pass
                 if response is None or response == "":
                     # Timeout or session-boundary cancellation
                     return f"[user did not respond within {int(timeout / 60)}m]"
@@ -16890,9 +16914,11 @@ class GatewayRunner:
             # to the user immediately.
             from tools.approval import (
                 register_gateway_notify,
+                register_gateway_resume,
                 reset_current_session_key,
                 set_current_session_key,
                 unregister_gateway_notify,
+                unregister_gateway_resume,
             )
 
             def _approval_notify_sync(approval_data: dict) -> None:
@@ -16983,6 +17009,23 @@ class GatewayRunner:
                         _approval_send_fut.result(timeout=15)
                 except Exception as _e:
                     logger.error("Failed to send approval request: %s", _e)
+
+            def _approval_resume_sync() -> None:
+                """Mark gateway light cues working after any approval path unblocks."""
+                if _status_adapter is None:
+                    return
+                try:
+                    safe_schedule_threadsafe(
+                        _status_adapter.emit_light_cue_for_chat(
+                            _status_chat_id,
+                            LightCueEvent.WORKING,
+                        ),
+                        _loop_for_step,
+                        logger=logger,
+                        log_message="Approval resume light-cue scheduling error",
+                    )
+                except Exception:
+                    pass
 
             # Prepend pending model switch note so the model knows about the switch
             _pending_notes = getattr(self, '_pending_model_notes', {})
@@ -17076,6 +17119,7 @@ class GatewayRunner:
             _approval_session_key = session_key or ""
             _approval_session_token = set_current_session_key(_approval_session_key)
             register_gateway_notify(_approval_session_key, _approval_notify_sync)
+            register_gateway_resume(_approval_session_key, _approval_resume_sync)
             try:
                 # If _prepare_inbound_message_text buffered image paths for native
                 # attachment, wrap the user turn as an OpenAI-style multimodal
@@ -17120,6 +17164,7 @@ class GatewayRunner:
                     _conversation_kwargs["persist_user_message"] = message
                 result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
             finally:
+                unregister_gateway_resume(_approval_session_key)
                 unregister_gateway_notify(_approval_session_key)
                 # Cancel any pending clarify entries so blocked agent
                 # threads don't hang past the end of the run (interrupt,

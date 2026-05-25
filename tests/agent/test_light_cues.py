@@ -8,6 +8,7 @@ from agent.light_cues import (
     LightCueMode,
     LightCueService,
     NullLightCueBackend,
+    SlotStatusFileBackend,
     WiZLightCueBackend,
     build_light_cue_service_from_config,
     load_light_cue_mode,
@@ -286,6 +287,162 @@ def test_light_cue_service_reloads_sticky_mode_before_emit(tmp_path, monkeypatch
     assert service.emit(LightCueEvent.WORKING) is False
     assert backend.actions == []
     assert service.mode is LightCueMode.NO_LIGHT
+
+
+def test_slot_status_file_backend_writes_per_slot_status_atomically(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_SLOT", "2")
+
+    service = LightCueService(backend=RecordingBackend(), slot_status_backend=SlotStatusFileBackend.from_env())
+
+    assert service.emit(LightCueEvent.WORKING) is True
+    status_path = tmp_path / "agent-lights" / "slots" / "2.json"
+    payload = json.loads(status_path.read_text(encoding="utf-8"))
+    assert payload["slot"] == 2
+    assert payload["event"] == "working"
+    assert payload["state"] == "working"
+    assert payload["pid"] > 0
+    assert payload["process_started_at"]
+    assert payload["updated_at"]
+    assert not status_path.with_suffix(".json.tmp").exists()
+
+
+def test_mark_slot_online_writes_idle_status_without_physical_light_action(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_SLOT", "1")
+    backend = RecordingBackend()
+    service = LightCueService(backend=backend, slot_status_backend=SlotStatusFileBackend.from_env())
+
+    assert service.mark_slot_online() is True
+
+    assert backend.actions == []
+    payload = json.loads((tmp_path / "agent-lights" / "slots" / "1.json").read_text(encoding="utf-8"))
+    assert payload["slot"] == 1
+    assert payload["event"] == "idle"
+    assert payload["state"] == "idle"
+    assert payload["pid"] > 0
+    assert payload["process_started_at"]
+
+
+def test_slot_status_file_backend_ignores_missing_or_invalid_slot_without_auto_assign(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv("HERMES_SLOT", raising=False)
+    assert SlotStatusFileBackend.from_env() is None
+
+    monkeypatch.setenv("HERMES_SLOT", "5")
+    assert SlotStatusFileBackend.from_env() is None
+
+    monkeypatch.setenv("HERMES_SLOT", "nope")
+    assert SlotStatusFileBackend.from_env() is None
+    assert not (tmp_path / "agent-lights").exists()
+
+
+def test_slot_status_file_backend_auto_assigns_first_available_slot(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv("HERMES_SLOT", raising=False)
+
+    backend = SlotStatusFileBackend.from_env(auto_assign=True)
+
+    assert backend is not None
+    assert backend.slot == 1
+    assert (tmp_path / "agent-lights" / "slots" / "1.lock").exists()
+
+
+def test_slot_status_file_backend_auto_assign_skips_live_lock_claim(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv("HERMES_SLOT", raising=False)
+    slots = tmp_path / "agent-lights" / "slots"
+    slots.mkdir(parents=True)
+    (slots / "1.lock").write_text(json.dumps({"pid": 111, "process_started_at": "started-111"}), encoding="utf-8")
+    monkeypatch.setattr(SlotStatusFileBackend, "_pid_is_running", staticmethod(lambda pid: pid == 111))
+    monkeypatch.setattr(SlotStatusFileBackend, "_process_started_at", staticmethod(lambda pid: "started-111" if pid == 111 else "current"))
+
+    backend = SlotStatusFileBackend.from_env(auto_assign=True)
+
+    assert backend is not None
+    assert backend.slot == 2
+
+
+def test_slot_status_file_backend_auto_assign_removes_dead_lock_claim(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv("HERMES_SLOT", raising=False)
+    slots = tmp_path / "agent-lights" / "slots"
+    slots.mkdir(parents=True)
+    (slots / "1.lock").write_text(json.dumps({"pid": 111, "process_started_at": "started-111"}), encoding="utf-8")
+    monkeypatch.setattr(SlotStatusFileBackend, "_pid_is_running", staticmethod(lambda pid: False))
+
+    backend = SlotStatusFileBackend.from_env(auto_assign=True)
+
+    assert backend is not None
+    assert backend.slot == 1
+
+
+def test_slot_status_file_backend_auto_assigns_invalid_slot_to_available_slot(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_SLOT", "6")
+    slots = tmp_path / "agent-lights" / "slots"
+    slots.mkdir(parents=True)
+    (slots / "1.json").write_text(json.dumps({"slot": 1, "pid": 111, "state": "idle"}), encoding="utf-8")
+    monkeypatch.setattr(SlotStatusFileBackend, "_pid_is_running", staticmethod(lambda pid: pid == 111))
+
+    backend = SlotStatusFileBackend.from_env(auto_assign=True)
+
+    assert backend is not None
+    assert backend.slot == 2
+
+
+def test_slot_status_file_backend_auto_assign_caps_at_four_live_slots(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv("HERMES_SLOT", raising=False)
+    slots = tmp_path / "agent-lights" / "slots"
+    slots.mkdir(parents=True)
+    for slot in range(1, 5):
+        (slots / f"{slot}.json").write_text(json.dumps({"slot": slot, "pid": 100 + slot, "state": "idle"}), encoding="utf-8")
+    monkeypatch.setattr(SlotStatusFileBackend, "_pid_is_running", staticmethod(lambda pid: True))
+
+    assert SlotStatusFileBackend.from_env(auto_assign=True) is None
+
+
+def test_slot_status_file_backend_auto_assign_reuses_current_process_slot(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv("HERMES_SLOT", raising=False)
+    slots = tmp_path / "agent-lights" / "slots"
+    slots.mkdir(parents=True)
+    (slots / "3.json").write_text(json.dumps({"slot": 3, "pid": __import__("os").getpid(), "state": "idle"}), encoding="utf-8")
+
+    backend = SlotStatusFileBackend.from_env(auto_assign=True)
+
+    assert backend is not None
+    assert backend.slot == 3
+
+
+def test_slot_status_file_backend_updates_even_when_physical_light_mode_is_off(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_SLOT", "3")
+    save_light_cue_mode(LightCueMode.NO_LIGHT)
+    service = LightCueService(backend=RecordingBackend(), slot_status_backend=SlotStatusFileBackend.from_env())
+
+    assert service.emit(LightCueEvent.FINAL_ANSWER) is False
+
+    status_path = tmp_path / "agent-lights" / "slots" / "3.json"
+    payload = json.loads(status_path.read_text(encoding="utf-8"))
+    assert payload["state"] == "final_answer"
+
+    service.emit(LightCueEvent.WORKING)
+    payload = json.loads(status_path.read_text(encoding="utf-8"))
+    assert payload["state"] == "working"
+
+
+def test_config_builder_enables_slot_status_backend_from_env(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_SLOT", "4")
+
+    service = build_light_cue_service_from_config({})
+
+    assert service.emit(LightCueEvent.IDLE) is False
+    payload = json.loads((tmp_path / "agent-lights" / "slots" / "4.json").read_text(encoding="utf-8"))
+    assert payload["slot"] == 4
+    assert payload["state"] == "idle"
 
 
 def test_config_builder_reuses_telegram_wiz_notification_light(monkeypatch):

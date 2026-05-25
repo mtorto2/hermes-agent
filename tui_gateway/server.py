@@ -415,7 +415,7 @@ def _get_tui_light_cue_service(session: dict | None):
 
         service = session.get("_light_cue_service")
         if not isinstance(service, LightCueService):
-            service = build_light_cue_service_from_config(_load_cfg())
+            service = build_light_cue_service_from_config(_load_cfg(), auto_assign_slot=True)
             session["_light_cue_service"] = service
         return service
     except Exception:
@@ -624,6 +624,12 @@ def _start_agent_build(sid: str, session: dict) -> None:
                 pass
 
             _wire_callbacks(sid)
+            try:
+                service = _get_tui_light_cue_service(current)
+                if service is not None:
+                    service.mark_slot_online()
+            except Exception:
+                logger.debug("TUI startup slot idle mark failed", exc_info=True)
             _sessions[sid]["_notif_stop"] = _start_notification_poller(sid, _sessions[sid])
             _notify_session_boundary("on_session_reset", key)
 
@@ -784,7 +790,16 @@ def _block_with_light_cue(event: str, sid: str, payload: dict, timeout: int = 30
         _emit_tui_light_cue(sid, LightCueEvent.HUMAN_INTERVENTION)
     except Exception:
         pass
-    return _block(event, sid, payload, timeout=timeout)
+    try:
+        result = _block(event, sid, payload, timeout=timeout)
+    finally:
+        try:
+            from agent.light_cues import LightCueEvent
+
+            _emit_tui_light_cue(sid, LightCueEvent.WORKING)
+        except Exception:
+            pass
+    return result
 
 
 def _clear_pending(sid: str | None = None) -> None:
@@ -2153,6 +2168,12 @@ def _init_session(sid: str, key: str, agent, history: list, cols: int = 80):
         # session startup resilient).
         pass
     _wire_callbacks(sid)
+    try:
+        service = _get_tui_light_cue_service(_sessions[sid])
+        if service is not None:
+            service.mark_slot_online()
+    except Exception:
+        logger.debug("TUI startup slot idle mark failed", exc_info=True)
     _sessions[sid]["_notif_stop"] = _start_notification_poller(sid, _sessions[sid])
     _notify_session_boundary("on_session_reset", key)
     _emit("session.info", sid, _session_info(agent))
@@ -2315,6 +2336,16 @@ def _(rid, params: dict) -> dict:
         "tool_started_at": {},
         "transport": current_transport() or _stdio_transport,
     }
+
+    # Publish the slot immediately for menu-bar surfaces. This is intentionally
+    # independent of AIAgent construction so a new `HERMES_SLOT=N hermes --tui`
+    # shows as idle/gray as soon as the TUI session comes online.
+    try:
+        service = _get_tui_light_cue_service(_sessions[sid])
+        if service is not None:
+            service.mark_slot_online()
+    except Exception:
+        logger.debug("TUI session-create slot idle mark failed", exc_info=True)
 
     # Return the lightweight session immediately so Ink can paint the composer
     # + skeleton panel, then build the real AIAgent just after this response is
