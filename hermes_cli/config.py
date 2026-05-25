@@ -2369,6 +2369,14 @@ OPTIONAL_ENV_VARS = {
         "password": True,
         "category": "tool",
     },
+    "HEYGEN_API_KEY": {
+        "description": "HeyGen API key for avatar and video generation workflows",
+        "prompt": "HeyGen API key",
+        "url": "https://app.heygen.com/settings?nav=API",
+        "tools": ["video_generate"],
+        "password": True,
+        "category": "tool",
+    },
     "VOICE_TOOLS_OPENAI_KEY": {
         "description": "OpenAI API key for voice transcription (Whisper) and OpenAI TTS",
         "prompt": "OpenAI API Key (for Whisper STT + TTS)",
@@ -5065,6 +5073,7 @@ def show_config():
         ("BROWSERBASE_API_KEY", "Browserbase"),
         ("BROWSER_USE_API_KEY", "Browser Use"),
         ("FAL_KEY", "FAL"),
+        ("HEYGEN_API_KEY", "HeyGen"),
     ]
     
     for env_key, name in keys:
