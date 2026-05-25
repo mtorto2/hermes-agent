@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from enum import Enum
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -69,9 +71,57 @@ class LightCueBackend(Protocol):
         ...
 
 
+class SlotStatusBackend(Protocol):
+    def emit_event(self, event: LightCueEvent) -> bool:
+        ...
+
+
 class NullLightCueBackend:
     def emit(self, action: LightCueAction) -> bool:
         return False
+
+
+@dataclass(frozen=True)
+class SlotStatusFileBackend:
+    """Write per-agent slot lifecycle status for local renderers.
+
+    This is intentionally separate from physical light mode. Matt may disable
+    LEDs while still wanting a menu bar surface to know which Hermes lane needs
+    attention.
+    """
+
+    slot: int
+    directory: Path | None = None
+
+    @classmethod
+    def from_env(cls) -> "SlotStatusFileBackend | None":
+        raw_slot = os.environ.get("HERMES_SLOT", "").strip()
+        try:
+            slot = int(raw_slot)
+        except ValueError:
+            return None
+        if slot not in {1, 2, 3, 4}:
+            return None
+        return cls(slot=slot)
+
+    @property
+    def _directory(self) -> Path:
+        return self.directory or (Path(get_hermes_home()) / "agent-lights" / "slots")
+
+    def emit_event(self, event: LightCueEvent) -> bool:
+        path = self._directory / f"{self.slot}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "slot": self.slot,
+            "event": event.value,
+            "state": event.value,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "pid": os.getpid(),
+        }
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        tmp.replace(path)
+        return True
 
 
 def _state_path() -> Path:
@@ -102,9 +152,16 @@ def save_light_cue_mode(mode: LightCueMode | str) -> LightCueMode:
 
 
 class LightCueService:
-    def __init__(self, backend: LightCueBackend | None = None, *, mode: LightCueMode | str | None = None):
+    def __init__(
+        self,
+        backend: LightCueBackend | None = None,
+        *,
+        mode: LightCueMode | str | None = None,
+        slot_status_backend: SlotStatusBackend | None = None,
+    ):
         self.backend = backend or NullLightCueBackend()
         self.mode = LightCueMode.from_value(mode) if mode is not None else load_light_cue_mode()
+        self.slot_status_backend = slot_status_backend
 
     def set_mode(self, mode: LightCueMode | str, *, persist: bool = True) -> LightCueMode:
         self.mode = LightCueMode.from_value(mode)
@@ -143,6 +200,12 @@ class LightCueService:
     def emit(self, event: LightCueEvent | str) -> bool:
         # Reload the sticky profile-level mode before every cue so long-lived
         # terminal and gateway processes observe menu changes made elsewhere.
+        event = LightCueEvent.from_value(event)
+        if self.slot_status_backend is not None:
+            try:
+                self.slot_status_backend.emit_event(event)
+            except Exception as exc:
+                logger.debug("Slot status backend failed: %s", exc)
         self.mode = load_light_cue_mode(self.mode)
         action = self.action_for(event)
         if action is None:
@@ -163,6 +226,7 @@ def build_light_cue_service_from_config(config: dict[str, Any] | None = None) ->
     backend rather than platform adapter code.
     """
     config = config or {}
+    slot_status_backend = SlotStatusFileBackend.from_env()
     mode = LightCueMode.from_value((config.get("light_cues") or {}).get("mode")) if isinstance(config, dict) else LightCueMode.DEFAULT
     wiz_cfg: Any = None
     try:
@@ -187,7 +251,7 @@ def build_light_cue_service_from_config(config: dict[str, Any] | None = None) ->
     if wiz_cfg:
         try:
             wiz_config = WiZLightCueConfig.from_mapping(wiz_cfg)
-            return LightCueService(backend=WiZLightCueBackend(wiz_config), mode=mode)
+            return LightCueService(backend=WiZLightCueBackend(wiz_config), mode=mode, slot_status_backend=slot_status_backend)
         except Exception as exc:
             logger.debug("Failed to build WiZ light cue backend from config: %s", exc)
-    return LightCueService(mode=mode)
+    return LightCueService(mode=mode, slot_status_backend=slot_status_backend)

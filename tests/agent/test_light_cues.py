@@ -8,6 +8,7 @@ from agent.light_cues import (
     LightCueMode,
     LightCueService,
     NullLightCueBackend,
+    SlotStatusFileBackend,
     WiZLightCueBackend,
     build_light_cue_service_from_config,
     load_light_cue_mode,
@@ -286,6 +287,66 @@ def test_light_cue_service_reloads_sticky_mode_before_emit(tmp_path, monkeypatch
     assert service.emit(LightCueEvent.WORKING) is False
     assert backend.actions == []
     assert service.mode is LightCueMode.NO_LIGHT
+
+
+def test_slot_status_file_backend_writes_per_slot_status_atomically(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_SLOT", "2")
+
+    service = LightCueService(backend=RecordingBackend(), slot_status_backend=SlotStatusFileBackend.from_env())
+
+    assert service.emit(LightCueEvent.WORKING) is True
+
+    status_path = tmp_path / "agent-lights" / "slots" / "2.json"
+    payload = json.loads(status_path.read_text(encoding="utf-8"))
+    assert payload["slot"] == 2
+    assert payload["event"] == "working"
+    assert payload["state"] == "working"
+    assert payload["pid"] > 0
+    assert payload["updated_at"]
+    assert not status_path.with_suffix(".json.tmp").exists()
+
+
+def test_slot_status_file_backend_ignores_missing_or_invalid_slot(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv("HERMES_SLOT", raising=False)
+    assert SlotStatusFileBackend.from_env() is None
+
+    monkeypatch.setenv("HERMES_SLOT", "5")
+    assert SlotStatusFileBackend.from_env() is None
+
+    monkeypatch.setenv("HERMES_SLOT", "nope")
+    assert SlotStatusFileBackend.from_env() is None
+    assert not (tmp_path / "agent-lights").exists()
+
+
+def test_slot_status_file_backend_updates_even_when_physical_light_mode_is_off(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_SLOT", "3")
+    save_light_cue_mode(LightCueMode.NO_LIGHT)
+    service = LightCueService(backend=RecordingBackend(), slot_status_backend=SlotStatusFileBackend.from_env())
+
+    assert service.emit(LightCueEvent.FINAL_ANSWER) is False
+
+    status_path = tmp_path / "agent-lights" / "slots" / "3.json"
+    payload = json.loads(status_path.read_text(encoding="utf-8"))
+    assert payload["state"] == "final_answer"
+
+    service.emit(LightCueEvent.WORKING)
+    payload = json.loads(status_path.read_text(encoding="utf-8"))
+    assert payload["state"] == "working"
+
+
+def test_config_builder_enables_slot_status_backend_from_env(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_SLOT", "4")
+
+    service = build_light_cue_service_from_config({})
+
+    assert service.emit(LightCueEvent.IDLE) is False
+    payload = json.loads((tmp_path / "agent-lights" / "slots" / "4.json").read_text(encoding="utf-8"))
+    assert payload["slot"] == 4
+    assert payload["state"] == "idle"
 
 
 def test_config_builder_reuses_telegram_wiz_notification_light(monkeypatch):
