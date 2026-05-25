@@ -70,6 +70,8 @@ _HERMES_CORE_TOOLS = [
     "kanban_unblock",
     # Computer use (macOS, gated on cua-driver being installed via check_fn)
     "computer_use",
+    # Apple Calendar (macOS/iCloud, gated on EventKit-capable Swift runtime)
+    "apple_calendar",
 ]
 
 # Webhook events may originate from untrusted third-party content (for example,
@@ -146,6 +148,15 @@ TOOLSETS = {
             "or keyboard focus. Works with any tool-capable model."
         ),
         "tools": ["computer_use"],
+        "includes": []
+    },
+
+    "apple_calendar": {
+        "description": (
+            "Native macOS/iCloud Apple Calendar access via EventKit. Lists calendars/events "
+            "and can create or delete events after explicit user confirmation."
+        ),
+        "tools": ["apple_calendar"],
         "includes": []
     },
 
