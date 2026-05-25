@@ -7634,6 +7634,17 @@ class HermesCLI:
             return "\n".join(p for p in parts if p)
         return str(value)
 
+    def _sync_personality_voice(self, personality_name: str) -> None:
+        """Switch the active TTS voice when a configured personality changes."""
+        try:
+            from hermes_cli.personality_voice import save_personality_voice
+            _changed, alias, provider = save_personality_voice(personality_name)
+        except Exception as exc:
+            print(f"  Voice switch skipped: {exc}")
+            return
+        if alias:
+            print(f"  Voice: {alias} ({provider})")
+
     def _handle_gquota_command(self, cmd_original: str) -> None:
         """Show Google Gemini Code Assist quota usage for the current OAuth account."""
         try:
@@ -7695,6 +7706,7 @@ class HermesCLI:
                     print("(^_^)b Personality cleared (saved to config)")
                 else:
                     print("(^_^) Personality cleared (session only)")
+                self._sync_personality_voice(personality_name)
                 print("  No personality overlay — using base agent behavior.")
             elif personality_name in self.personalities:
                 self.system_prompt = self._resolve_personality_prompt(self.personalities[personality_name])
@@ -7703,6 +7715,7 @@ class HermesCLI:
                     print(f"(^_^)b Personality set to '{personality_name}' (saved to config)")
                 else:
                     print(f"(^_^) Personality set to '{personality_name}' (session only)")
+                self._sync_personality_voice(personality_name)
                 print(f"  \"{self.system_prompt[:60]}{'...' if len(self.system_prompt) > 60 else ''}\"")
             else:
                 print(f"(._.) Unknown personality: {personality_name}")
