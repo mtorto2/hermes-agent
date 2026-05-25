@@ -59,6 +59,15 @@ def test_write_json_returns_false_on_broken_pipe(monkeypatch):
     assert server.write_json({"ok": True}) is False
 
 
+def test_block_with_light_cue_returns_to_working_after_answer(monkeypatch):
+    cues = []
+    monkeypatch.setattr(server, "_emit_tui_light_cue", lambda sid, event: cues.append(getattr(event, "value", event)))
+    monkeypatch.setattr(server, "_block", lambda event, sid, payload, timeout=300: "answer")
+
+    assert server._block_with_light_cue("clarify.request", "sid-1", {}, timeout=1) == "answer"
+    assert cues == ["human_intervention", "working"]
+
+
 def test_tui_verbose_tool_details_fail_closed_when_redaction_fails(monkeypatch):
     redact_module = types.ModuleType("agent.redact")
 
@@ -2232,9 +2241,11 @@ def test_block_with_light_cue_marks_human_intervention(monkeypatch):
     answer = server._block_with_light_cue("clarify.request", "sid", {}, timeout=12)
 
     assert answer == "clarify.request:sid:12"
-    assert len(calls) == 1
+    assert len(calls) == 2
     assert calls[0][0] == "sid"
     assert getattr(calls[0][1], "value", calls[0][1]) == "human_intervention"
+    assert calls[1][0] == "sid"
+    assert getattr(calls[1][1], "value", calls[1][1]) == "working"
 
 
 def test_prompt_submit_expands_context_refs(monkeypatch):

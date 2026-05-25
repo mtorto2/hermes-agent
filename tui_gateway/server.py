@@ -790,7 +790,16 @@ def _block_with_light_cue(event: str, sid: str, payload: dict, timeout: int = 30
         _emit_tui_light_cue(sid, LightCueEvent.HUMAN_INTERVENTION)
     except Exception:
         pass
-    return _block(event, sid, payload, timeout=timeout)
+    try:
+        result = _block(event, sid, payload, timeout=timeout)
+    finally:
+        try:
+            from agent.light_cues import LightCueEvent
+
+            _emit_tui_light_cue(sid, LightCueEvent.WORKING)
+        except Exception:
+            pass
+    return result
 
 
 def _clear_pending(sid: str | None = None) -> None:

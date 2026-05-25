@@ -72,6 +72,7 @@ def _clear_approval_state():
     from tools import approval as mod
     mod._gateway_queues.clear()
     mod._gateway_notify_cbs.clear()
+    mod._gateway_resume_cbs.clear()
     mod._session_approved.clear()
     mod._permanent_approved.clear()
     mod._pending.clear()
@@ -121,6 +122,30 @@ class TestBlockingGatewayApproval:
     def test_resolve_returns_zero_when_no_pending(self):
         from tools.approval import resolve_gateway_approval
         assert resolve_gateway_approval("nonexistent", "once") == 0
+
+    def test_resolve_calls_resume_callback_after_unblocking(self):
+        from tools.approval import (
+            _ApprovalEntry,
+            _gateway_queues,
+            register_gateway_resume,
+            resolve_gateway_approval,
+            unregister_gateway_resume,
+        )
+
+        session_key = "test-resume-callback"
+        calls = []
+        register_gateway_resume(session_key, lambda: calls.append("working"))
+        entry = _ApprovalEntry({"command": "rm -rf /tmp/nope"})
+        _gateway_queues[session_key] = [entry]
+
+        try:
+            assert resolve_gateway_approval(session_key, "once") == 1
+        finally:
+            unregister_gateway_resume(session_key)
+
+        assert entry.event.is_set()
+        assert entry.result == "once"
+        assert calls == ["working"]
 
     def test_resolve_all_unblocks_multiple_entries(self):
         """resolve_gateway_approval with resolve_all=True signals all entries."""
@@ -416,6 +441,44 @@ class TestBlockingApprovalE2E:
         assert result_holder[0] is not None
         assert result_holder[0]["approved"] is True
         unregister_gateway_notify(session_key)
+
+    def test_blocking_approval_timeout_fires_resume_callback(self):
+        """Timed-out gateway approvals also resume the working light cue."""
+        from tools.approval import (
+            check_all_command_guards,
+            register_gateway_notify,
+            register_gateway_resume,
+            reset_current_session_key,
+            set_current_session_key,
+            unregister_gateway_notify,
+            unregister_gateway_resume,
+        )
+
+        session_key = "e2e-timeout-test"
+        notified = []
+        resumed = []
+        register_gateway_notify(session_key, lambda d: notified.append(d))
+        register_gateway_resume(session_key, lambda: resumed.append("working"))
+
+        with patch("hermes_cli.config.load_config", return_value={"approvals": {"gateway_timeout": 0}}):
+            token = set_current_session_key(session_key)
+            os.environ["HERMES_GATEWAY_SESSION"] = "1"
+            os.environ["HERMES_EXEC_ASK"] = "1"
+            os.environ["HERMES_SESSION_KEY"] = session_key
+            try:
+                result = check_all_command_guards("rm -rf /important", "local")
+            finally:
+                os.environ.pop("HERMES_GATEWAY_SESSION", None)
+                os.environ.pop("HERMES_EXEC_ASK", None)
+                os.environ.pop("HERMES_SESSION_KEY", None)
+                reset_current_session_key(token)
+                unregister_gateway_resume(session_key)
+                unregister_gateway_notify(session_key)
+
+        assert notified
+        assert result["approved"] is False
+        assert result["outcome"] == "timeout"
+        assert resumed == ["working"]
 
     def test_blocking_approval_deny(self):
         """check_all_command_guards returns BLOCKED when denied."""

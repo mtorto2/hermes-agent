@@ -11018,6 +11018,7 @@ class HermesCLI:
             try:
                 result = response_queue.get(timeout=1)
                 self._clarify_deadline = 0
+                self._emit_light_cue(LightCueEvent.WORKING)
                 return result
             except queue.Empty:
                 remaining = self._clarify_deadline - _time.monotonic()
@@ -11038,6 +11039,7 @@ class HermesCLI:
         self._clarify_deadline = 0
         self._invalidate()
         _cprint(f"\n{_DIM}(clarify timed out after {timeout}s — agent will decide){_RST}")
+        self._emit_light_cue(LightCueEvent.WORKING)
         return (
             "The user did not provide a response within the time limit. "
             "Use your best judgement to make the choice and proceed."
@@ -11129,6 +11131,7 @@ class HermesCLI:
                     self._approval_state = None
                     self._approval_deadline = 0
                     self._invalidate()
+                    self._emit_light_cue(LightCueEvent.WORKING)
                     return result
                 except queue.Empty:
                     remaining = self._approval_deadline - _time.monotonic()
@@ -11143,6 +11146,7 @@ class HermesCLI:
             self._approval_deadline = 0
             self._invalidate()
             _cprint(f"\n{_DIM}  ⏱ Timeout — denying command{_RST}")
+            self._emit_light_cue(LightCueEvent.WORKING)
             return "deny"
 
     def _approval_choices(self, command: str, *, allow_permanent: bool = True) -> list[str]:
