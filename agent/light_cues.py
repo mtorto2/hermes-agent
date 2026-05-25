@@ -163,6 +163,8 @@ class AgentLightsMenuBarLauncher:
   <string>1</string>
   <key>LSUIElement</key>
   <true/>
+  <key>NSAppleEventsUsageDescription</key>
+  <string>Hermes Agent Lights uses Terminal automation to focus the Terminal tab for the selected Hermes instance.</string>
 </dict>
 </plist>
 """,
@@ -195,17 +197,25 @@ class SlotStatusFileBackend:
         directory: Path | None = None,
         model_name: str | None = None,
     ) -> "SlotStatusFileBackend | None":
+        resolved_directory = directory or cls._default_directory_for_process()
         raw_slot = os.environ.get("HERMES_SLOT", "").strip()
         try:
             slot = int(raw_slot)
         except ValueError:
             slot = 0
         if slot in {1, 2, 3, 4}:
-            return cls._with_exit_cleanup(cls(slot=slot, directory=directory, model_name=model_name))
+            return cls._with_exit_cleanup(cls(slot=slot, directory=resolved_directory, model_name=model_name))
         if not auto_assign:
             return None
-        slot = cls._claim_available_slot(directory or (Path(get_hermes_home()) / "agent-lights" / "slots"))
-        return cls._with_exit_cleanup(cls(slot=slot, directory=directory, model_name=model_name)) if slot is not None else None
+        slot = cls._claim_available_slot(resolved_directory)
+        return cls._with_exit_cleanup(cls(slot=slot, directory=resolved_directory, model_name=model_name)) if slot is not None else None
+
+    @staticmethod
+    def _default_directory_for_process() -> Path:
+        base = Path(get_hermes_home()) / "agent-lights"
+        if os.environ.get("HERMES_KANBAN_TASK"):
+            return base / "agents"
+        return base / "slots"
 
     @classmethod
     def _with_exit_cleanup(cls, backend: "SlotStatusFileBackend") -> "SlotStatusFileBackend":

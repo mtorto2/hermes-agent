@@ -321,13 +321,35 @@ def test_slot_status_file_backend_marks_kanban_workers(tmp_path, monkeypatch):
     service = LightCueService(backend=RecordingBackend(), slot_status_backend=SlotStatusFileBackend.from_env())
 
     assert service.emit(LightCueEvent.WORKING) is True
-    payload = json.loads((tmp_path / "agent-lights" / "slots" / "2.json").read_text(encoding="utf-8"))
+    payload = json.loads((tmp_path / "agent-lights" / "agents" / "2.json").read_text(encoding="utf-8"))
     assert payload["source"] == "kanban_worker"
     assert payload["model_name"] == "openai-codex/gpt-5.5"
     assert payload["kanban_task_id"] == "t_ring1234"
     assert payload["kanban_board"] == "voice-clipboard"
     assert payload["kanban_task_title"] == "Investigate menu rings"
     assert payload["profile"] == "matt-codex"
+    assert not (tmp_path / "agent-lights" / "slots" / "2.json").exists()
+
+
+def test_kanban_worker_auto_assignment_uses_separate_agent_capacity_pool(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv("HERMES_SLOT", raising=False)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_agent_pool")
+    slots = tmp_path / "agent-lights" / "slots"
+    slots.mkdir(parents=True)
+    for slot in range(1, 5):
+        (slots / f"{slot}.json").write_text(
+            json.dumps({"slot": slot, "pid": 100 + slot, "state": "idle", "source": "hermes"}),
+            encoding="utf-8",
+        )
+    monkeypatch.setattr(SlotStatusFileBackend, "_pid_is_running", staticmethod(lambda pid: 100 < pid < 105))
+
+    backend = SlotStatusFileBackend.from_env(auto_assign=True)
+
+    assert backend is not None
+    assert backend.slot == 1
+    assert backend._directory == tmp_path / "agent-lights" / "agents"
+    assert (tmp_path / "agent-lights" / "agents" / "1.lock").exists()
 
 
 def test_slot_status_file_backend_uses_config_model_when_env_model_absent(tmp_path, monkeypatch):
@@ -423,7 +445,10 @@ def test_agent_lights_menu_bar_launcher_prepares_app_bundle_from_existing_debug_
     assert app_path == tmp_path / "apps" / "agent-lights-menu-bar" / ".build" / "AgentLightsMenuBar.app"
     executable_path = app_path / "Contents" / "MacOS" / "AgentLightsMenuBar"
     assert executable_path.read_bytes() == b"debug-binary"
-    assert "LSUIElement" in (app_path / "Contents" / "Info.plist").read_text(encoding="utf-8")
+    plist = (app_path / "Contents" / "Info.plist").read_text(encoding="utf-8")
+    assert "LSUIElement" in plist
+    assert "NSAppleEventsUsageDescription" in plist
+    assert "Terminal" in plist
 
 
 def test_agent_lights_menu_bar_launcher_refreshes_existing_bundle_from_debug_binary(tmp_path):

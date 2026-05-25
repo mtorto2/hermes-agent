@@ -4,7 +4,7 @@ Minimal native macOS status item for Matt's active Hermes lanes.
 
 ## Contract
 
-The app reads Hermes slot files from:
+The app reads normal Hermes slot files from:
 
 ```text
 ~/.hermes/agent-lights/slots/1.json
@@ -13,7 +13,16 @@ The app reads Hermes slot files from:
 ~/.hermes/agent-lights/slots/4.json
 ```
 
-Each file is written by Hermes when a terminal/TUI instance starts. Hermes will auto-assign the first available slot, capped at 4 active instances, using per-slot lock files to avoid concurrent startup collisions. Setting `HERMES_SLOT=1..4` still forces a specific slot; missing or invalid values such as `HERMES_SLOT=6` fall back to auto-assignment when capacity is available.
+Kanban worker agents use a separate capacity pool under:
+
+```text
+~/.hermes/agent-lights/agents/1.json
+~/.hermes/agent-lights/agents/2.json
+~/.hermes/agent-lights/agents/3.json
+~/.hermes/agent-lights/agents/4.json
+```
+
+Each file is written by Hermes when a terminal/TUI instance or Kanban worker starts. Hermes will auto-assign the first available slot within the appropriate pool, capped at 4 active normal instances and 4 active Kanban workers, using per-slot lock files to avoid concurrent startup collisions. Setting `HERMES_SLOT=1..4` still forces a specific slot inside that process class's pool; missing or invalid values such as `HERMES_SLOT=6` fall back to auto-assignment when capacity is available.
 
 ## Dot mapping
 
@@ -29,23 +38,63 @@ Left-to-right dots follow active slot order: slot 1, then slot 2, then slot 3, t
 | error | red steady for MVP; flashing/pulse is next polish |
 | idle | gray, but only when the slot's producing process is alive |
 
-Kanban worker slots use the same state colors, but render as thick unfilled rings
-instead of filled dots. Normal Hermes CLI/TUI instances remain filled dots.
+Normal Hermes CLI/TUI instances render as horizontal filled dots in the primary
+menu-bar item. Kanban workers render as a compact 2×2 filled-circle group in that
+same visible item so Ice/menu-bar managers cannot hide a second status item
+independently. The agent group appears only while at least one worker is active:
+positions are top-left, top-right, bottom-left, bottom-right; active worker
+circles use lifecycle colors; unused worker capacity circles remain gray.
 
 A slot renders when its status file is valid and either:
 
 - `pid` is set and that process is still alive, or
 - no live `pid` is available but the status file was modified in the last 120 seconds.
 
-After that grace window, the companion app prunes the stale `.json` and `.lock`
-files so completed/abandoned Kanban worker rings do not persist as ghosts. Normal
-Hermes shutdown also removes the slot owned by that process when shutdown is
-clean.
+After that grace window, the companion app prunes stale `.json` and `.lock` files
+from both pools so completed/abandoned Kanban worker rings do not persist as
+ghosts. Normal Hermes shutdown also removes the slot owned by that process when
+shutdown is clean.
 
-Clicking the menu bar item opens a vertical status menu: the first row summarizes
-active slot count, then each active process gets its own disabled row. Rows include
-slot number, lifecycle state, dot/ring type, model/profile when available, and
-Kanban board/task/title details when the producer wrote them.
+Clicking the menu bar item opens a vertical status menu. The first row uses this
+compact count format:
+
+```text
+Hermes: 3 active  Agents: 6 active
+```
+
+Each active process then gets its own clickable row with compact model/state text,
+for example:
+
+```text
+1: gpt 5.5 - answer ready
+2: claude 4.7 - working
+3: gpt 5.2 - needs intervention
+Agent 1: gpt 5.5 - working
+```
+
+Model names are shortened for readability by dropping provider prefixes and common
+Claude family suffixes. Status labels use human wording (`answer ready`, `working`,
+`needs intervention`) instead of raw lifecycle enum names. Clicking a normal
+Hermes row uses the slot producer PID to find its TTY and asks Terminal.app to
+select/raise the matching tab/window. Clicking an agent row with `kanban_task_id`
+opens Terminal.app and runs `hermes kanban [--board <board>] show <task_id>` so
+the associated Kanban card is pulled up directly. If the process has exited, has
+no TTY, lacks card metadata, or Terminal automation permission is denied, the app
+beeps and leaves focus unchanged.
+
+The status menu also includes **Show Floating Monitor**. This opens a Sticky
+Notes-style monitor window near the upper-right of the screen: translucent
+off-white, rounded, resizable, always-on-top (`.floating` panel level), and
+closable with a simple `×` control. The window shows the same live status feed at
+a larger scale: normal Hermes TUI sessions render as large filled circles with no
+outline, and Kanban worker capacity renders as a large filled 2×2 group with gray
+placeholders. The monitor keeps the same left-to-right ordering as the menu-bar
+item: each Hermes TUI circle occupies one visual unit, and the entire Kanban 2×2
+grid occupies one matching unit to its right. The circle layout recalculates from
+the current window size, so resizing the panel scales and repositions the
+indicators instead of leaving a fixed-size icon. **Monitor More Transparent** and
+**Monitor Less Transparent** menu items adjust the panel opacity in persisted
+steps.
 
 ## Development
 
@@ -65,7 +114,10 @@ open the companion app if it is not already running.
 If Ice or another menu bar manager is installed, a freshly packaged app bundle
 may be treated as a new menu bar item and placed in the hidden section. The app
 can be running correctly while the dots are hidden by Ice; reveal the hidden menu
-bar items once and pin "Hermes Agent Lights" visible for human QA.
+bar items once and pin "Hermes Agent Lights" visible for human QA. The Kanban
+agent circles are intentionally drawn inside the primary Hermes item rather than
+a second status item, so pinning that one item should reveal both Hermes dots and
+agent circles.
 
 ```bash
 cd apps/agent-lights-menu-bar
@@ -84,6 +136,13 @@ JSON
 cat > ~/.hermes/agent-lights/slots/2.json <<'JSON'
 {"slot":2,"state":"final_answer","event":"final_answer","updated_at":"manual","pid":0}
 JSON
+mkdir -p ~/.hermes/agent-lights/agents
+cat > ~/.hermes/agent-lights/agents/1.json <<'JSON'
+{"slot":1,"state":"working","event":"working","updated_at":"manual","pid":0,"source":"kanban_worker"}
+JSON
 ```
 
-The menu item should show two temporary dots, then hide them after the status files become stale unless a live `pid` is present.
+The menu should show two temporary filled dots plus a 2×2 filled-circle agent
+group in the same menu-bar item, with one active colored circle and three gray
+placeholders, then hide them after the status files become stale unless a live
+`pid` is present.

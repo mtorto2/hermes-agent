@@ -31,22 +31,23 @@ public struct SlotStatus: Equatable {
     }
 
     public var menuDetail: String {
-        var parts = ["\(slot): \(state.rawValue)", isKanbanWorker ? "ring" : "dot"]
-        if let taskLocator = nonEmptyTaskLocator {
-            parts.append(taskLocator)
-        }
-        appendIfPresent(kanbanTaskTitle, to: &parts)
-        appendIfPresent(profile, to: &parts)
-        appendIfPresent(modelName, to: &parts)
-        return parts.joined(separator: " · ")
+        "\(slot): \(displayModelName) - \(state.menuLabel)"
     }
 
-    private var nonEmptyTaskLocator: String? {
-        guard let taskId = trimmed(kanbanTaskId) else { return nil }
-        if let board = trimmed(kanbanBoard) {
-            return "\(board)/\(taskId)"
-        }
-        return taskId
+    public var agentMenuDetail: String {
+        "Agent \(slot): \(displayModelName) - \(state.menuLabel)"
+    }
+
+    private var displayModelName: String {
+        guard let rawModel = trimmed(modelName) else { return "unknown" }
+        let leaf = rawModel.split(separator: "/").last.map(String.init) ?? rawModel
+        let normalized = leaf
+            .replacingOccurrences(of: "claude-sonnet-", with: "claude-")
+            .replacingOccurrences(of: "claude-opus-", with: "claude-")
+            .replacingOccurrences(of: "claude-haiku-", with: "claude-")
+            .replacingOccurrences(of: "-", with: " ")
+            .replacingOccurrences(of: "_", with: " ")
+        return normalized.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "unknown" : normalized
     }
 
     public static func missing(slot: Int) -> SlotStatus {
@@ -141,22 +142,313 @@ public struct SlotStatusMenuModel: Equatable {
     public let rowTitles: [String]
     public let tooltip: String
 
-    public init(statuses: [SlotStatus]) {
-        let rowTitles = statuses.map(\.menuDetail)
-        self.rowTitles = rowTitles
-        if rowTitles.isEmpty {
-            self.summaryTitle = "Hermes Agent Lights: no active slots"
-            self.tooltip = self.summaryTitle
-        } else {
-            self.summaryTitle = "Hermes Agent Lights: \(rowTitles.count) active slot\(rowTitles.count == 1 ? "" : "s")"
-            self.tooltip = "Hermes Agent Lights:\n" + rowTitles.joined(separator: "\n")
+    public init(statuses: [SlotStatus], agentCount: Int? = nil) {
+        let hermesStatuses = statuses.filter { !$0.isKanbanWorker }
+        let agentStatuses = statuses.filter(\.isKanbanWorker)
+        self.init(hermesStatuses: hermesStatuses, agentStatuses: agentStatuses, agentCount: agentCount)
+    }
+
+    public init(hermesStatuses: [SlotStatus], agentStatuses: [SlotStatus], agentCount: Int? = nil) {
+        let hermesRows = hermesStatuses.map(\.menuDetail)
+        let agentRows = agentStatuses.map(\.agentMenuDetail)
+        let resolvedAgentCount = agentCount ?? agentStatuses.count
+        self.rowTitles = hermesRows + agentRows
+        self.summaryTitle = "Hermes: \(hermesStatuses.count) active  Agents: \(resolvedAgentCount) active"
+        self.tooltip = rowTitles.isEmpty ? self.summaryTitle : self.summaryTitle + "\n" + rowTitles.joined(separator: "\n")
+    }
+}
+
+public struct AgentRing: Equatable {
+    public let state: SlotLifecycleState
+    public let isPlaceholder: Bool
+
+    public init(state: SlotLifecycleState, isPlaceholder: Bool) {
+        self.state = state
+        self.isPlaceholder = isPlaceholder
+    }
+}
+
+public struct AgentRingGroup: Equatable {
+    public let capacity: Int
+    public let rings: [AgentRing]
+
+    public var shouldRender: Bool {
+        rings.contains { !$0.isPlaceholder }
+    }
+
+    public init(statuses: [SlotStatus], capacity: Int = 4) {
+        self.capacity = capacity
+        let visible = Array(statuses.sorted { $0.slot < $1.slot }.prefix(capacity))
+        var rings = visible.map { AgentRing(state: $0.state, isPlaceholder: false) }
+        while rings.count < capacity {
+            rings.append(AgentRing(state: .missing, isPlaceholder: true))
+        }
+        self.rings = rings
+    }
+}
+
+public struct AgentRingGridPosition: Equatable {
+    public let column: Int
+    public let row: Int
+
+    public init(column: Int, row: Int) {
+        self.column = column
+        self.row = row
+    }
+}
+
+public enum AgentIndicatorStyle: Equatable {
+    case filledCircle
+}
+
+public struct StatusIndicatorGeometry: Equatable {
+    public let hermesDotDiameter: Double
+    public let hermesDotSpacing: Double
+    public let agentIndicatorStyle: AgentIndicatorStyle
+    public let agentCircleDiameter: Double
+    public let agentCircleColumnSpacing: Double
+    public let agentCircleRowSpacing: Double
+    public let agentIndicatorWidth: Double
+
+    public init(
+        hermesDotDiameter: Double = 9.0,
+        hermesDotSpacing: Double = 14.0,
+        agentIndicatorStyle: AgentIndicatorStyle = .filledCircle,
+        agentCircleDiameter: Double = 6.8,
+        agentCircleColumnSpacing: Double = 8.2,
+        agentCircleRowSpacing: Double = 8.2,
+        agentIndicatorWidth: Double = 22.0
+    ) {
+        self.hermesDotDiameter = hermesDotDiameter
+        self.hermesDotSpacing = hermesDotSpacing
+        self.agentIndicatorStyle = agentIndicatorStyle
+        self.agentCircleDiameter = agentCircleDiameter
+        self.agentCircleColumnSpacing = agentCircleColumnSpacing
+        self.agentCircleRowSpacing = agentCircleRowSpacing
+        self.agentIndicatorWidth = agentIndicatorWidth
+    }
+}
+
+public struct StatusIndicatorLayout: Equatable {
+    public let filledDotCount: Int
+    public let agentRingCount: Int
+    public let agentRingColumns: Int
+    public let agentRingRows: Int
+    public let agentRingGridPositions: [AgentRingGridPosition]
+
+    public var shouldRenderAgentRings: Bool {
+        agentRingCount > 0
+    }
+
+    public init(hermesStatuses: [SlotStatus], agentGroup: AgentRingGroup) {
+        self.filledDotCount = min(hermesStatuses.count, 4)
+        self.agentRingCount = agentGroup.shouldRender ? agentGroup.capacity : 0
+        let columns = 2
+        self.agentRingColumns = columns
+        self.agentRingRows = 2
+        self.agentRingGridPositions = (0..<agentGroup.capacity).map { index in
+            AgentRingGridPosition(column: index % columns, row: index / columns)
         }
     }
 }
 
-private func appendIfPresent(_ value: String?, to parts: inout [String]) {
-    if let trimmedValue = trimmed(value) {
-        parts.append(trimmedValue)
+public struct FloatingMonitorWindowSpec: Equatable, Sendable {
+    public let defaultWidth: Double
+    public let defaultHeight: Double
+    public let opacity: Double
+    public let backgroundRed: Double
+    public let backgroundGreen: Double
+    public let backgroundBlue: Double
+    public let backgroundAlpha: Double
+    public let drawsCircleOutlines: Bool
+    public let isFloating: Bool
+    public let isResizable: Bool
+    public let isTranslucent: Bool
+
+    public static let `default` = FloatingMonitorWindowSpec(
+        defaultWidth: 500,
+        defaultHeight: 230,
+        opacity: 0.72,
+        backgroundRed: 0.97,
+        backgroundGreen: 0.96,
+        backgroundBlue: 0.93,
+        backgroundAlpha: 0.58,
+        drawsCircleOutlines: false,
+        isFloating: true,
+        isResizable: true,
+        isTranslucent: true
+    )
+}
+
+public enum FloatingMonitorOpacity {
+    public static let minimum = 0.35
+    public static let maximum = 0.95
+    public static let step = 0.08
+
+    public static func clamped(_ value: Double) -> Double {
+        min(maximum, max(minimum, value))
+    }
+
+    public static func moreTransparent(from value: Double) -> Double {
+        clamped(value - step)
+    }
+
+    public static func lessTransparent(from value: Double) -> Double {
+        clamped(value + step)
+    }
+}
+
+public struct FloatingMonitorSize: Equatable {
+    public let width: Double
+    public let height: Double
+
+    public init(width: Double, height: Double) {
+        self.width = width
+        self.height = height
+    }
+}
+
+public struct FloatingMonitorItem: Equatable {
+    public let state: SlotLifecycleState
+    public let isAgent: Bool
+    public let isPlaceholder: Bool
+    public let x: Double
+    public let y: Double
+    public let diameter: Double
+}
+
+public struct FloatingMonitorLayout: Equatable {
+    public let items: [FloatingMonitorItem]
+
+    public init(size: FloatingMonitorSize, hermesStatuses: [SlotStatus], agentGroup: AgentRingGroup) {
+        let activeHermes = Array(hermesStatuses.prefix(4))
+        let includeAgents = agentGroup.shouldRender
+        let unitCount = activeHermes.count + (includeAgents ? 1 : 0)
+        guard unitCount > 0 else {
+            self.items = []
+            return
+        }
+
+        let availableWidth = max(80, size.width - 56)
+        let availableHeight = max(80, size.height - 62)
+        let unitGapRatio = 0.24
+        let totalGapUnits = Double(max(0, unitCount - 1)) * unitGapRatio
+        let unitSize = max(18, min(availableHeight * 0.72, availableWidth / (Double(unitCount) + totalGapUnits)))
+        let unitGap = unitSize * unitGapRatio
+        let totalWidth = Double(unitCount) * unitSize + Double(max(0, unitCount - 1)) * unitGap
+        var cursorX = (size.width - totalWidth) / 2
+        let centerY = size.height / 2
+        var built: [FloatingMonitorItem] = []
+
+        for status in activeHermes {
+            built.append(FloatingMonitorItem(
+                state: status.state,
+                isAgent: false,
+                isPlaceholder: false,
+                x: cursorX,
+                y: centerY - unitSize / 2,
+                diameter: unitSize
+            ))
+            cursorX += unitSize + unitGap
+        }
+
+        if includeAgents {
+            let agentGapRatio = 0.18
+            let agentDiameter = unitSize / (2 + agentGapRatio)
+            let agentSpacing = agentDiameter * (1 + agentGapRatio)
+            let startX = cursorX
+            let startY = centerY + unitSize / 2 - agentDiameter
+            for (index, ring) in agentGroup.rings.enumerated() {
+                let column = Double(index % 2)
+                let row = Double(index / 2)
+                built.append(FloatingMonitorItem(
+                    state: ring.state,
+                    isAgent: true,
+                    isPlaceholder: ring.isPlaceholder,
+                    x: startX + column * agentSpacing,
+                    y: startY - row * agentSpacing,
+                    diameter: agentDiameter
+                ))
+            }
+        }
+
+        self.items = built
+    }
+}
+
+private extension SlotLifecycleState {
+    var menuLabel: String {
+        switch self {
+        case .finalAnswer:
+            return "answer ready"
+        case .humanIntervention:
+            return "needs intervention"
+        case .working:
+            return "working"
+        case .error:
+            return "error"
+        case .idle:
+            return "idle"
+        case .missing:
+            return "missing"
+        }
+    }
+}
+
+public enum TerminalFocusScript {
+    public static func script(forTTY tty: String) -> String? {
+        let trimmedTTY = tty.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmedTTY.range(of: #"^ttys[0-9]+$"#, options: .regularExpression) != nil else {
+            return nil
+        }
+        let terminalTTY = "/dev/\(trimmedTTY)"
+        return """
+        tell application "Terminal"
+            activate
+            repeat with w in windows
+                repeat with t in tabs of w
+                    if tty of t is "\(terminalTTY)" then
+                        set selected tab of w to t
+                        set index of w to 1
+                        return true
+                    end if
+                end repeat
+            end repeat
+        end tell
+        return false
+        """
+    }
+}
+
+public enum KanbanCardOpenScript {
+    public static func script(taskId: String?, board: String?) -> String? {
+        guard let rawTaskId = trimmed(taskId),
+              rawTaskId.range(of: #"^t_[A-Za-z0-9_-]+$"#, options: .regularExpression) != nil else {
+            return nil
+        }
+        let normalizedBoard = trimmed(board)
+        if let normalizedBoard,
+           normalizedBoard.range(of: #"^[A-Za-z0-9_.-]+$"#, options: .regularExpression) == nil {
+            return nil
+        }
+        let boardArgs = normalizedBoard.map { " --board \($0)" } ?? ""
+        let shellCommand = """
+        if command -v hermes >/dev/null 2>&1; then HERMES_BIN=hermes; elif [ -x \"$HOME/.hermes/hermes-agent/venv/bin/hermes\" ]; then HERMES_BIN=\"$HOME/.hermes/hermes-agent/venv/bin/hermes\"; else echo 'hermes CLI not found'; exit 127; fi; clear; echo 'Hermes Kanban: \(rawTaskId)'; echo; \"$HERMES_BIN\" kanban\(boardArgs) show \(rawTaskId); echo; echo 'Press any key to close...'; read -n 1 -s
+        """
+        return """
+        tell application "Terminal"
+            activate
+            do script \"\(appleScriptEscaped(shellCommand))\"
+        end tell
+        return true
+        """
+    }
+
+    private static func appleScriptEscaped(_ value: String) -> String {
+        value
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+            .replacingOccurrences(of: "\n", with: "; ")
     }
 }
 
