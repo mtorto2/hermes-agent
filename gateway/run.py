@@ -10622,6 +10622,11 @@ class GatewayRunner:
                 if "agent" not in config or not isinstance(config.get("agent"), dict):
                     config["agent"] = {}
                 config["agent"]["system_prompt"] = ""
+                try:
+                    from hermes_cli.personality_voice import apply_personality_voice_to_config
+                    apply_personality_voice_to_config(config, args)
+                except Exception:
+                    logger.debug("personality voice sync skipped", exc_info=True)
                 atomic_yaml_write(config_path, config)
             except Exception as e:
                 return t("gateway.personality.save_failed", error=str(e))
@@ -10635,6 +10640,11 @@ class GatewayRunner:
                 if "agent" not in config or not isinstance(config.get("agent"), dict):
                     config["agent"] = {}
                 config["agent"]["system_prompt"] = new_prompt
+                try:
+                    from hermes_cli.personality_voice import apply_personality_voice_to_config
+                    apply_personality_voice_to_config(config, args)
+                except Exception:
+                    logger.debug("personality voice sync skipped", exc_info=True)
                 atomic_yaml_write(config_path, config)
             except Exception as e:
                 return t("gateway.personality.save_failed", error=str(e))
