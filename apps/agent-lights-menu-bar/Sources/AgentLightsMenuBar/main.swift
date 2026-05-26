@@ -87,7 +87,7 @@ private final class AgentLightsApp: NSObject, NSApplicationDelegate, NSMenuDeleg
 
     private func render() {
         let slotStatuses = (1...4).compactMap { loadRenderableStatus(directory: slotsDirectory, slot: $0) }
-        let agentStatuses = (1...4).compactMap { loadRenderableStatus(directory: agentsDirectory, slot: $0) }
+        let agentStatuses = (1...8).compactMap { loadRenderableStatus(directory: agentsDirectory, slot: $0) }
         let legacyAgentStatuses = slotStatuses.filter(\.isKanbanWorker)
         let hermesStatuses = slotStatuses.filter { !$0.isKanbanWorker }
         let allAgentStatuses = agentStatuses + legacyAgentStatuses

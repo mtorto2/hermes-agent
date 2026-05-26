@@ -41,6 +41,10 @@ public struct SlotStatus: Equatable {
     private var displayModelName: String {
         guard let rawModel = trimmed(modelName) else { return "unknown" }
         let leaf = rawModel.split(separator: "/").last.map(String.init) ?? rawModel
+        let lowerLeaf = leaf.lowercased()
+        if lowerLeaf.hasPrefix("gpt-") {
+            return "GPT-" + String(leaf.dropFirst(4))
+        }
         let normalized = leaf
             .replacingOccurrences(of: "claude-sonnet-", with: "claude-")
             .replacingOccurrences(of: "claude-opus-", with: "claude-")
@@ -176,7 +180,7 @@ public struct AgentRingGroup: Equatable {
         rings.contains { !$0.isPlaceholder }
     }
 
-    public init(statuses: [SlotStatus], capacity: Int = 4) {
+    public init(statuses: [SlotStatus], capacity: Int = 8) {
         self.capacity = capacity
         let visible = Array(statuses.sorted { $0.slot < $1.slot }.prefix(capacity))
         var rings = visible.map { AgentRing(state: $0.state, isPlaceholder: false) }
@@ -217,7 +221,7 @@ public struct StatusIndicatorGeometry: Equatable {
         agentCircleDiameter: Double = 6.8,
         agentCircleColumnSpacing: Double = 8.2,
         agentCircleRowSpacing: Double = 8.2,
-        agentIndicatorWidth: Double = 22.0
+        agentIndicatorWidth: Double = 39.0
     ) {
         self.hermesDotDiameter = hermesDotDiameter
         self.hermesDotSpacing = hermesDotSpacing
@@ -243,11 +247,13 @@ public struct StatusIndicatorLayout: Equatable {
     public init(hermesStatuses: [SlotStatus], agentGroup: AgentRingGroup) {
         self.filledDotCount = min(hermesStatuses.count, 4)
         self.agentRingCount = agentGroup.shouldRender ? agentGroup.capacity : 0
-        let columns = 2
+        let columns = max(2, ((agentGroup.capacity + 3) / 4) * 2)
         self.agentRingColumns = columns
         self.agentRingRows = 2
         self.agentRingGridPositions = (0..<agentGroup.capacity).map { index in
-            AgentRingGridPosition(column: index % columns, row: index / columns)
+            let bank = index / 4
+            let indexInBank = index % 4
+            return AgentRingGridPosition(column: bank * 2 + indexInBank % 2, row: indexInBank / 2)
         }
     }
 }
@@ -323,7 +329,8 @@ public struct FloatingMonitorLayout: Equatable {
     public init(size: FloatingMonitorSize, hermesStatuses: [SlotStatus], agentGroup: AgentRingGroup) {
         let activeHermes = Array(hermesStatuses.prefix(4))
         let includeAgents = agentGroup.shouldRender
-        let unitCount = activeHermes.count + (includeAgents ? 1 : 0)
+        let agentUnitCount = includeAgents ? 1 : 0
+        let unitCount = activeHermes.count + agentUnitCount
         guard unitCount > 0 else {
             self.items = []
             return
@@ -354,13 +361,15 @@ public struct FloatingMonitorLayout: Equatable {
 
         if includeAgents {
             let agentGapRatio = 0.18
-            let agentDiameter = unitSize / (2 + agentGapRatio)
+            let columns = max(2, (agentGroup.capacity + 1) / 2)
+            let agentDiameter = unitSize / (Double(columns) + Double(max(0, columns - 1)) * agentGapRatio)
             let agentSpacing = agentDiameter * (1 + agentGapRatio)
+            let footprintHeight = agentDiameter * 2 + agentDiameter * agentGapRatio
             let startX = cursorX
-            let startY = centerY + unitSize / 2 - agentDiameter
+            let startY = centerY + footprintHeight / 2 - agentDiameter
             for (index, ring) in agentGroup.rings.enumerated() {
-                let column = Double(index % 2)
-                let row = Double(index / 2)
+                let column = Double(index % columns)
+                let row = Double(index / columns)
                 built.append(FloatingMonitorItem(
                     state: ring.state,
                     isAgent: true,

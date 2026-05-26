@@ -536,7 +536,13 @@ def build_light_cue_service_from_config(config: dict[str, Any] | None = None, *,
     backend rather than platform adapter code.
     """
     config = config or {}
-    configured_model = config.get("model") if isinstance(config, dict) else None
+    configured_model = None
+    if isinstance(config, dict):
+        model_config = config.get("model")
+        if isinstance(model_config, dict):
+            configured_model = model_config.get("default")
+        elif isinstance(model_config, str):
+            configured_model = model_config
     configured_model = configured_model.strip() if isinstance(configured_model, str) and configured_model.strip() else None
     slot_status_backend = SlotStatusFileBackend.from_env(auto_assign=auto_assign_slot, model_name=configured_model)
     menu_bar_launcher = AgentLightsMenuBarLauncher() if slot_status_backend is not None else None

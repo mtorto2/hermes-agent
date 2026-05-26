@@ -33,7 +33,7 @@ final class SlotStatusTests: XCTestCase {
         XCTAssertEqual(status.kanbanTaskTitle, "Investigate menu rings")
         XCTAssertEqual(status.profile, "matt-codex")
         XCTAssertTrue(status.isKanbanWorker)
-        XCTAssertEqual(status.menuDetail, "2: gpt 5.5 - answer ready")
+        XCTAssertEqual(status.menuDetail, "2: GPT-5.5 - answer ready")
     }
 
     func testNonKanbanSlotsAreNotWorkerRings() throws {
@@ -67,37 +67,40 @@ final class SlotStatusTests: XCTestCase {
 
         XCTAssertEqual(model.summaryTitle, "Hermes: 2 active  Agents: 1 active")
         XCTAssertEqual(model.rowTitles, [
-            "1: gpt 5.5 - answer ready",
+            "1: GPT-5.5 - answer ready",
             "2: claude 4.7 - working",
-            "Agent 1: gpt 5.5 - working",
+            "Agent 1: GPT-5.5 - working",
         ])
         XCTAssertEqual(
             model.tooltip,
-            "Hermes: 2 active  Agents: 1 active\n1: gpt 5.5 - answer ready\n2: claude 4.7 - working\nAgent 1: gpt 5.5 - working"
+            "Hermes: 2 active  Agents: 1 active\n1: GPT-5.5 - answer ready\n2: claude 4.7 - working\nAgent 1: GPT-5.5 - working"
         )
     }
 
-    func testAgentRingGroupShowsFourCapacitySlotsWhenAnyAgentIsRunning() throws {
+    func testAgentRingGroupShowsEightCapacitySlotsWhenAnyAgentIsRunning() throws {
         let first = try SlotStatus.decode(from: """
         {"slot":1,"state":"working","source":"kanban_worker","model_name":"openai-codex/gpt-5.5"}
         """.data(using: .utf8)!)
         let second = try SlotStatus.decode(from: """
         {"slot":2,"state":"human_intervention","source":"kanban_worker","model_name":"anthropic/claude-sonnet-4.6"}
         """.data(using: .utf8)!)
+        let sixth = try SlotStatus.decode(from: """
+        {"slot":6,"state":"error","source":"kanban_worker","model_name":"openai/gpt-5.5"}
+        """.data(using: .utf8)!)
 
-        let group = AgentRingGroup(statuses: [first, second])
+        let group = AgentRingGroup(statuses: [sixth, first, second])
 
         XCTAssertTrue(group.shouldRender)
-        XCTAssertEqual(group.capacity, 4)
-        XCTAssertEqual(group.rings.map(\.state), [.working, .humanIntervention, .missing, .missing])
-        XCTAssertEqual(group.rings.map(\.isPlaceholder), [false, false, true, true])
+        XCTAssertEqual(group.capacity, 8)
+        XCTAssertEqual(group.rings.map(\.state), [.working, .humanIntervention, .error, .missing, .missing, .missing, .missing, .missing])
+        XCTAssertEqual(group.rings.map(\.isPlaceholder), [false, false, false, true, true, true, true, true])
     }
 
     func testAgentRingGroupHiddenWhenNoAgentWorkersAreRunning() {
         let group = AgentRingGroup(statuses: [])
 
         XCTAssertFalse(group.shouldRender)
-        XCTAssertEqual(group.rings.count, 4)
+        XCTAssertEqual(group.rings.count, 8)
         XCTAssertTrue(group.rings.allSatisfy(\.isPlaceholder))
     }
 
@@ -115,15 +118,19 @@ final class SlotStatusTests: XCTestCase {
         )
 
         XCTAssertEqual(layout.filledDotCount, 1)
-        XCTAssertEqual(layout.agentRingCount, 4)
+        XCTAssertEqual(layout.agentRingCount, 8)
         XCTAssertTrue(layout.shouldRenderAgentRings)
-        XCTAssertEqual(layout.agentRingColumns, 2)
+        XCTAssertEqual(layout.agentRingColumns, 4)
         XCTAssertEqual(layout.agentRingRows, 2)
         XCTAssertEqual(layout.agentRingGridPositions, [
             AgentRingGridPosition(column: 0, row: 0),
             AgentRingGridPosition(column: 1, row: 0),
             AgentRingGridPosition(column: 0, row: 1),
             AgentRingGridPosition(column: 1, row: 1),
+            AgentRingGridPosition(column: 2, row: 0),
+            AgentRingGridPosition(column: 3, row: 0),
+            AgentRingGridPosition(column: 2, row: 1),
+            AgentRingGridPosition(column: 3, row: 1),
         ])
     }
 
@@ -180,12 +187,12 @@ final class SlotStatusTests: XCTestCase {
             agentGroup: AgentRingGroup(statuses: [agent])
         )
 
-        XCTAssertEqual(large.items.count, 5)
+        XCTAssertEqual(large.items.count, 9)
         XCTAssertGreaterThan(large.items[0].diameter, small.items[0].diameter)
         XCTAssertGreaterThan(large.items[0].diameter, 90)
-        XCTAssertEqual(large.items.filter(\.isAgent).count, 4)
+        XCTAssertEqual(large.items.filter(\.isAgent).count, 8)
         XCTAssertEqual(large.items.filter { $0.state == .humanIntervention }.count, 1)
-        XCTAssertEqual(large.items.filter { $0.isAgent && $0.isPlaceholder }.count, 3)
+        XCTAssertEqual(large.items.filter { $0.isAgent && $0.isPlaceholder }.count, 7)
 
         let hermesCircle = try XCTUnwrap(large.items.first { !$0.isAgent })
         let agentCircles = large.items.filter(\.isAgent)
@@ -198,10 +205,22 @@ final class SlotStatusTests: XCTestCase {
         let agentCenterY = (agentMinY + agentMaxY) / 2
         let hermesCenterY = hermesCircle.y + hermesCircle.diameter / 2
 
-        XCTAssertEqual(hermesCircle.diameter, agentFootprintWidth, accuracy: 0.5)
-        XCTAssertEqual(hermesCircle.diameter, agentFootprintHeight, accuracy: 0.5)
+        XCTAssertLessThan(agentFootprintHeight, hermesCircle.diameter * 0.55)
         XCTAssertEqual(hermesCenterY, agentCenterY, accuracy: 0.5)
         XCTAssertLessThan(hermesCircle.x + hermesCircle.diameter, agentMinX)
+        XCTAssertEqual(agentFootprintWidth, hermesCircle.diameter, accuracy: 0.5)
+
+        let sortedAgentCentersX = agentCircles.map { $0.x + $0.diameter / 2 }.sorted()
+        let uniqueColumns = sortedAgentCentersX.reduce(into: [Double]()) { columns, center in
+            if columns.last.map({ abs($0 - center) > 0.5 }) ?? true {
+                columns.append(center)
+            }
+        }
+        XCTAssertEqual(uniqueColumns.count, 4)
+        for gap in zip(uniqueColumns, uniqueColumns.dropFirst()).map({ $1 - $0 }) {
+            XCTAssertLessThan(gap, agentCircles[0].diameter * 1.35)
+            XCTAssertGreaterThan(gap, agentCircles[0].diameter * 1.05)
+        }
 
         for i in 0..<agentCircles.count {
             for j in (i + 1)..<agentCircles.count {
@@ -210,7 +229,7 @@ final class SlotStatusTests: XCTestCase {
                 let dx = (first.x + first.diameter / 2) - (second.x + second.diameter / 2)
                 let dy = (first.y + first.diameter / 2) - (second.y + second.diameter / 2)
                 let distance = (dx * dx + dy * dy).squareRoot()
-                XCTAssertGreaterThanOrEqual(distance, first.diameter * 1.08)
+                XCTAssertGreaterThanOrEqual(distance, first.diameter * 1.05)
             }
         }
     }

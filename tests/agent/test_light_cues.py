@@ -610,12 +610,13 @@ def test_config_builder_enables_slot_status_backend_from_env(tmp_path, monkeypat
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setenv("HERMES_SLOT", "4")
 
-    service = build_light_cue_service_from_config({})
+    service = build_light_cue_service_from_config({"model": {"default": "gpt-5.5", "provider": "openai-codex"}})
 
     assert service.emit(LightCueEvent.IDLE) is False
     payload = json.loads((tmp_path / "agent-lights" / "slots" / "4.json").read_text(encoding="utf-8"))
     assert payload["slot"] == 4
     assert payload["state"] == "idle"
+    assert payload["model_name"] == "gpt-5.5"
 
 
 def test_config_builder_reuses_telegram_wiz_notification_light(monkeypatch):
