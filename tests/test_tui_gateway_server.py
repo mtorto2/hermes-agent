@@ -2183,6 +2183,62 @@ def test_prompt_submit_emits_tui_light_cues_on_success(monkeypatch):
         server._sessions.pop("sid", None)
 
 
+def test_prompt_submit_releases_running_before_message_complete(monkeypatch):
+    """Queued TUI prompts drain from the UI as soon as message.complete arrives.
+
+    If the gateway still has session["running"] set at that boundary, the
+    drained prompt races into prompt.submit, gets rejected as "session busy",
+    and is re-enqueued instead of immediately emitting a new working cue.  That
+    leaves Agent Lights showing the prior final-answer/error state while the
+    user expects the queued turn to have started.
+    """
+
+    class _Agent:
+        def run_conversation(
+            self, prompt, conversation_history=None, stream_callback=None
+        ):
+            return {
+                "final_response": "ok",
+                "messages": [{"role": "assistant", "content": "ok"}],
+            }
+
+    class _ImmediateThread:
+        def __init__(self, target=None, daemon=None):
+            self._target = target
+
+        def start(self):
+            assert self._target is not None
+            self._target()
+
+    running_at_complete = []
+    session = _session(agent=_Agent())
+    server._sessions["sid"] = session
+    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+    monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
+    monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
+    monkeypatch.setattr(server, "_emit_tui_light_cue", lambda sid, event: True)
+
+    def capture_emit(event, sid, payload=None):
+        if event == "message.complete":
+            with session["history_lock"]:
+                running_at_complete.append(session.get("running"))
+
+    monkeypatch.setattr(server, "_emit", capture_emit)
+
+    try:
+        server.handle_request(
+            {
+                "id": "1",
+                "method": "prompt.submit",
+                "params": {"session_id": "sid", "text": "ping"},
+            }
+        )
+
+        assert running_at_complete == [False]
+    finally:
+        server._sessions.pop("sid", None)
+
+
 def test_prompt_submit_emits_tui_light_cues_on_error(monkeypatch):
     class _Agent:
         def run_conversation(

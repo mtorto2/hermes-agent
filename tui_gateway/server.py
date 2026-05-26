@@ -3559,11 +3559,25 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
             rendered = render_message(raw, cols)
             if rendered:
                 payload["rendered"] = rendered
-            _emit("message.complete", sid, payload)
+
             if status == "error":
                 _emit_tui_light_cue(sid, "error")
             elif status == "complete" and isinstance(raw, str) and raw.strip():
                 _emit_tui_light_cue(sid, "final_answer")
+
+            # Release the TUI busy guard before notifying the frontend that the
+            # turn completed. The React queue-drain effect fires immediately on
+            # message.complete; if session["running"] is still true at that
+            # boundary, the drained prompt races into prompt.submit, gets
+            # rejected as "session busy", and sits re-queued while Agent Lights
+            # remains on the previous final/error state instead of showing the
+            # next turn's working cue. Emit this turn's terminal cue first so a
+            # queued follow-up cannot start with "working" and then be
+            # overwritten by the previous turn's final/error cue.
+            with session["history_lock"]:
+                session["running"] = False
+
+            _emit("message.complete", sid, payload)
 
             # ── /goal continuation (Ralph-style loop) ─────────────────
             # After every TUI turn, if a /goal is active, ask the judge
