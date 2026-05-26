@@ -78,10 +78,9 @@ async def test_light_cue_menu_renders_all_modes_with_short_callbacks(tmp_path, m
     mock_msg.message_id = 4242
     adapter._bot.send_message = AsyncMock(return_value=mock_msg)
 
-    with patch("gateway.platforms.telegram.InlineKeyboardButton", Button), patch(
-        "gateway.platforms.telegram.InlineKeyboardMarkup", Markup
-    ):
-        result = await adapter.send_light_cue_menu(chat_id="12345")
+    monkeypatch.setitem(TelegramAdapter.send_light_cue_menu.__globals__, "InlineKeyboardButton", Button)
+    monkeypatch.setitem(TelegramAdapter.send_light_cue_menu.__globals__, "InlineKeyboardMarkup", Markup)
+    result = await adapter.send_light_cue_menu(chat_id="12345")
 
     assert result.success is True
     kwargs = adapter._bot.send_message.call_args[1]

@@ -2721,8 +2721,14 @@ class TelegramAdapter(BasePlatformAdapter):
             LightCueMode.DIM_DEFAULT: "Dim default",
             LightCueMode.NO_LIGHT: "No light",
         }
+        light_cue_modes = (
+            LightCueMode.DEFAULT,
+            LightCueMode.NIGHT,
+            LightCueMode.DIM_DEFAULT,
+            LightCueMode.NO_LIGHT,
+        )
         rows = []
-        for mode in LightCueMode:
+        for mode in light_cue_modes:
             marker = "✅ " if mode is current else ""
             rows.append([
                 InlineKeyboardButton(

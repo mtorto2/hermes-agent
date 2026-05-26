@@ -20,9 +20,13 @@ Kanban worker agents use a separate capacity pool under:
 ~/.hermes/agent-lights/agents/2.json
 ~/.hermes/agent-lights/agents/3.json
 ~/.hermes/agent-lights/agents/4.json
+~/.hermes/agent-lights/agents/5.json
+~/.hermes/agent-lights/agents/6.json
+~/.hermes/agent-lights/agents/7.json
+~/.hermes/agent-lights/agents/8.json
 ```
 
-Each file is written by Hermes when a terminal/TUI instance or Kanban worker starts. Hermes will auto-assign the first available slot within the appropriate pool, capped at 4 active normal instances and 4 active Kanban workers, using per-slot lock files to avoid concurrent startup collisions. Setting `HERMES_SLOT=1..4` still forces a specific slot inside that process class's pool; missing or invalid values such as `HERMES_SLOT=6` fall back to auto-assignment when capacity is available.
+Each file is written by Hermes when a terminal/TUI instance or Kanban worker starts. Hermes will auto-assign the first available slot within the appropriate pool, capped at 4 active normal instances and 8 active Kanban workers, using per-slot lock files to avoid concurrent startup collisions. Setting `HERMES_SLOT=1..4` still forces a specific normal-Hermes slot; Kanban workers auto-assign within their 1..8 pool. Missing or invalid values such as `HERMES_SLOT=9` fall back to auto-assignment when capacity is available.
 
 ## Dot mapping
 
@@ -39,11 +43,12 @@ Left-to-right dots follow active slot order: slot 1, then slot 2, then slot 3, t
 | idle | gray, but only when the slot's producing process is alive |
 
 Normal Hermes CLI/TUI instances render as horizontal filled dots in the primary
-menu-bar item. Kanban workers render as a compact 2×2 filled-circle group in that
+menu-bar item. Kanban workers render as compact filled-circle groups in that
 same visible item so Ice/menu-bar managers cannot hide a second status item
 independently. The agent group appears only while at least one worker is active:
-positions are top-left, top-right, bottom-left, bottom-right; active worker
-circles use lifecycle colors; unused worker capacity circles remain gray.
+slots 1..4 render as the first 2×2 bank and slots 5..8 as a second 2×2 bank;
+active worker circles use lifecycle colors; unused worker capacity circles
+remain gray.
 
 A slot renders when its status file is valid and either:
 
