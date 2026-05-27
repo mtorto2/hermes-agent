@@ -4892,6 +4892,33 @@ class TelegramAdapter(BasePlatformAdapter):
             "and use observed context only when the current message asks for it."
         )
 
+    def _telegram_current_message_addressing_prompt(self, message: Any) -> Optional[str]:
+        """Describe why this group message reached this bot after trigger stripping."""
+        if not message or not self._is_group_chat(message):
+            return None
+
+        username = (getattr(getattr(self, "_bot", None), "username", None) or "").lstrip("@")
+        addressed_by: list[str] = []
+        if self._message_mentions_bot(message):
+            addressed_by.append("explicitly addressed this bot via @mention")
+        if self._is_reply_to_bot(message):
+            addressed_by.append("replied to this bot")
+        if self._message_matches_mention_patterns(message):
+            addressed_by.append("matched a configured wake pattern")
+        if not addressed_by:
+            return None
+
+        parts = ["Current message addressing:", f"- Trigger: {'; '.join(addressed_by)}."]
+        if username:
+            parts.append(
+                f"- This bot's visible handle is @{username}; it may have been stripped from "
+                "the current message text before the agent saw it."
+            )
+        mentioned = sorted(self._extract_bot_mention_usernames(message))
+        if mentioned:
+            parts.append("- Explicit bot handles in the original Telegram message: " + ", ".join(f"@{name}" for name in mentioned))
+        return "\n".join(parts)
+
     def _apply_telegram_group_observe_attribution(self, event: MessageEvent) -> MessageEvent:
         """Align triggered group turns with observed-history attribution."""
         if not self._telegram_observe_unmentioned_group_messages():
@@ -4904,7 +4931,11 @@ class TelegramAdapter(BasePlatformAdapter):
         if not allowed or chat_id_str not in allowed:
             return event
         shared_source = self._telegram_group_observe_shared_source(event.source)
-        observe_prompt = self._telegram_group_observe_channel_prompt()
+        prompt_parts = [self._telegram_group_observe_channel_prompt()]
+        addressing_prompt = self._telegram_current_message_addressing_prompt(raw_message)
+        if addressing_prompt:
+            prompt_parts.append(addressing_prompt)
+        observe_prompt = "\n\n".join(prompt_parts)
         channel_prompt = f"{event.channel_prompt}\n\n{observe_prompt}" if event.channel_prompt else observe_prompt
         if event.message_type == MessageType.COMMAND:
             return dataclasses.replace(

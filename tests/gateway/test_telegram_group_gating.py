@@ -225,6 +225,33 @@ def test_observed_group_context_uses_shared_source_and_prompt_for_later_mentions
     asyncio.run(_run())
 
 
+def test_triggered_group_prompt_preserves_explicit_addressing_after_mention_strip():
+    """The agent should know the visible @mention was stripped from event.text."""
+    adapter = _make_adapter(
+        require_mention=True,
+        allowed_chats=["-100"],
+        group_allowed_chats=["-100"],
+        observe_unmentioned_group_messages=True,
+    )
+    text = "@hermes_bot what did Alice say?"
+    msg = _group_message(
+        text,
+        from_user_id=222,
+        from_user_name="Bob Example",
+        entities=[_mention_entity(text)],
+    )
+    event = adapter._build_message_event(msg, MessageType.TEXT, update_id=1005)
+    event.text = adapter._clean_bot_trigger_text(event.text) or ""
+
+    attributed = adapter._apply_telegram_group_observe_attribution(event)
+    prompt = attributed.channel_prompt or ""
+
+    assert attributed.text == "[Bob Example|222]\nwhat did Alice say?"
+    assert "Current message addressing:" in prompt
+    assert "explicitly addressed this bot via @mention" in prompt
+    assert "@hermes_bot" in prompt
+
+
 def test_observed_group_context_replays_as_current_message_context_not_user_turns():
     from gateway.run import (
         _build_gateway_agent_history,
