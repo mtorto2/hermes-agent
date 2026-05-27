@@ -435,6 +435,48 @@ def _emit_tui_light_cue(sid: str, event: Any) -> bool:
         return False
 
 
+def _register_tui_approval_callbacks(sid: str, session_key: str) -> bool:
+    """Register TUI approval callbacks and mirror approval lifecycle to lights."""
+    try:
+        from tools.approval import (
+            load_permanent_allowlist,
+            register_gateway_notify,
+            register_gateway_resume,
+        )
+    except Exception:
+        logger.debug("TUI approval callback registration unavailable", exc_info=True)
+        return False
+
+    def _approval_request(data):
+        try:
+            from agent.light_cues import LightCueEvent
+
+            _emit_tui_light_cue(sid, LightCueEvent.HUMAN_INTERVENTION)
+        except Exception:
+            logger.debug("TUI approval request light cue failed", exc_info=True)
+        _emit("approval.request", sid, data)
+
+    def _approval_resume():
+        try:
+            from agent.light_cues import LightCueEvent
+
+            _emit_tui_light_cue(sid, LightCueEvent.WORKING)
+        except Exception:
+            logger.debug("TUI approval resume light cue failed", exc_info=True)
+
+    try:
+        register_gateway_notify(session_key, _approval_request)
+        register_gateway_resume(session_key, _approval_resume)
+    except Exception:
+        logger.debug("TUI approval callback registration failed", exc_info=True)
+        return False
+    try:
+        load_permanent_allowlist()
+    except Exception:
+        logger.debug("TUI approval allowlist preload failed", exc_info=True)
+    return True
+
+
 def _estimate_image_tokens(width: int, height: int) -> int:
     """Very rough UI estimate for image prompt cost.
 
@@ -602,26 +644,7 @@ def _start_agent_build(sid: str, session: dict) -> None:
             except Exception:
                 pass
 
-            try:
-                from tools.approval import (
-                    register_gateway_notify,
-                    load_permanent_allowlist,
-                )
-
-                def _approval_request(data):
-                    try:
-                        from agent.light_cues import LightCueEvent
-
-                        _emit_tui_light_cue(sid, LightCueEvent.HUMAN_INTERVENTION)
-                    except Exception:
-                        pass
-                    _emit("approval.request", sid, data)
-
-                register_gateway_notify(key, _approval_request)
-                notify_registered = True
-                load_permanent_allowlist()
-            except Exception:
-                pass
+            notify_registered = _register_tui_approval_callbacks(sid, key)
 
             _wire_callbacks(sid)
             try:
@@ -1346,7 +1369,6 @@ def _sync_session_key_after_compress(
             disable_session_yolo,
             enable_session_yolo,
             is_session_yolo_enabled,
-            register_gateway_notify,
             unregister_gateway_notify,
         )
 
@@ -1365,13 +1387,7 @@ def _sync_session_key_after_compress(
                 disable_session_yolo(old_key)
             except Exception:
                 pass
-        try:
-            register_gateway_notify(
-                new_session_id,
-                lambda data: _emit("approval.request", sid, data),
-            )
-        except Exception:
-            pass
+        _register_tui_approval_callbacks(sid, new_session_id)
     except Exception:
         # Even if the approval module fails to import, still anchor the
         # session_key on the new continuation id so downstream lookups
@@ -2148,10 +2164,7 @@ def _init_session(sid: str, key: str, agent, history: list, cols: int = 80):
         # Defer hard-failure to slash.exec; chat still works without slash worker.
         _sessions[sid]["slash_worker"] = None
     try:
-        from tools.approval import register_gateway_notify, load_permanent_allowlist
-
-        register_gateway_notify(key, lambda data: _emit("approval.request", sid, data))
-        load_permanent_allowlist()
+        _register_tui_approval_callbacks(sid, key)
     except Exception:
         pass
     # Surface the self-improvement background review's "💾 …" summary as a

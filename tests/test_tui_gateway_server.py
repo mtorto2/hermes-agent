@@ -68,6 +68,60 @@ def test_block_with_light_cue_returns_to_working_after_answer(monkeypatch):
     assert cues == ["human_intervention", "working"]
 
 
+def test_tui_approval_callbacks_emit_human_intervention_then_working(monkeypatch):
+    registered = {}
+    cues = []
+    emits = []
+
+    class _FakeWorker:
+        def __init__(self, key, model):
+            self.key = key
+
+    import tools.approval as _approval
+
+    monkeypatch.setattr(server, "_SlashWorker", _FakeWorker)
+    monkeypatch.setattr(server, "_wire_callbacks", lambda _sid: None)
+    monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: emits.append(args))
+    monkeypatch.setattr(server, "_notify_session_boundary", lambda *args, **kwargs: None)
+    monkeypatch.setattr(server, "_session_info", lambda _agent: {"model": "x"})
+    monkeypatch.setattr(
+        server,
+        "_emit_tui_light_cue",
+        lambda sid, event: cues.append(getattr(event, "value", event)),
+    )
+    monkeypatch.setattr(
+        _approval,
+        "register_gateway_notify",
+        lambda key, cb: registered.setdefault("notify", (key, cb)),
+    )
+    monkeypatch.setattr(
+        _approval,
+        "register_gateway_resume",
+        lambda key, cb: registered.setdefault("resume", (key, cb)),
+    )
+    monkeypatch.setattr(_approval, "load_permanent_allowlist", lambda: None)
+
+    try:
+        server._init_session(
+            "sid",
+            "session-key",
+            types.SimpleNamespace(model="x"),
+            history=[],
+            cols=80,
+        )
+
+        assert registered["notify"][0] == "session-key"
+        assert registered["resume"][0] == "session-key"
+
+        registered["notify"][1]({"command": "rm -rf scratch"})
+        registered["resume"][1]()
+
+        assert cues == ["human_intervention", "working"]
+        assert ("approval.request", "sid", {"command": "rm -rf scratch"}) in emits
+    finally:
+        server._sessions.pop("sid", None)
+
+
 def test_tui_verbose_tool_details_fail_closed_when_redaction_fails(monkeypatch):
     redact_module = types.ModuleType("agent.redact")
 
