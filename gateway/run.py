@@ -80,6 +80,7 @@ _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"|rate\s+limited\.\s+waiting\s+\d"
     r"|retrying\s+in\s+\d"
     r"|max\s+retries\s+\(\d+\).*(?:trying\s+fallback|exhausted|invalid\s+responses)"
+    r"|model\s+returned\s+empty\s+after\s+tool\s+calls"
     r"|stream\s+(?:drop|drop\s+mid\s+tool-call).+retry\s+\d"
     r"|stale\s+connections\s+from\s+a\s+previous\s+provider\s+issue"
     r")",
