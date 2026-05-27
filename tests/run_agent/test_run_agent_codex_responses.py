@@ -448,6 +448,32 @@ def test_run_codex_stream_falls_back_to_create_after_stream_completion_error(mon
     assert response.output[0].content[0].text == "create fallback ok"
 
 
+def test_run_codex_stream_recovers_when_terminal_snapshot_has_null_output(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    output_item = SimpleNamespace(
+        type="message",
+        content=[SimpleNamespace(type="output_text", text="stream recovered")],
+    )
+
+    class _NullOutputTerminalStream(_FakeResponsesStream):
+        def __iter__(self):
+            yield SimpleNamespace(type="response.output_text.delta", delta="stream recovered")
+            yield SimpleNamespace(type="response.output_item.done", item=output_item)
+            raise TypeError("'NoneType' object is not iterable")
+
+    agent.client = SimpleNamespace(
+        responses=SimpleNamespace(
+            stream=lambda **kwargs: _NullOutputTerminalStream(),
+            create=lambda **kwargs: _codex_message_response("should not use fallback"),
+        )
+    )
+
+    response = agent._run_codex_stream(_codex_request_kwargs())
+
+    assert response.status == "completed"
+    assert response.output[0].content[0].text == "stream recovered"
+
+
 def test_run_codex_stream_fallback_parses_create_stream_events(monkeypatch):
     agent = _build_agent(monkeypatch)
     calls = {"stream": 0, "create": 0}

@@ -188,6 +188,38 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
     # returns empty output (e.g. chatgpt.com backend-api sends
     # response.incomplete instead of response.completed).
     agent._codex_streamed_text_parts: list = []
+
+    def _recover_from_collected_stream_items(reason: str):
+        if collected_output_items:
+            logger.debug(
+                "Codex stream: recovered %d output items after SDK terminal parse error (%s)",
+                len(collected_output_items),
+                reason,
+            )
+            return SimpleNamespace(
+                output=list(collected_output_items),
+                status="completed",
+            )
+        if agent._codex_streamed_text_parts and not has_tool_calls:
+            assembled = "".join(agent._codex_streamed_text_parts)
+            logger.debug(
+                "Codex stream: synthesized output from %d text deltas after SDK "
+                "terminal parse error (%s; %d chars)",
+                len(agent._codex_streamed_text_parts),
+                reason,
+                len(assembled),
+            )
+            return SimpleNamespace(
+                output=[SimpleNamespace(
+                    type="message",
+                    role="assistant",
+                    status="completed",
+                    content=[SimpleNamespace(type="output_text", text=assembled)],
+                )],
+                status="completed",
+            )
+        return None
+
     for attempt in range(max_stream_retries + 1):
         if agent._interrupt_requested:
             raise InterruptedError("Agent interrupted before Codex stream retry")
@@ -334,6 +366,17 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                     err_text,
                 )
                 return agent._run_codex_create_stream_fallback(api_kwargs, client=active_client)
+            raise
+        except TypeError as exc:
+            err_text = str(exc)
+            output_none_parse_error = (
+                "NoneType" in err_text
+                and "not iterable" in err_text
+            )
+            if output_none_parse_error:
+                recovered = _recover_from_collected_stream_items(err_text)
+                if recovered is not None:
+                    return recovered
             raise
 
 
