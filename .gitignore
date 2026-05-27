@@ -51,6 +51,10 @@ cli-config.yaml
 # Skills Hub state (lives in ~/.hermes/skills/.hub/ at runtime, but just in case)
 skills/.hub/
 ignored/
+
+# Matt-local non-repo recovery/reference material.
+# Kept searchable in the working tree but intentionally not committed.
+/local/
 .worktrees/
 environments/benchmarks/evals/
 
