@@ -1,3 +1,5 @@
+import { spawn } from 'node:child_process'
+
 import type { InputEvent, Key } from '@hermes/ink'
 import * as Ink from '@hermes/ink'
 import { type MutableRefObject, useEffect, useMemo, useRef, useState } from 'react'
@@ -36,6 +38,9 @@ const PRINTABLE = /^[ -~\u00a0-\uffff]+$/
 const BRACKET_PASTE = new RegExp(`${ESC}?\\[20[01]~`, 'g')
 const FRAME_BATCH_MS = 16
 const MULTI_CLICK_MS = 500
+// Keep this copy aligned with cli.py::INPUT_COMPACTOR_STATUS; the classic CLI
+// and TUI intentionally show the same progress text during async compaction.
+const INPUT_COMPACTOR_STATUS = 'Compacting input draft...'
 
 const invert = (s: string) => INV + s + INV_OFF
 const dim = (s: string) => DIM + s + DIM_OFF
@@ -118,6 +123,78 @@ export function applyPrintableInsert(
     cursor: cursor + text.length,
     value: value.slice(0, cursor) + text + value.slice(cursor)
   }
+}
+
+export const inputCompactionNotice = (text: string): null | string => {
+  if (!text.trim()) {
+    return null
+  }
+
+  if (text.trimStart().startsWith('/')) {
+    return 'Input compactor skipped slash command.'
+  }
+
+  return null
+}
+
+export const inputCompactionSource = (
+  text: string,
+  compactedUpTo: number,
+  wholeBuffer: boolean
+): null | { start: number; text: string } => {
+  if (!text.trim() || inputCompactionNotice(text)) {
+    return null
+  }
+
+  if (wholeBuffer) {
+    return { start: 0, text }
+  }
+
+  const start = Math.max(0, Math.min(compactedUpTo, text.length))
+  const source = text.slice(start)
+
+  return source.trim() ? { start, text: source } : null
+}
+
+export const spliceInputCompactionResult = (
+  original: string,
+  start: number,
+  compacted: string
+): { compactedUpTo: number; cursor: number; text: string } => {
+  const prefix = original.slice(0, Math.max(0, Math.min(start, original.length)))
+  const text = prefix + compacted.trim()
+
+  return { compactedUpTo: text.length, cursor: text.length, text }
+}
+
+export const isAltTInputCompactionRaw = (eventRaw: string): boolean => eventRaw === '\x1bt' || eventRaw === '\x1bT'
+
+export const isInputCompactionKey = (input: string, key: Key, eventRaw: string): { wholeBuffer: boolean } | null => {
+  if (key.ctrl && input === 't') {
+    return { wholeBuffer: false }
+  }
+
+  if (isAltTInputCompactionRaw(eventRaw) || (key.meta && input.toLowerCase() === 't')) {
+    return { wholeBuffer: true }
+  }
+
+  return null
+}
+
+export const canRunInputCompactor = (enabled: boolean, mask?: string): boolean => enabled && !mask
+
+export const refreshInputCompactionOffset = (
+  value: string,
+  compactedPrefix: string,
+  compactedUpTo: number
+): { compactedPrefix: string; compactedUpTo: number } => {
+  if (!compactedPrefix || value.startsWith(compactedPrefix)) {
+    const nextUpTo = Math.min(compactedUpTo, value.length)
+
+    return { compactedPrefix: value.slice(0, nextUpTo), compactedUpTo: nextUpTo }
+  }
+
+  return { compactedPrefix: '', compactedUpTo: 0 }
 }
 
 export const shouldRouteMultiCharInputAsPaste = (text: string): boolean => text.includes('\n')
@@ -419,6 +496,7 @@ export function TextInput({
   mouseApiRef,
   voiceRecordKey = DEFAULT_VOICE_RECORD_KEY,
   placeholder = '',
+  enableInputCompactor = false,
   focus = true
 }: TextInputProps) {
   const [cur, setCur] = useState(value.length)
@@ -437,6 +515,11 @@ export function TextInput({
   const parentChangeTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const pendingParentValue = useRef<string | null>(null)
   const localRenderTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const [inputCompactionStatus, setInputCompactionStatus] = useState<null | string>(null)
+  const inputCompactionStatusTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const inputCompactorRunningRef = useRef(false)
+  const compactedUpToRef = useRef(0)
+  const compactedPrefixRef = useRef('')
   const lineWidthRef = useRef(stringWidth(value.includes('\n') ? value.slice(value.lastIndexOf('\n') + 1) : value))
   const mouseAnchorRef = useRef<null | number>(null)
   const lastClickRef = useRef<{ at: number; offset: number }>({ at: 0, offset: -1 })
@@ -529,6 +612,9 @@ export function TextInput({
       selRef.current = null
       vRef.current = value
       lineWidthRef.current = stringWidth(value.includes('\n') ? value.slice(value.lastIndexOf('\n') + 1) : value)
+      const refreshed = refreshInputCompactionOffset(value, compactedPrefixRef.current, compactedUpToRef.current)
+      compactedUpToRef.current = refreshed.compactedUpTo
+      compactedPrefixRef.current = refreshed.compactedPrefix
       undo.current = []
       redo.current = []
     }
@@ -575,6 +661,10 @@ export function TextInput({
 
       if (localRenderTimer.current) {
         clearTimeout(localRenderTimer.current)
+      }
+
+      if (inputCompactionStatusTimerRef.current) {
+        clearTimeout(inputCompactionStatusTimerRef.current)
       }
     },
     []
@@ -691,6 +781,153 @@ export function TextInput({
 
     to.current.push({ cursor: curRef.current, value: vRef.current })
     commit(entry.value, entry.cursor, false)
+  }
+
+  const setInputCompactionMessage = (message: string | null, autoClear = false) => {
+    if (inputCompactionStatusTimerRef.current) {
+      clearTimeout(inputCompactionStatusTimerRef.current)
+      inputCompactionStatusTimerRef.current = null
+    }
+
+    setInputCompactionStatus(message)
+
+    if (message && autoClear) {
+      inputCompactionStatusTimerRef.current = setTimeout(() => {
+        inputCompactionStatusTimerRef.current = null
+        setInputCompactionStatus(null)
+      }, 3_000)
+    }
+  }
+
+  const runInputCompactor = (wholeBuffer: boolean) => {
+    flushKeyBurst()
+
+    if (!canRunInputCompactor(enableInputCompactor, mask)) {
+      return
+    }
+
+    const original = vRef.current
+    const notice = inputCompactionNotice(original)
+
+    if (notice) {
+      setInputCompactionMessage(notice, true)
+
+      return
+    }
+
+    if (inputCompactorRunningRef.current) {
+      return
+    }
+
+    const compactorPath = process.env.HERMES_INPUT_COMPACTOR
+
+    if (!compactorPath) {
+      setInputCompactionMessage('Set HERMES_INPUT_COMPACTOR or input_compactor_path to enable input compaction.', true)
+
+      return
+    }
+
+    const refreshed = refreshInputCompactionOffset(original, compactedPrefixRef.current, compactedUpToRef.current)
+    compactedUpToRef.current = refreshed.compactedUpTo
+    compactedPrefixRef.current = refreshed.compactedPrefix
+
+    const source = inputCompactionSource(original, compactedUpToRef.current, wholeBuffer)
+
+    if (!source) {
+      return
+    }
+
+    const startVersion = editVersionRef.current
+    inputCompactorRunningRef.current = true
+    setInputCompactionMessage(INPUT_COMPACTOR_STATUS)
+
+    const child = spawn(compactorPath, ['--stdin'], { stdio: ['pipe', 'pipe', 'pipe'] })
+    let stdoutText = ''
+    let stderrText = ''
+    let settled = false
+    let killTimer: ReturnType<typeof setTimeout> | null = null
+
+    const timeout = setTimeout(() => {
+      if (settled) {
+        return
+      }
+
+      settled = true
+      child.kill('SIGTERM')
+      finish('Input compactor failed: timed out after 90 seconds')
+      killTimer = setTimeout(() => {
+        if (child.exitCode === null) {
+          child.kill('SIGKILL')
+        }
+      }, 2_000)
+    }, 90_000)
+
+    const finish = (message?: string) => {
+      clearTimeout(timeout)
+      if (killTimer) {
+        clearTimeout(killTimer)
+        killTimer = null
+      }
+      inputCompactorRunningRef.current = false
+      setInputCompactionMessage(message ?? null, !!message)
+    }
+
+    child.stdout.setEncoding('utf8')
+    child.stderr.setEncoding('utf8')
+    child.stdout.on('data', chunk => {
+      stdoutText += String(chunk)
+    })
+    child.stderr.on('data', chunk => {
+      stderrText += String(chunk)
+    })
+    child.on('error', error => {
+      if (settled) {
+        return
+      }
+
+      settled = true
+      finish(`Input compactor failed: ${error.message.slice(0, 300)}`)
+    })
+    child.on('close', code => {
+      if (settled) {
+        if (killTimer) {
+          clearTimeout(killTimer)
+          killTimer = null
+        }
+        return
+      }
+
+      settled = true
+      if (code !== 0) {
+        const lines = (stderrText || stdoutText || 'compactor failed').trim().split(/\r?\n/)
+        const message = lines.at(-1) || 'compactor failed'
+        finish(`Input compactor failed: ${message.slice(0, 300)}`)
+
+        return
+      }
+
+      const compacted = stdoutText.trim()
+
+      if (!compacted) {
+        finish('Input compactor failed: compactor returned empty output')
+
+        return
+      }
+
+      if (editVersionRef.current !== startVersion || vRef.current !== original) {
+        finish('Compactor finished, but draft changed; leaving current input untouched.')
+
+        return
+      }
+
+      const result = spliceInputCompactionResult(original, source.start, compacted)
+      compactedUpToRef.current = result.compactedUpTo
+      compactedPrefixRef.current = result.text.slice(0, result.compactedUpTo)
+      commit(result.text, result.cursor)
+      finish()
+    })
+    child.stdin.on('error', () => {})
+    child.stdin.end(source.text)
   }
 
   const emitPaste = (e: PasteEvent) => {
@@ -876,7 +1113,15 @@ export function TextInput({
 
   useInput(
     (inp: string, k: Key, event: InputEvent) => {
-      const eventRaw = event.keypress.raw
+      const eventRaw = event.keypress.raw ?? ''
+
+      const compactionKey = isInputCompactionKey(inp, k, eventRaw)
+
+      if (compactionKey && canRunInputCompactor(enableInputCompactor, mask)) {
+        runInputCompactor(compactionKey.wholeBuffer)
+
+        return
+      }
 
       // Configured voice shortcut wins over composer-level defaults like
       // paste/copy so users who bind voice to ctrl+v / alt+v / cmd+v
@@ -1162,7 +1407,8 @@ export function TextInput({
   )
 
   return (
-    <Box
+    <Box flexDirection="column" width={columns}>
+      <Box
       onClick={(e: MouseEventLite) => {
         if (!focus) {
           return
@@ -1226,7 +1472,9 @@ export function TextInput({
       ref={boxRef}
       width={columns}
     >
-      <Text wrap="wrap">{rendered}</Text>
+        <Text wrap="wrap">{rendered}</Text>
+      </Box>
+      {enableInputCompactor && inputCompactionStatus && <Text color="gray" wrap="truncate-end">{inputCompactionStatus}</Text>}
     </Box>
   )
 }
@@ -1248,6 +1496,7 @@ export interface PasteEvent {
 
 interface TextInputProps {
   columns?: number
+  enableInputCompactor?: boolean
   focus?: boolean
   mask?: string
   mouseApiRef?: MutableRefObject<null | TextInputMouseApi>

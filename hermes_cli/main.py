@@ -1488,6 +1488,21 @@ def _launch_tui(
     env.setdefault("HERMES_PYTHON", sys.executable)
     env.setdefault("HERMES_CWD", os.getcwd())
     env.setdefault("NODE_ENV", "development" if tui_dev else "production")
+    if not env.get("HERMES_INPUT_COMPACTOR"):
+        try:
+            from hermes_cli.config import load_config
+
+            cfg = load_config()
+            raw_compactor = None
+            if isinstance(cfg, dict):
+                display_cfg = cfg.get("display")
+                if isinstance(display_cfg, dict):
+                    raw_compactor = display_cfg.get("input_compactor_path")
+                raw_compactor = raw_compactor or cfg.get("input_compactor_path")
+            if raw_compactor:
+                env["HERMES_INPUT_COMPACTOR"] = os.path.expanduser(str(raw_compactor))
+        except Exception:
+            pass
 
     wt_info = None
     if worktree:

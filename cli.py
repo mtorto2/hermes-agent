@@ -37,7 +37,9 @@ import tempfile
 import time
 import uuid
 import textwrap
+import subprocess
 from collections import deque
+from dataclasses import dataclass
 from urllib.parse import unquote, urlparse
 from contextlib import contextmanager
 from pathlib import Path
@@ -45,6 +47,82 @@ from datetime import datetime
 from typing import List, Dict, Any, Optional
 
 logger = logging.getLogger(__name__)
+
+INPUT_COMPACTOR_STATUS = "Compacting input draft..."
+
+
+@dataclass(frozen=True)
+class InputCompactionSource:
+    start: int
+    text: str
+
+
+@dataclass(frozen=True)
+class InputCompactionResult:
+    text: str
+    compacted_up_to: int
+    cursor_position: int
+
+
+def input_compaction_notice(text: str) -> str | None:
+    """Return a user-facing skip reason for non-empty text."""
+    if not text.strip():
+        return None
+    if text.lstrip().startswith("/"):
+        return "Input compactor skipped slash command."
+    return None
+
+
+def input_compaction_source(text: str, *, compacted_up_to: int = 0, whole_buffer: bool = False) -> InputCompactionSource | None:
+    """Choose the text slice to compact for Ctrl+T segment or Alt+T whole-buffer mode."""
+    if not text.strip() or input_compaction_notice(text):
+        return None
+    if whole_buffer:
+        return InputCompactionSource(start=0, text=text)
+    start = max(0, min(compacted_up_to, len(text)))
+    source = text[start:]
+    if not source.strip():
+        return None
+    return InputCompactionSource(start=start, text=source)
+
+
+def splice_input_compaction_result(original: str, *, start: int, compacted: str) -> InputCompactionResult:
+    """Splice a compacted segment back into the original buffer and mark it compacted."""
+    prefix = original[: max(0, min(start, len(original)))]
+    result = prefix + compacted.strip()
+    return InputCompactionResult(text=result, compacted_up_to=len(result), cursor_position=len(result))
+
+
+def input_compaction_result_is_stale(
+    original: str,
+    current: str,
+    *,
+    start_version: int,
+    current_version: int,
+) -> bool:
+    """Return true when the user touched the draft after async compaction started."""
+    return current != original or current_version != start_version
+
+
+def refresh_input_compaction_offset(text: str, *, compacted_prefix: str = "", compacted_up_to: int = 0) -> tuple[int, str]:
+    """Keep the segment offset only while the already-compacted prefix is unchanged."""
+    if not compacted_prefix or text.startswith(compacted_prefix):
+        next_up_to = min(compacted_up_to, len(text))
+        return next_up_to, text[:next_up_to]
+    return 0, ""
+
+
+def resolve_input_compactor_path(config: Dict[str, Any] | None = None) -> Path | None:
+    """Resolve the configured input compactor path without baking in a machine-specific default."""
+    raw = os.environ.get("HERMES_INPUT_COMPACTOR")
+    if not raw and isinstance(config, dict):
+        display = config.get("display")
+        if isinstance(display, dict):
+            raw = display.get("input_compactor_path")
+        raw = raw or config.get("input_compactor_path")
+    if not raw:
+        return None
+    return Path(str(raw)).expanduser()
 
 # Suppress startup messages for clean CLI experience
 os.environ["HERMES_QUIET"] = "1"  # Our own modules
@@ -3242,6 +3320,11 @@ class HermesCLI:
         self._last_scrollback_tool: str = ""  # last tool name printed to scrollback (for "new" dedup)
         self._command_running = False
         self._command_status = ""
+        self._input_compactor_compacted_up_to = 0
+        self._input_compactor_compacted_prefix = ""
+        self._input_compactor_lock = threading.Lock()
+        self._input_compactor_running = False
+        self._input_compactor_edit_version = 0
         self._attached_images: list[Path] = []
         self._image_counter = 0
         self.preloaded_skills: list[str] = []
@@ -12362,6 +12445,8 @@ class HermesCLI:
             return _state_fragment("class:prompt-working", "?")
         if self._command_running:
             return _state_fragment("class:prompt-working", self._command_spinner_frame())
+        if self._input_compactor_running:
+            return _state_fragment("class:prompt-working", self._command_spinner_frame())
         if self._agent_running:
             return _state_fragment("class:prompt-working", "⚕")
         if self._voice_mode:
@@ -12707,6 +12792,10 @@ class HermesCLI:
             Commands (starting with /) always go to _pending_input so they're
             handled as commands, not sent as interrupt text to the agent.
             """
+            def _reset_input_compactor_state() -> None:
+                self._input_compactor_compacted_up_to = 0
+                self._input_compactor_compacted_prefix = ""
+
             # --- Sudo password prompt: submit the typed password ---
             if self._sudo_state:
                 text = event.app.current_buffer.text
@@ -12791,6 +12880,7 @@ class HermesCLI:
                         self._should_exit = True
                         if event.app.is_running:
                             event.app.exit()
+                    _reset_input_compactor_state()
                     event.app.current_buffer.reset(append_to_history=True)
                     return
 
@@ -12799,6 +12889,7 @@ class HermesCLI:
                 # pending prompt it is trying to remove.
                 if self._should_handle_queue_delete_command_inline(text, has_images=has_images):
                     self.process_command(text)
+                    _reset_input_compactor_state()
                     event.app.current_buffer.reset(append_to_history=True)
                     return
 
@@ -12810,6 +12901,7 @@ class HermesCLI:
                 # agent.steer() is thread-safe (holds _pending_steer_lock).
                 if self._should_handle_steer_command_inline(text, has_images=has_images):
                     self.process_command(text)
+                    _reset_input_compactor_state()
                     event.app.current_buffer.reset(append_to_history=True)
                     return
 
@@ -12877,6 +12969,7 @@ class HermesCLI:
                         pass
                 else:
                     self._pending_input.put(payload)
+                _reset_input_compactor_state()
                 event.app.current_buffer.reset(append_to_history=True)
 
         _bind_prompt_submit_keys(kb, handle_enter)
@@ -12921,6 +13014,129 @@ class HermesCLI:
         def handle_open_in_editor(event):
             """Ctrl+G (or Alt+G in VSCode/Cursor) opens the current draft in an external editor."""
             cli_ref._open_external_editor(event.current_buffer)
+
+        def _compact_current_buffer(event, *, whole_buffer: bool = False):
+            """Compact the current input draft natively, preserving review before submit."""
+            buf = event.current_buffer
+            original = buf.text
+            notice = input_compaction_notice(original)
+            if notice:
+                _cprint(f"\n{_DIM}{notice}{_RST}")
+                return
+
+            compactor_lock = cli_ref._input_compactor_lock
+            if not compactor_lock.acquire(blocking=False):
+                return
+
+            offset, compacted_prefix = refresh_input_compaction_offset(
+                original,
+                compacted_prefix=cli_ref._input_compactor_compacted_prefix,
+                compacted_up_to=cli_ref._input_compactor_compacted_up_to,
+            )
+            cli_ref._input_compactor_compacted_up_to = offset
+            cli_ref._input_compactor_compacted_prefix = compacted_prefix
+            source = input_compaction_source(original, compacted_up_to=offset, whole_buffer=whole_buffer)
+            if source is None:
+                compactor_lock.release()
+                return
+
+            compactor = resolve_input_compactor_path(getattr(cli_ref, "config", None))
+            if compactor is None:
+                compactor_lock.release()
+                _cprint(f"\n{_DIM}Set HERMES_INPUT_COMPACTOR or input_compactor_path to enable input compaction.{_RST}")
+                return
+            if not compactor.exists():
+                compactor_lock.release()
+                _cprint(f"\n{_DIM}Input compactor not found: {compactor}{_RST}")
+                return
+
+            cursor = buf.cursor_position
+            start_version = cli_ref._input_compactor_edit_version
+            app = event.app
+
+            def _call_on_ui(callback):
+                loop = getattr(app, "loop", None)
+                if loop is not None and getattr(loop, "is_running", lambda: False)():
+                    loop.call_soon_threadsafe(callback)
+                    return True
+                return False
+
+            previous_status = getattr(cli_ref, "_command_status", "")
+            cli_ref._input_compactor_running = True
+            cli_ref._command_status = INPUT_COMPACTOR_STATUS
+            app.invalidate()
+
+            def _run_compactor():
+                try:
+                    proc = subprocess.run(
+                        [str(compactor), "--stdin"],
+                        input=source.text,
+                        text=True,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        timeout=90,
+                        check=False,
+                    )
+                    if proc.returncode != 0:
+                        err = (proc.stderr or proc.stdout or "compactor failed").strip().splitlines()
+                        message = err[-1] if err else "compactor failed"
+                        raise RuntimeError(message[:300])
+                    compacted = proc.stdout.strip()
+                    if not compacted:
+                        raise RuntimeError("compactor returned empty output")
+
+                    def _apply_result():
+                        # Do not clobber if the user kept typing while the compactor ran.
+                        if input_compaction_result_is_stale(
+                            original,
+                            buf.text,
+                            start_version=start_version,
+                            current_version=cli_ref._input_compactor_edit_version,
+                        ):
+                            _cprint(f"\n{_DIM}Compactor finished, but draft changed; leaving current input untouched.{_RST}")
+                            return
+                        result = splice_input_compaction_result(original, start=source.start, compacted=compacted)
+                        buf.text = result.text
+                        buf.cursor_position = result.cursor_position
+                        cli_ref._input_compactor_compacted_up_to = result.compacted_up_to
+                        cli_ref._input_compactor_compacted_prefix = result.text[: result.compacted_up_to]
+
+                    _call_on_ui(_apply_result)
+                except Exception as exc:
+                    error_message = str(exc)
+
+                    def _show_error():
+                        _cprint(f"\n{_DIM}Input compactor failed: {error_message}{_RST}")
+                        if buf.text == original:
+                            buf.cursor_position = min(cursor, len(buf.text))
+
+                    _call_on_ui(_show_error)
+                finally:
+                    def _finish():
+                        if getattr(cli_ref, "_command_status", "") == INPUT_COMPACTOR_STATUS:
+                            cli_ref._command_status = previous_status
+                        cli_ref._input_compactor_running = False
+                        compactor_lock.release()
+                        app.invalidate()
+
+                    if not _call_on_ui(_finish):
+                        cli_ref._input_compactor_running = False
+                        if getattr(cli_ref, "_command_status", "") == INPUT_COMPACTOR_STATUS:
+                            cli_ref._command_status = previous_status
+                        compactor_lock.release()
+
+            threading.Thread(target=_run_compactor, daemon=True).start()
+
+        @kb.add('c-t', filter=_editor_filter, eager=True)
+        def handle_compact_latest_input_segment(event):
+            """Ctrl+T compacts only the latest uncompacted input segment."""
+            _compact_current_buffer(event, whole_buffer=False)
+
+        @kb.add('escape', 't', filter=_editor_filter)
+        @kb.add('escape', 'T', filter=_editor_filter)
+        def handle_compact_whole_input_buffer(event):
+            """Alt+T compacts the whole current draft buffer."""
+            _compact_current_buffer(event, whole_buffer=True)
 
         @kb.add('tab', eager=True)
         def handle_tab(event):
@@ -13586,6 +13802,11 @@ class HermesCLI:
         # EEXIST. The suffix keeps markdown highlighting without that bug.
         input_area.buffer.tempfile_suffix = '.md'
 
+        def _note_input_compactor_edit(_buffer) -> None:
+            cli_ref._input_compactor_edit_version += 1
+
+        input_area.buffer.on_text_changed += _note_input_compactor_edit
+
         # Dynamic height: accounts for both explicit newlines AND visual
         # wrapping of long lines so the input area always fits its content.
         def _input_height():
@@ -13721,7 +13942,7 @@ class HermesCLI:
                 return "type your answer here and press Enter"
             if cli_ref._clarify_state:
                 return ""
-            if cli_ref._command_running:
+            if cli_ref._command_running or cli_ref._input_compactor_running:
                 frame = cli_ref._command_spinner_frame()
                 status = cli_ref._command_status or "Processing command..."
                 return f"{frame} {status}"
@@ -13784,11 +14005,14 @@ class HermesCLI:
                 return [
                     ('class:hint', f'  {frame} command in progress · input temporarily disabled'),
                 ]
+            if cli_ref._input_compactor_running:
+                frame = cli_ref._command_spinner_frame()
+                return [('class:hint', f'  {frame} {INPUT_COMPACTOR_STATUS}')]
 
             return []
 
         def get_hint_height():
-            if cli_ref._sudo_state or cli_ref._secret_state or cli_ref._approval_state or cli_ref._slash_confirm_state or cli_ref._clarify_state or cli_ref._command_running:
+            if cli_ref._sudo_state or cli_ref._secret_state or cli_ref._approval_state or cli_ref._slash_confirm_state or cli_ref._clarify_state or cli_ref._command_running or cli_ref._input_compactor_running:
                 return 1
             # Keep a spacer while the agent runs on roomy terminals, but reclaim
             # the row on narrow/mobile screens where every line matters.
