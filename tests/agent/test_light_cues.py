@@ -293,6 +293,7 @@ def test_light_cue_service_reloads_sticky_mode_before_emit(tmp_path, monkeypatch
 def test_slot_status_file_backend_writes_per_slot_status_atomically(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setenv("HERMES_SLOT", "2")
+    monkeypatch.setenv("HERMES_SESSION_ID", "20260529_123456_abcd")
 
     service = LightCueService(backend=RecordingBackend(), slot_status_backend=SlotStatusFileBackend.from_env())
 
@@ -305,8 +306,35 @@ def test_slot_status_file_backend_writes_per_slot_status_atomically(tmp_path, mo
     assert payload["pid"] > 0
     assert payload["process_started_at"]
     assert payload["source"] == "hermes"
+    assert payload["session_id"] == "20260529_123456_abcd"
     assert payload["updated_at"]
     assert not status_path.with_suffix(".json.tmp").exists()
+
+
+def test_light_cue_service_writes_per_slot_context_sidecar(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_SLOT", "2")
+
+    service = LightCueService(backend=RecordingBackend(), slot_status_backend=SlotStatusFileBackend.from_env())
+
+    assert service.update_slot_context(
+        session_id="20260529_123456_abcd",
+        current_context="Implement Agent Lights tab context.",
+        chat_summary="Wiring the Swift menu submenu.",
+        provider="openai-codex",
+        model_name="gpt-5.5",
+    ) is True
+    context_path = tmp_path / "agent-lights" / "context" / "2.json"
+    payload = json.loads(context_path.read_text(encoding="utf-8"))
+    assert payload["slot"] == 2
+    assert payload["source"] == "hermes"
+    assert payload["session_id"] == "20260529_123456_abcd"
+    assert payload["provider"] == "openai-codex"
+    assert payload["model_name"] == "gpt-5.5"
+    assert payload["current_context"] == "Implement Agent Lights tab context."
+    assert payload["chat_summary"] == "Wiring the Swift menu submenu."
+    assert payload["updated_at"]
+    assert not context_path.with_suffix(".json.tmp").exists()
 
 
 def test_slot_status_file_backend_marks_kanban_workers(tmp_path, monkeypatch):
@@ -474,6 +502,50 @@ def test_agent_lights_menu_bar_launcher_refreshes_existing_bundle_from_debug_bin
     assert executable_path.read_bytes() == b"new-binary"
 
 
+def test_agent_lights_menu_bar_launcher_uses_arch_specific_swiftpm_binary_after_clean_build(tmp_path):
+    binary_path = (
+        tmp_path
+        / "apps"
+        / "agent-lights-menu-bar"
+        / ".build"
+        / "arm64-apple-macosx"
+        / "debug"
+        / "AgentLightsMenuBar"
+    )
+    binary_path.parent.mkdir(parents=True)
+    binary_path.write_bytes(b"arch-specific-binary")
+    launcher = AgentLightsMenuBarLauncher(repo_root=tmp_path)
+
+    app_path = launcher._ensure_app_bundle()
+
+    assert app_path is not None
+    executable_path = app_path / "Contents" / "MacOS" / "AgentLightsMenuBar"
+    assert executable_path.read_bytes() == b"arch-specific-binary"
+
+
+def test_agent_lights_menu_bar_launcher_prefers_newer_swiftpm_binary_candidate(tmp_path):
+    legacy_binary = tmp_path / "apps" / "agent-lights-menu-bar" / ".build" / "debug" / "AgentLightsMenuBar"
+    arch_binary = (
+        tmp_path
+        / "apps"
+        / "agent-lights-menu-bar"
+        / ".build"
+        / "arm64-apple-macosx"
+        / "debug"
+        / "AgentLightsMenuBar"
+    )
+    legacy_binary.parent.mkdir(parents=True)
+    arch_binary.parent.mkdir(parents=True)
+    legacy_binary.write_bytes(b"old-legacy-binary")
+    arch_binary.write_bytes(b"new-arch-binary")
+    launcher = AgentLightsMenuBarLauncher(repo_root=tmp_path)
+
+    app_path = launcher._ensure_app_bundle()
+
+    assert app_path is not None
+    assert (app_path / "Contents" / "MacOS" / "AgentLightsMenuBar").read_bytes() == b"new-arch-binary"
+
+
 def test_agent_lights_menu_bar_launcher_returns_none_without_built_binary(tmp_path):
     launcher = AgentLightsMenuBarLauncher(repo_root=tmp_path)
 
@@ -574,6 +646,28 @@ def test_slot_status_file_backend_auto_assign_caps_at_four_live_slots(tmp_path, 
     monkeypatch.setattr(SlotStatusFileBackend, "_pid_is_running", staticmethod(lambda pid: True))
 
     assert SlotStatusFileBackend.from_env(auto_assign=True) is None
+
+
+def test_light_cue_service_retries_slot_claim_when_capacity_frees(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv("HERMES_SLOT", raising=False)
+    slots = tmp_path / "agent-lights" / "slots"
+    slots.mkdir(parents=True)
+    for slot in range(1, 5):
+        (slots / f"{slot}.json").write_text(json.dumps({"slot": slot, "pid": 100 + slot, "state": "idle"}), encoding="utf-8")
+    monkeypatch.setattr(SlotStatusFileBackend, "_pid_is_running", staticmethod(lambda pid: True))
+
+    service = build_light_cue_service_from_config({"model": {"default": "gpt-5.5"}}, auto_assign_slot=True)
+    assert service.slot_status_backend is None
+
+    (slots / "3.json").unlink()
+
+    service.emit(LightCueEvent.IDLE)
+
+    payload = json.loads((slots / "3.json").read_text(encoding="utf-8"))
+    assert payload["slot"] == 3
+    assert payload["state"] == "idle"
+    assert payload["model_name"] == "gpt-5.5"
 
 
 def test_slot_status_file_backend_auto_assign_reuses_current_process_slot(tmp_path, monkeypatch):
