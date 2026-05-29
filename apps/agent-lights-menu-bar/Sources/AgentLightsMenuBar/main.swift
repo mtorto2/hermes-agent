@@ -22,6 +22,7 @@ private final class AgentLightsApp: NSObject, NSApplicationDelegate, NSMenuDeleg
     private let monitorOpacityDefaultsKey = "HermesFloatingMonitorOpacity"
     private let slotsDirectory: URL
     private let agentsDirectory: URL
+    private var terminalTTYOrderCache: (loadedAt: Date, ttys: [String])?
 
     override init() {
         let home = ProcessInfo.processInfo.environment["HERMES_HOME"]
@@ -91,15 +92,76 @@ private final class AgentLightsApp: NSObject, NSApplicationDelegate, NSMenuDeleg
         let legacyAgentStatuses = slotStatuses.filter(\.isKanbanWorker)
         let hermesStatuses = slotStatuses.filter { !$0.isKanbanWorker }
         let allAgentStatuses = agentStatuses + legacyAgentStatuses
+        // Keep normal Hermes lights stable by their Agent Lights slot letters (A-D).
+        // Terminal window/tab ordering is still used for click-to-focus association,
+        // but not for visual ordering; Terminal's AppleScript window order changes
+        // with focus and made the dots jump around.
+        let orderedHermesStatuses = hermesStatuses.sorted { $0.slot < $1.slot }
 
         let agentGroup = AgentRingGroup(statuses: allAgentStatuses)
-        statusItem.button?.image = DotRenderer.image(for: hermesStatuses, agentGroup: agentGroup)
+        statusItem.button?.image = DotRenderer.image(for: orderedHermesStatuses, agentGroup: agentGroup)
         removeAgentStatusItemIfPresent()
-        let menuModel = SlotStatusMenuModel(hermesStatuses: hermesStatuses, agentStatuses: allAgentStatuses)
+        let menuModel = SlotStatusMenuModel(hermesStatuses: orderedHermesStatuses, agentStatuses: allAgentStatuses)
         statusItem.button?.toolTip = menuModel.tooltip
         statusSummaryItem.title = menuModel.summaryTitle
-        replaceStatusRows(with: hermesStatuses + allAgentStatuses, rowTitles: menuModel.rowTitles)
-        monitorController?.update(hermesStatuses: hermesStatuses, agentGroup: agentGroup)
+        replaceStatusRows(with: orderedHermesStatuses + allAgentStatuses, rowTitles: menuModel.rowTitles)
+        monitorController?.update(hermesStatuses: orderedHermesStatuses, agentGroup: agentGroup)
+    }
+
+    private func orderHermesStatusesForTerminal(_ statuses: [SlotStatus]) -> [SlotStatus] {
+        let pids = statuses.compactMap(\.pid)
+        guard !pids.isEmpty else { return statuses.sorted { $0.slot < $1.slot } }
+        let terminalOrder = terminalTTYOrder()
+        guard !terminalOrder.isEmpty else { return statuses.sorted { $0.slot < $1.slot } }
+        let ttyByPid = Dictionary(uniqueKeysWithValues: pids.compactMap { pid in
+            ttyForProcess(pid: pid).map { (pid, $0) }
+        })
+        return SlotStatus.orderedByTerminalTTY(statuses, ttyForPid: ttyByPid, terminalTTYOrder: terminalOrder)
+    }
+
+    private func terminalTTYOrder() -> [String] {
+        let now = Date()
+        if let cache = terminalTTYOrderCache, now.timeIntervalSince(cache.loadedAt) < 2.0 {
+            return cache.ttys
+        }
+        let script = """
+        set output to ""
+        tell application "Terminal"
+            repeat with w in windows
+                repeat with t in tabs of w
+                    try
+                        set output to output & (tty of t) & linefeed
+                    end try
+                end repeat
+            end repeat
+        end tell
+        return output
+        """
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        process.arguments = ["-e", script]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = Pipe()
+        do {
+            try process.run()
+            process.waitUntilExit()
+        } catch {
+            terminalTTYOrderCache = (loadedAt: now, ttys: [])
+            return []
+        }
+        guard process.terminationStatus == 0 else {
+            terminalTTYOrderCache = (loadedAt: now, ttys: [])
+            return []
+        }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        let output = String(data: data, encoding: .utf8) ?? ""
+        let ttys = output
+            .split(whereSeparator: \.isNewline)
+            .map(String.init)
+            .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        terminalTTYOrderCache = (loadedAt: now, ttys: ttys)
+        return ttys
     }
 
     private func removeAgentStatusItemIfPresent() {

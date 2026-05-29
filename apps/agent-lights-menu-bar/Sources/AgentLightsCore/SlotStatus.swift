@@ -31,11 +31,17 @@ public struct SlotStatus: Equatable {
     }
 
     public var menuDetail: String {
-        "\(slot): \(displayModelName) - \(state.menuLabel)"
+        "\(slotLetter): \(displayModelName) - \(state.menuLabel)"
     }
 
     public var agentMenuDetail: String {
         "Agent \(slot): \(displayModelName) - \(state.menuLabel)"
+    }
+
+    private var slotLetter: String {
+        guard (1...26).contains(slot),
+              let scalar = UnicodeScalar(64 + slot) else { return String(slot) }
+        return String(Character(scalar))
     }
 
     private var displayModelName: String {
@@ -45,10 +51,16 @@ public struct SlotStatus: Equatable {
         if lowerLeaf.hasPrefix("gpt-") {
             return "GPT-" + String(leaf.dropFirst(4))
         }
+        if lowerLeaf.hasPrefix("claude-sonnet-") {
+            return "Sonnet " + String(leaf.dropFirst("claude-sonnet-".count)).replacingOccurrences(of: "-", with: ".")
+        }
+        if lowerLeaf.hasPrefix("claude-opus-") {
+            return "Opus " + String(leaf.dropFirst("claude-opus-".count)).replacingOccurrences(of: "-", with: ".")
+        }
+        if lowerLeaf.hasPrefix("claude-haiku-") {
+            return "Haiku " + String(leaf.dropFirst("claude-haiku-".count)).replacingOccurrences(of: "-", with: ".")
+        }
         let normalized = leaf
-            .replacingOccurrences(of: "claude-sonnet-", with: "claude-")
-            .replacingOccurrences(of: "claude-opus-", with: "claude-")
-            .replacingOccurrences(of: "claude-haiku-", with: "claude-")
             .replacingOccurrences(of: "-", with: " ")
             .replacingOccurrences(of: "_", with: " ")
         return normalized.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "unknown" : normalized
@@ -75,6 +87,41 @@ public struct SlotStatus: Equatable {
             kanbanTaskTitle: payload.kanbanTaskTitle,
             profile: payload.profile
         )
+    }
+
+    public static func orderedByTerminalTTY(
+        _ statuses: [SlotStatus],
+        ttyForPid: [Int: String],
+        terminalTTYOrder: [String]
+    ) -> [SlotStatus] {
+        var ttyRank: [String: Int] = [:]
+        for (index, tty) in terminalTTYOrder.enumerated() {
+            guard let normalized = normalizedTTY(tty), ttyRank[normalized] == nil else { continue }
+            ttyRank[normalized] = index
+        }
+        return statuses.sorted { left, right in
+            let leftRank = left.pid.flatMap { ttyForPid[$0] }.flatMap { ttyRank[normalizedTTY($0) ?? ""] }
+            let rightRank = right.pid.flatMap { ttyForPid[$0] }.flatMap { ttyRank[normalizedTTY($0) ?? ""] }
+            switch (leftRank, rightRank) {
+            case let (left?, right?) where left != right:
+                return left < right
+            case (_?, nil):
+                return true
+            case (nil, _?):
+                return false
+            default:
+                return left.slot < right.slot
+            }
+        }
+    }
+
+    private static func normalizedTTY(_ tty: String) -> String? {
+        let trimmedTTY = tty.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedTTY.isEmpty, trimmedTTY != "??" else { return nil }
+        if trimmedTTY.hasPrefix("/dev/") {
+            return String(trimmedTTY.dropFirst(5))
+        }
+        return trimmedTTY
     }
 
     public func shouldRender(
