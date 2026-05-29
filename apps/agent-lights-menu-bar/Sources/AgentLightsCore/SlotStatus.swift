@@ -25,17 +25,28 @@ public struct SlotStatus: Equatable {
     public let kanbanTaskId: String?
     public let kanbanTaskTitle: String?
     public let profile: String?
+    public let sessionId: String?
 
     public var isKanbanWorker: Bool {
         source == "kanban_worker"
     }
 
     public var menuDetail: String {
-        "\(slot): \(displayModelName) - \(state.menuLabel)"
+        "\(slotLetter): \(displayModelName) - \(state.menuLabel)"
+    }
+
+    public var terminalTabTitle: String {
+        "Hermes \(slotLetter)"
     }
 
     public var agentMenuDetail: String {
         "Agent \(slot): \(displayModelName) - \(state.menuLabel)"
+    }
+
+    private var slotLetter: String {
+        guard (1...26).contains(slot),
+              let scalar = UnicodeScalar(64 + slot) else { return String(slot) }
+        return String(Character(scalar))
     }
 
     private var displayModelName: String {
@@ -45,17 +56,23 @@ public struct SlotStatus: Equatable {
         if lowerLeaf.hasPrefix("gpt-") {
             return "GPT-" + String(leaf.dropFirst(4))
         }
+        if lowerLeaf.hasPrefix("claude-sonnet-") {
+            return "Sonnet " + String(leaf.dropFirst("claude-sonnet-".count)).replacingOccurrences(of: "-", with: ".")
+        }
+        if lowerLeaf.hasPrefix("claude-opus-") {
+            return "Opus " + String(leaf.dropFirst("claude-opus-".count)).replacingOccurrences(of: "-", with: ".")
+        }
+        if lowerLeaf.hasPrefix("claude-haiku-") {
+            return "Haiku " + String(leaf.dropFirst("claude-haiku-".count)).replacingOccurrences(of: "-", with: ".")
+        }
         let normalized = leaf
-            .replacingOccurrences(of: "claude-sonnet-", with: "claude-")
-            .replacingOccurrences(of: "claude-opus-", with: "claude-")
-            .replacingOccurrences(of: "claude-haiku-", with: "claude-")
             .replacingOccurrences(of: "-", with: " ")
             .replacingOccurrences(of: "_", with: " ")
         return normalized.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "unknown" : normalized
     }
 
     public static func missing(slot: Int) -> SlotStatus {
-        SlotStatus(slot: slot, state: .missing, event: nil, updatedAt: nil, pid: nil, processStartedAt: nil, source: nil, modelName: nil, kanbanBoard: nil, kanbanTaskId: nil, kanbanTaskTitle: nil, profile: nil)
+        SlotStatus(slot: slot, state: .missing, event: nil, updatedAt: nil, pid: nil, processStartedAt: nil, source: nil, modelName: nil, kanbanBoard: nil, kanbanTaskId: nil, kanbanTaskTitle: nil, profile: nil, sessionId: nil)
     }
 
     public static func decode(from data: Data) throws -> SlotStatus {
@@ -73,8 +90,44 @@ public struct SlotStatus: Equatable {
             kanbanBoard: payload.kanbanBoard,
             kanbanTaskId: payload.kanbanTaskId,
             kanbanTaskTitle: payload.kanbanTaskTitle,
-            profile: payload.profile
+            profile: payload.profile,
+            sessionId: payload.sessionId
         )
+    }
+
+    public static func orderedByTerminalTTY(
+        _ statuses: [SlotStatus],
+        ttyForPid: [Int: String],
+        terminalTTYOrder: [String]
+    ) -> [SlotStatus] {
+        var ttyRank: [String: Int] = [:]
+        for (index, tty) in terminalTTYOrder.enumerated() {
+            guard let normalized = normalizedTTY(tty), ttyRank[normalized] == nil else { continue }
+            ttyRank[normalized] = index
+        }
+        return statuses.sorted { left, right in
+            let leftRank = left.pid.flatMap { ttyForPid[$0] }.flatMap { ttyRank[normalizedTTY($0) ?? ""] }
+            let rightRank = right.pid.flatMap { ttyForPid[$0] }.flatMap { ttyRank[normalizedTTY($0) ?? ""] }
+            switch (leftRank, rightRank) {
+            case let (left?, right?) where left != right:
+                return left < right
+            case (_?, nil):
+                return true
+            case (nil, _?):
+                return false
+            default:
+                return left.slot < right.slot
+            }
+        }
+    }
+
+    private static func normalizedTTY(_ tty: String) -> String? {
+        let trimmedTTY = tty.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedTTY.isEmpty, trimmedTTY != "??" else { return nil }
+        if trimmedTTY.hasPrefix("/dev/") {
+            return String(trimmedTTY.dropFirst(5))
+        }
+        return trimmedTTY
     }
 
     public func shouldRender(
@@ -429,6 +482,66 @@ public enum TerminalFocusScript {
     }
 }
 
+public enum TerminalTabTitleScript {
+    public static func script(forTTY tty: String, title: String) -> String? {
+        let trimmedTTY = tty.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmedTTY.range(of: #"^ttys[0-9]+$"#, options: .regularExpression) != nil else {
+            return nil
+        }
+        let trimmedTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedTitle.isEmpty else { return nil }
+        let terminalTTY = "/dev/\(trimmedTTY)"
+        let escapedTTY = appleScriptEscaped(terminalTTY)
+        let titleCommand = "/usr/bin/printf "
+            + shellSingleQuoted("\\033]1;\(trimmedTitle)\\007")
+            + " > "
+            + shellSingleQuoted(terminalTTY)
+        let escapedCommand = appleScriptEscaped(titleCommand)
+        return """
+        tell application "Terminal"
+            repeat with w in windows
+                repeat with t in tabs of w
+                    if tty of t is "\(escapedTTY)" then
+                        try
+                            set title displays custom title of t to false
+                        end try
+                        try
+                            set custom title of t to ""
+                        end try
+                        try
+                            set title displays device name of t to false
+                        end try
+                        try
+                            set title displays shell path of t to false
+                        end try
+                        try
+                            set title displays window size of t to false
+                        end try
+                        try
+                            set title displays file name of t to false
+                        end try
+                        do shell script "\(escapedCommand)"
+                        return true
+                    end if
+                end repeat
+            end repeat
+        end tell
+        return false
+        """
+    }
+
+    private static func appleScriptEscaped(_ value: String) -> String {
+        value
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+            .replacingOccurrences(of: "\n", with: " ")
+    }
+
+    private static func shellSingleQuoted(_ value: String) -> String {
+        "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+}
+
 public enum KanbanCardOpenScript {
     public static func script(taskId: String?, board: String?) -> String? {
         guard let rawTaskId = trimmed(taskId),
@@ -480,6 +593,7 @@ private struct SlotStatusPayload: Decodable {
     let kanbanTaskId: String?
     let kanbanTaskTitle: String?
     let profile: String?
+    let sessionId: String?
 
     enum CodingKeys: String, CodingKey {
         case slot
@@ -494,5 +608,6 @@ private struct SlotStatusPayload: Decodable {
         case kanbanTaskId = "kanban_task_id"
         case kanbanTaskTitle = "kanban_task_title"
         case profile
+        case sessionId = "session_id"
     }
 }

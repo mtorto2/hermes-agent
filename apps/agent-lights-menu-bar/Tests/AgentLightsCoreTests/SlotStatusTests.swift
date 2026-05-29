@@ -33,7 +33,7 @@ final class SlotStatusTests: XCTestCase {
         XCTAssertEqual(status.kanbanTaskTitle, "Investigate menu rings")
         XCTAssertEqual(status.profile, "matt-codex")
         XCTAssertTrue(status.isKanbanWorker)
-        XCTAssertEqual(status.menuDetail, "2: GPT-5.5 - answer ready")
+        XCTAssertEqual(status.menuDetail, "B: GPT-5.5 - answer ready")
     }
 
     func testNonKanbanSlotsAreNotWorkerRings() throws {
@@ -49,7 +49,7 @@ final class SlotStatusTests: XCTestCase {
         let status = try SlotStatus.decode(from: payload)
 
         XCTAssertFalse(status.isKanbanWorker)
-        XCTAssertEqual(status.menuDetail, "1: claude 4.6 - working")
+        XCTAssertEqual(status.menuDetail, "A: Sonnet 4.6 - working")
     }
 
     func testMenuModelProvidesOneRowPerRenderableSlot() throws {
@@ -57,7 +57,7 @@ final class SlotStatusTests: XCTestCase {
         {"slot":1,"state":"final_answer","source":"hermes","model_name":"openai/gpt-5.5"}
         """.data(using: .utf8)!)
         let second = try SlotStatus.decode(from: """
-        {"slot":2,"state":"working","source":"hermes","model_name":"anthropic/claude-4.7"}
+        {"slot":2,"state":"working","source":"hermes","model_name":"anthropic/claude-opus-4.8"}
         """.data(using: .utf8)!)
         let worker = try SlotStatus.decode(from: """
         {"slot":1,"state":"working","source":"kanban_worker","model_name":"openai-codex/gpt-5.5"}
@@ -67,14 +67,110 @@ final class SlotStatusTests: XCTestCase {
 
         XCTAssertEqual(model.summaryTitle, "Hermes: 2 active  Agents: 1 active")
         XCTAssertEqual(model.rowTitles, [
-            "1: GPT-5.5 - answer ready",
-            "2: claude 4.7 - working",
+            "A: GPT-5.5 - answer ready",
+            "B: Opus 4.8 - working",
             "Agent 1: GPT-5.5 - working",
         ])
         XCTAssertEqual(
             model.tooltip,
-            "Hermes: 2 active  Agents: 1 active\n1: GPT-5.5 - answer ready\n2: claude 4.7 - working\nAgent 1: GPT-5.5 - working"
+            "Hermes: 2 active  Agents: 1 active\nA: GPT-5.5 - answer ready\nB: Opus 4.8 - working\nAgent 1: GPT-5.5 - working"
         )
+    }
+
+    func testHermesStatusesCanBeOrderedByTerminalTabTtyInsteadOfSlotNumber() throws {
+        let firstSlot = try SlotStatus.decode(from: """
+        {"slot":1,"state":"final_answer","pid":101,"source":"hermes","model_name":"openai/gpt-5.5"}
+        """.data(using: .utf8)!)
+        let secondSlot = try SlotStatus.decode(from: """
+        {"slot":2,"state":"working","pid":202,"source":"hermes","model_name":"anthropic/claude-4.7"}
+        """.data(using: .utf8)!)
+        let thirdSlot = try SlotStatus.decode(from: """
+        {"slot":3,"state":"idle","pid":303,"source":"hermes","model_name":"openai/gpt-5.5"}
+        """.data(using: .utf8)!)
+
+        let ordered = SlotStatus.orderedByTerminalTTY(
+            [firstSlot, secondSlot, thirdSlot],
+            ttyForPid: [101: "ttys003", 202: "ttys001", 303: "ttys002"],
+            terminalTTYOrder: ["/dev/ttys001", "/dev/ttys002", "/dev/ttys003"]
+        )
+
+        XCTAssertEqual(ordered.map(\.slot), [2, 3, 1])
+    }
+
+    func testTerminalTtyOrderingFallsBackToSlotOrderForUnknownTabs() throws {
+        let firstSlot = try SlotStatus.decode(from: """
+        {"slot":1,"state":"final_answer","pid":101,"source":"hermes","model_name":"openai/gpt-5.5"}
+        """.data(using: .utf8)!)
+        let secondSlot = try SlotStatus.decode(from: """
+        {"slot":2,"state":"working","pid":202,"source":"hermes","model_name":"anthropic/claude-4.7"}
+        """.data(using: .utf8)!)
+
+        let ordered = SlotStatus.orderedByTerminalTTY(
+            [secondSlot, firstSlot],
+            ttyForPid: [202: "ttys009"],
+            terminalTTYOrder: ["/dev/ttys001"]
+        )
+
+        XCTAssertEqual(ordered.map(\.slot), [1, 2])
+    }
+
+    func testTerminalTabTitleUsesSingleSlotLetterAtEndForReadableMacOSTabs() throws {
+        let status = try SlotStatus.decode(from: """
+        {"slot":2,"state":"working","pid":202,"source":"hermes","model_name":"openai/gpt-5.5"}
+        """.data(using: .utf8)!)
+
+        XCTAssertEqual(status.terminalTabTitle, "Hermes B")
+    }
+
+    func testTerminalTabTitleScriptSetsExactOscTitleForMatchingTTYOnly() {
+        let script = TerminalTabTitleScript.script(forTTY: "ttys001", title: "Hermes B")
+
+        XCTAssertNotNil(script)
+        XCTAssertTrue(script?.contains("if tty of t is \"/dev/ttys001\"") == true)
+        XCTAssertTrue(script?.contains("set title displays custom title of t to false") == true)
+        XCTAssertTrue(script?.contains("set custom title of t to \"\"") == true)
+        XCTAssertTrue(script?.contains("do shell script \"/usr/bin/printf") == true)
+        XCTAssertTrue(script?.contains("Hermes B") == true)
+        XCTAssertTrue(script?.contains("/dev/ttys001") == true)
+        XCTAssertNil(TerminalTabTitleScript.script(forTTY: "../../bad", title: "B"))
+    }
+
+    func testSlotContextProvidesExpandableMenuRows() throws {
+        let context = try SlotContext.decode(from: """
+        {
+          "slot": 2,
+          "tab_name": "Build lights",
+          "provider": "openai-codex",
+          "model_name": "gpt-5.5",
+          "session_id": "20260529_123456_abcd",
+          "current_context": "Implement Agent Lights per-tab context submenu.",
+          "chat_summary": "Tests are red; wiring Swift menu next.",
+          "updated_at": "2026-05-29T12:34:56+00:00"
+        }
+        """.data(using: .utf8)!)
+
+        XCTAssertEqual(context.slot, 2)
+        XCTAssertEqual(context.detailRows, [
+            "Tab: B — Build lights",
+            "Provider / Model: openai-codex / gpt-5.5",
+            "Session: 20260529_123456_abcd",
+            "Current Context: Implement Agent Lights per-tab context submenu.",
+            "Chat Summary: Tests are red; wiring Swift menu next.",
+            "Updated: 2026-05-29T12:34:56+00:00",
+        ])
+    }
+
+    func testSlotContextFallbackStillCreatesSubmenuRowsWithoutSidecar() throws {
+        let status = try SlotStatus.decode(from: """
+        {"slot":1,"state":"working","source":"hermes","model_name":"openai/gpt-5.5"}
+        """.data(using: .utf8)!)
+
+        let context = SlotContext.fallback(for: status)
+
+        XCTAssertEqual(context.detailRows, [
+            "Tab: A",
+            "Provider / Model: openai/gpt-5.5",
+        ])
     }
 
     func testAgentRingGroupShowsEightCapacitySlotsWhenAnyAgentIsRunning() throws {

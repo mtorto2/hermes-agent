@@ -10,6 +10,13 @@ private final class StatusRowAction: NSObject {
     }
 }
 
+private struct TerminalTabTitleSyncRequest {
+    let slot: Int
+    let pid: Int
+    let title: String
+    let cacheKey: String
+}
+
 @MainActor
 private final class AgentLightsApp: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -22,6 +29,12 @@ private final class AgentLightsApp: NSObject, NSApplicationDelegate, NSMenuDeleg
     private let monitorOpacityDefaultsKey = "HermesFloatingMonitorOpacity"
     private let slotsDirectory: URL
     private let agentsDirectory: URL
+    private let contextDirectory: URL
+    private let tabTitleSyncQueue = DispatchQueue(label: "com.savant.hermes-agent-lights.tab-title-sync", qos: .utility)
+    private let subprocessTimeout: TimeInterval = 2.0
+    private var terminalTTYOrderCache: (loadedAt: Date, ttys: [String])?
+    private var appliedTerminalTabTitleKeys: [Int: String] = [:]
+    private var pendingTerminalTabTitleSlots: Set<Int> = []
 
     override init() {
         let home = ProcessInfo.processInfo.environment["HERMES_HOME"]
@@ -32,6 +45,8 @@ private final class AgentLightsApp: NSObject, NSApplicationDelegate, NSMenuDeleg
             .appendingPathComponent("slots")
         self.agentsDirectory = agentLightsDirectory
             .appendingPathComponent("agents")
+        self.contextDirectory = agentLightsDirectory
+            .appendingPathComponent("context")
         super.init()
     }
 
@@ -91,15 +106,78 @@ private final class AgentLightsApp: NSObject, NSApplicationDelegate, NSMenuDeleg
         let legacyAgentStatuses = slotStatuses.filter(\.isKanbanWorker)
         let hermesStatuses = slotStatuses.filter { !$0.isKanbanWorker }
         let allAgentStatuses = agentStatuses + legacyAgentStatuses
+        // Keep normal Hermes lights stable by their Agent Lights slot letters (A-D).
+        // Terminal window/tab ordering is still used for click-to-focus association,
+        // but not for visual ordering; Terminal's AppleScript window order changes
+        // with focus and made the dots jump around.
+        let orderedHermesStatuses = hermesStatuses.sorted { $0.slot < $1.slot }
+        syncTerminalTabTitles(for: orderedHermesStatuses)
 
         let agentGroup = AgentRingGroup(statuses: allAgentStatuses)
-        statusItem.button?.image = DotRenderer.image(for: hermesStatuses, agentGroup: agentGroup)
+        statusItem.button?.image = DotRenderer.image(for: orderedHermesStatuses, agentGroup: agentGroup)
         removeAgentStatusItemIfPresent()
-        let menuModel = SlotStatusMenuModel(hermesStatuses: hermesStatuses, agentStatuses: allAgentStatuses)
+        let menuModel = SlotStatusMenuModel(hermesStatuses: orderedHermesStatuses, agentStatuses: allAgentStatuses)
         statusItem.button?.toolTip = menuModel.tooltip
         statusSummaryItem.title = menuModel.summaryTitle
-        replaceStatusRows(with: hermesStatuses + allAgentStatuses, rowTitles: menuModel.rowTitles)
-        monitorController?.update(hermesStatuses: hermesStatuses, agentGroup: agentGroup)
+        let slotContexts = loadSlotContexts(for: orderedHermesStatuses)
+        replaceStatusRows(with: orderedHermesStatuses + allAgentStatuses, rowTitles: menuModel.rowTitles, contexts: slotContexts)
+        monitorController?.update(hermesStatuses: orderedHermesStatuses, agentGroup: agentGroup)
+    }
+
+    private func orderHermesStatusesForTerminal(_ statuses: [SlotStatus]) -> [SlotStatus] {
+        let pids = statuses.compactMap(\.pid)
+        guard !pids.isEmpty else { return statuses.sorted { $0.slot < $1.slot } }
+        let terminalOrder = terminalTTYOrder()
+        guard !terminalOrder.isEmpty else { return statuses.sorted { $0.slot < $1.slot } }
+        let ttyByPid = Dictionary(uniqueKeysWithValues: pids.compactMap { pid in
+            ttyForProcess(pid: pid).map { (pid, $0) }
+        })
+        return SlotStatus.orderedByTerminalTTY(statuses, ttyForPid: ttyByPid, terminalTTYOrder: terminalOrder)
+    }
+
+    private func terminalTTYOrder() -> [String] {
+        let now = Date()
+        if let cache = terminalTTYOrderCache, now.timeIntervalSince(cache.loadedAt) < 2.0 {
+            return cache.ttys
+        }
+        let script = """
+        set output to ""
+        tell application "Terminal"
+            repeat with w in windows
+                repeat with t in tabs of w
+                    try
+                        set output to output & (tty of t) & linefeed
+                    end try
+                end repeat
+            end repeat
+        end tell
+        return output
+        """
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        process.arguments = ["-e", script]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = Pipe()
+        do {
+            try process.run()
+            process.waitUntilExit()
+        } catch {
+            terminalTTYOrderCache = (loadedAt: now, ttys: [])
+            return []
+        }
+        guard process.terminationStatus == 0 else {
+            terminalTTYOrderCache = (loadedAt: now, ttys: [])
+            return []
+        }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        let output = String(data: data, encoding: .utf8) ?? ""
+        let ttys = output
+            .split(whereSeparator: \.isNewline)
+            .map(String.init)
+            .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        terminalTTYOrderCache = (loadedAt: now, ttys: ttys)
+        return ttys
     }
 
     private func removeAgentStatusItemIfPresent() {
@@ -109,7 +187,7 @@ private final class AgentLightsApp: NSObject, NSApplicationDelegate, NSMenuDeleg
         }
     }
 
-    private func replaceStatusRows(with statuses: [SlotStatus], rowTitles: [String]) {
+    private func replaceStatusRows(with statuses: [SlotStatus], rowTitles: [String], contexts: [Int: SlotContext]) {
         for item in statusRowItems {
             statusMenu.removeItem(item)
         }
@@ -118,11 +196,45 @@ private final class AgentLightsApp: NSObject, NSApplicationDelegate, NSMenuDeleg
             item.target = self
             item.isEnabled = status.pid != nil || (status.isKanbanWorker && status.kanbanTaskId != nil)
             item.representedObject = StatusRowAction(status: status)
+            if !status.isKanbanWorker, let context = contexts[status.slot] {
+                item.submenu = contextMenu(for: status, context: context)
+            }
             return item
         }
         for (offset, item) in statusRowItems.enumerated() {
             statusMenu.insertItem(item, at: 1 + offset)
         }
+    }
+
+    private func contextMenu(for status: SlotStatus, context: SlotContext) -> NSMenu {
+        let menu = NSMenu()
+        for row in context.detailRows {
+            let item = NSMenuItem(title: row, action: nil, keyEquivalent: "")
+            item.isEnabled = false
+            menu.addItem(item)
+        }
+        menu.addItem(NSMenuItem.separator())
+        let focusItem = NSMenuItem(title: "Focus Tab", action: #selector(openStatusRow(_:)), keyEquivalent: "")
+        focusItem.target = self
+        focusItem.isEnabled = status.pid != nil
+        focusItem.representedObject = StatusRowAction(status: status)
+        menu.addItem(focusItem)
+        return menu
+    }
+
+    private func loadSlotContexts(for statuses: [SlotStatus]) -> [Int: SlotContext] {
+        var contexts: [Int: SlotContext] = [:]
+        for status in statuses {
+            let url = contextDirectory.appendingPathComponent("\(status.slot).json")
+            if let data = try? Data(contentsOf: url),
+               let context = try? SlotContext.decode(from: data),
+               context.slot == status.slot {
+                contexts[status.slot] = context
+            } else {
+                contexts[status.slot] = SlotContext.fallback(for: status)
+            }
+        }
+        return contexts
     }
 
 
@@ -149,15 +261,72 @@ private final class AgentLightsApp: NSObject, NSApplicationDelegate, NSMenuDeleg
         executeAppleScript(script)
     }
 
+    private func syncTerminalTabTitles(for statuses: [SlotStatus]) {
+        let requests = statuses.compactMap { status -> TerminalTabTitleSyncRequest? in
+            guard let pid = status.pid else { return nil }
+            let title = status.terminalTabTitle
+            let cacheKey = "\(pid):\(title)"
+            guard appliedTerminalTabTitleKeys[status.slot] != cacheKey,
+                  !pendingTerminalTabTitleSlots.contains(status.slot) else {
+                return nil
+            }
+            pendingTerminalTabTitleSlots.insert(status.slot)
+            return TerminalTabTitleSyncRequest(slot: status.slot, pid: pid, title: title, cacheKey: cacheKey)
+        }
+        guard !requests.isEmpty else { return }
+
+        let timeout = subprocessTimeout
+        tabTitleSyncQueue.async { [weak self] in
+            for request in requests {
+                let succeeded: Bool
+                if let tty = Self.ttyForProcess(pid: request.pid, timeout: timeout),
+                   let script = TerminalTabTitleScript.script(forTTY: tty, title: request.title) {
+                    succeeded = Self.executeAppleScriptReturnsBool(script, timeout: timeout)
+                } else {
+                    succeeded = false
+                }
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    self.pendingTerminalTabTitleSlots.remove(request.slot)
+                    if succeeded {
+                        self.appliedTerminalTabTitleKeys[request.slot] = request.cacheKey
+                    } else if self.appliedTerminalTabTitleKeys[request.slot] == request.cacheKey {
+                        self.appliedTerminalTabTitleKeys.removeValue(forKey: request.slot)
+                    }
+                }
+            }
+        }
+    }
+
     private func executeAppleScript(_ script: String) {
-        var error: NSDictionary?
-        let result = NSAppleScript(source: script)?.executeAndReturnError(&error)
-        if error != nil || result?.booleanValue != true {
+        if !Self.executeAppleScriptReturnsBool(script, timeout: subprocessTimeout) {
             NSSound.beep()
         }
     }
 
+    nonisolated private static func executeAppleScriptReturnsBool(_ script: String, timeout: TimeInterval) -> Bool {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        process.arguments = ["-e", script]
+        let output = Pipe()
+        process.standardOutput = output
+        process.standardError = Pipe()
+        do {
+            try process.run()
+        } catch {
+            return false
+        }
+        guard waitForProcess(process, timeout: timeout), process.terminationStatus == 0 else { return false }
+        let data = output.fileHandleForReading.readDataToEndOfFile()
+        let text = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return text == "true"
+    }
+
     private func ttyForProcess(pid: Int) -> String? {
+        Self.ttyForProcess(pid: pid, timeout: subprocessTimeout)
+    }
+
+    nonisolated private static func ttyForProcess(pid: Int, timeout: TimeInterval) -> String? {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/bin/ps")
         process.arguments = ["-o", "tty=", "-p", String(pid)]
@@ -166,15 +335,27 @@ private final class AgentLightsApp: NSObject, NSApplicationDelegate, NSMenuDeleg
         process.standardError = Pipe()
         do {
             try process.run()
-            process.waitUntilExit()
         } catch {
             return nil
         }
-        guard process.terminationStatus == 0 else { return nil }
+        guard waitForProcess(process, timeout: timeout), process.terminationStatus == 0 else { return nil }
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
         let tty = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let tty, !tty.isEmpty, tty != "??" else { return nil }
         return tty
+    }
+
+    nonisolated private static func waitForProcess(_ process: Process, timeout: TimeInterval) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while process.isRunning && Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.02)
+        }
+        if process.isRunning {
+            process.terminate()
+            process.waitUntilExit()
+            return false
+        }
+        return true
     }
 
     @objc private func refreshNow(_ sender: NSMenuItem) {
@@ -217,7 +398,8 @@ private final class AgentLightsApp: NSObject, NSApplicationDelegate, NSMenuDeleg
     @objc private func openStatusFolder(_ sender: NSMenuItem) {
         try? FileManager.default.createDirectory(at: slotsDirectory, withIntermediateDirectories: true)
         try? FileManager.default.createDirectory(at: agentsDirectory, withIntermediateDirectories: true)
-        NSWorkspace.shared.activateFileViewerSelecting([slotsDirectory, agentsDirectory])
+        try? FileManager.default.createDirectory(at: contextDirectory, withIntermediateDirectories: true)
+        NSWorkspace.shared.activateFileViewerSelecting([slotsDirectory, agentsDirectory, contextDirectory])
     }
 
     @objc private func quit(_ sender: NSMenuItem) {

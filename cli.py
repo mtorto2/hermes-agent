@@ -37,9 +37,7 @@ import tempfile
 import time
 import uuid
 import textwrap
-import subprocess
 from collections import deque
-from dataclasses import dataclass
 from urllib.parse import unquote, urlparse
 from contextlib import contextmanager
 from pathlib import Path
@@ -47,82 +45,6 @@ from datetime import datetime
 from typing import List, Dict, Any, Optional
 
 logger = logging.getLogger(__name__)
-
-INPUT_COMPACTOR_STATUS = "Compacting input draft..."
-
-
-@dataclass(frozen=True)
-class InputCompactionSource:
-    start: int
-    text: str
-
-
-@dataclass(frozen=True)
-class InputCompactionResult:
-    text: str
-    compacted_up_to: int
-    cursor_position: int
-
-
-def input_compaction_notice(text: str) -> str | None:
-    """Return a user-facing skip reason for non-empty text."""
-    if not text.strip():
-        return None
-    if text.lstrip().startswith("/"):
-        return "Input compactor skipped slash command."
-    return None
-
-
-def input_compaction_source(text: str, *, compacted_up_to: int = 0, whole_buffer: bool = False) -> InputCompactionSource | None:
-    """Choose the text slice to compact for Ctrl+T segment or Alt+T whole-buffer mode."""
-    if not text.strip() or input_compaction_notice(text):
-        return None
-    if whole_buffer:
-        return InputCompactionSource(start=0, text=text)
-    start = max(0, min(compacted_up_to, len(text)))
-    source = text[start:]
-    if not source.strip():
-        return None
-    return InputCompactionSource(start=start, text=source)
-
-
-def splice_input_compaction_result(original: str, *, start: int, compacted: str) -> InputCompactionResult:
-    """Splice a compacted segment back into the original buffer and mark it compacted."""
-    prefix = original[: max(0, min(start, len(original)))]
-    result = prefix + compacted.strip()
-    return InputCompactionResult(text=result, compacted_up_to=len(result), cursor_position=len(result))
-
-
-def input_compaction_result_is_stale(
-    original: str,
-    current: str,
-    *,
-    start_version: int,
-    current_version: int,
-) -> bool:
-    """Return true when the user touched the draft after async compaction started."""
-    return current != original or current_version != start_version
-
-
-def refresh_input_compaction_offset(text: str, *, compacted_prefix: str = "", compacted_up_to: int = 0) -> tuple[int, str]:
-    """Keep the segment offset only while the already-compacted prefix is unchanged."""
-    if not compacted_prefix or text.startswith(compacted_prefix):
-        next_up_to = min(compacted_up_to, len(text))
-        return next_up_to, text[:next_up_to]
-    return 0, ""
-
-
-def resolve_input_compactor_path(config: Dict[str, Any] | None = None) -> Path | None:
-    """Resolve the configured input compactor path without baking in a machine-specific default."""
-    raw = os.environ.get("HERMES_INPUT_COMPACTOR")
-    if not raw and isinstance(config, dict):
-        display = config.get("display")
-        if isinstance(display, dict):
-            raw = display.get("input_compactor_path")
-        raw = raw or config.get("input_compactor_path")
-    if not raw:
-        return None
-    return Path(str(raw)).expanduser()
 
 # Suppress startup messages for clean CLI experience
 os.environ["HERMES_QUIET"] = "1"  # Our own modules
@@ -152,15 +74,10 @@ except (ImportError, AttributeError):
     _STEADY_CURSOR = None
 
 try:
-    from hermes_cli.pt_input_extras import (
-        install_ctrl_enter_alias,
-        install_ignored_terminal_sequences,
-        install_shift_enter_alias,
-    )
+    from hermes_cli.pt_input_extras import install_shift_enter_alias, install_ctrl_enter_alias
     install_shift_enter_alias()
     install_ctrl_enter_alias()
-    install_ignored_terminal_sequences()
-    del install_shift_enter_alias, install_ctrl_enter_alias, install_ignored_terminal_sequences
+    del install_shift_enter_alias, install_ctrl_enter_alias
 except Exception:
     pass
 import threading
@@ -254,7 +171,7 @@ from hermes_cli.browser_connect import (
     try_launch_chrome_debug,
 )
 from hermes_cli.env_loader import load_hermes_dotenv
-from utils import base_url_host_matches
+from utils import base_url_host_matches, is_truthy_value
 
 _hermes_home = get_hermes_home()
 _project_env = Path(__file__).parent / '.env'
@@ -468,10 +385,6 @@ def load_cli_config() -> Dict[str, Any]:
             "inactivity_timeout": 120,  # Auto-cleanup inactive browser sessions after 2 min
             "record_sessions": False,  # Auto-record browser sessions as WebM videos
             "engine": "auto",  # Browser engine: auto (Chrome), lightpanda, chrome
-            "camofox": {
-                "rewrite_loopback_urls": False,
-                "loopback_host_alias": "host.docker.internal",
-            },
         },
         "compression": {
             "enabled": True,      # Auto-compress when approaching context limit
@@ -652,12 +565,13 @@ def load_cli_config() -> Dict[str, Any]:
         "singularity_image": "TERMINAL_SINGULARITY_IMAGE",
         "modal_image": "TERMINAL_MODAL_IMAGE",
         "daytona_image": "TERMINAL_DAYTONA_IMAGE",
+        "vercel_runtime": "TERMINAL_VERCEL_RUNTIME",
         # SSH config
         "ssh_host": "TERMINAL_SSH_HOST",
         "ssh_user": "TERMINAL_SSH_USER",
         "ssh_port": "TERMINAL_SSH_PORT",
         "ssh_key": "TERMINAL_SSH_KEY",
-        # Container resource config (docker, singularity, modal, daytona -- ignored for local/ssh)
+        # Container resource config (docker, singularity, modal, daytona, vercel_sandbox -- ignored for local/ssh)
         "container_cpu": "TERMINAL_CONTAINER_CPU",
         "container_memory": "TERMINAL_CONTAINER_MEMORY",
         "container_disk": "TERMINAL_CONTAINER_DISK",
@@ -666,8 +580,6 @@ def load_cli_config() -> Dict[str, Any]:
         "docker_env": "TERMINAL_DOCKER_ENV",
         "docker_mount_cwd_to_workspace": "TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE",
         "docker_run_as_host_user": "TERMINAL_DOCKER_RUN_AS_HOST_USER",
-        "docker_persist_across_processes": "TERMINAL_DOCKER_PERSIST_ACROSS_PROCESSES",
-        "docker_orphan_reaper": "TERMINAL_DOCKER_ORPHAN_REAPER",
         "sandbox_dir": "TERMINAL_SANDBOX_DIR",
         # Persistent shell (non-local backends)
         "persistent_shell": "TERMINAL_PERSISTENT_SHELL",
@@ -906,6 +818,8 @@ def _sync_process_session_id(session_id: str) -> None:
     from gateway.session_context import set_current_session_id
 
     set_current_session_id(session_id)
+    if session_id:
+        os.environ["HERMES_SESSION_ID"] = session_id
 
 # Cron job system for scheduled tasks (execution is handled by the gateway)
 def get_job(*args, **kwargs):
@@ -2567,9 +2481,8 @@ _TERMINAL_INPUT_MODE_RESET_SEQ = (
 def _preserve_ctrl_enter_newline() -> bool:
     """Detect environments where Ctrl+Enter must produce a newline, not submit.
 
-    Windows Terminal, WSL, SSH sessions, Ghostty, and some modern terminals
-    deliver Ctrl+Enter/Ctrl+J as bare LF (c-j). On those terminals c-j must
-    NOT be bound to submit;
+    Native Windows, WSL, SSH sessions, and Windows Terminal all send Ctrl+Enter
+    as bare LF (c-j). On those terminals c-j must NOT be bound to submit;
     binding it to submit makes Ctrl+Enter (intended as 'newline like Alt+Enter')
     submit instead. Local POSIX TTYs that deliver Enter as LF (docker exec,
     some thin PTYs without SSH) still need c-j bound to submit, so we keep
@@ -2582,12 +2495,6 @@ def _preserve_ctrl_enter_newline() -> bool:
     if any(os.environ.get(v) for v in ("SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY")):
         return True
     if os.environ.get("WT_SESSION"):
-        return True
-    if os.environ.get("GHOSTTY_RESOURCES_DIR") or os.environ.get("GHOSTTY_BIN_DIR"):
-        return True
-    if os.environ.get("TERM", "").lower() == "xterm-ghostty":
-        return True
-    if os.environ.get("TERM_PROGRAM", "").lower() == "ghostty":
         return True
     if "microsoft" in os.environ.get("WSL_DISTRO_NAME", "").lower():
         return True
@@ -2609,7 +2516,7 @@ def _bind_prompt_submit_keys(kb, handler) -> None:
     some thin PTYs (docker exec, certain SSH flavors) deliver Enter as LF
     instead of CR — without this, Enter appears dead on those terminals.
 
-    Exception: on Windows, WSL, SSH sessions, Windows Terminal, and Ghostty,
+    Exception: on Windows, WSL, SSH sessions, and Windows Terminal,
     c-j is the wire encoding of Ctrl+Enter (a distinct keystroke from
     plain Enter / c-m). We leave c-j unbound there so the c-j newline
     handler registered separately can fire — giving the user an
@@ -3337,11 +3244,6 @@ class HermesCLI:
         self._last_scrollback_tool: str = ""  # last tool name printed to scrollback (for "new" dedup)
         self._command_running = False
         self._command_status = ""
-        self._input_compactor_compacted_up_to = 0
-        self._input_compactor_compacted_prefix = ""
-        self._input_compactor_lock = threading.Lock()
-        self._input_compactor_running = False
-        self._input_compactor_edit_version = 0
         self._attached_images: list[Path] = []
         self._image_counter = 0
         self.preloaded_skills: list[str] = []
@@ -3851,7 +3753,7 @@ class HermesCLI:
             percent_label = f"{percent}%" if percent is not None else "--"
             duration_label = snapshot["duration"]
 
-            yolo_active = self._is_session_yolo_active()
+            yolo_active = bool(os.getenv("HERMES_YOLO_MODE"))
             if width < 52:
                 text = f"⚕ {snapshot['model_short']} · {duration_label}"
                 if yolo_active:
@@ -3912,7 +3814,7 @@ class HermesCLI:
             # line and produce duplicated status bar rows over long sessions.
             width = self._get_tui_terminal_width()
             duration_label = snapshot["duration"]
-            yolo_active = self._is_session_yolo_active()
+            yolo_active = bool(os.getenv("HERMES_YOLO_MODE"))
 
             if width < 52:
                 frags = [
@@ -7011,7 +6913,6 @@ class HermesCLI:
             pass
 
         # Switch to the new session
-        self._transfer_session_yolo(self.session_id, new_session_id)
         self.session_id = new_session_id
         self.session_start = now
         self._pending_title = None
@@ -7259,13 +7160,11 @@ class HermesCLI:
 
         * ``sys.platform == "win32"`` — native Windows console (ConPTY /
           win32_input) does not support the modal reliably.
+        * Called from a non-main thread — the prompt_toolkit event loop only
+          runs on the main thread; key bindings can't fire from a daemon
+          thread (same rationale as the ``_prompt_text_input`` thread guard
+          in PR #23454).
         * ``self._app`` is not set — unit tests / non-interactive contexts.
-
-        On non-Windows platforms the modal itself is still safe from the
-        ``process_loop`` daemon thread as long as the main-thread event loop
-        owns the prompt_toolkit buffer mutations.  When we are off the main
-        thread, schedule the modal snapshot / restore work on ``self._app.loop``
-        via ``call_soon_threadsafe`` and keep the queue-based response path.
         """
         import threading
         import time as _time
@@ -7286,62 +7185,33 @@ class HermesCLI:
         if sys.platform == "win32":
             return self._prompt_text_input("Choice [1/2/3]: ")
 
-        try:
-            app_loop = self._app.loop
-        except Exception:
-            app_loop = None
-
-        in_main_thread = threading.current_thread() is threading.main_thread()
-        if not in_main_thread and app_loop is None:
+        # Mirror the thread-aware guard from _prompt_text_input (PR #23454):
+        # run_in_terminal and the modal queue both depend on the main-thread
+        # event loop.  From a daemon thread the modal key bindings never fire.
+        if threading.current_thread() is not threading.main_thread():
             return self._prompt_text_input("Choice [1/2/3]: ")
 
         response_queue = queue.Queue()
-
-        def _setup_modal() -> None:
-            self._capture_modal_input_snapshot()
-            self._slash_confirm_state = {
-                "title": title,
-                "detail": detail,
-                "choices": choices,
-                "selected": 0,
-                "response_queue": response_queue,
-            }
-            self._slash_confirm_deadline = _time.monotonic() + timeout
-            self._invalidate()
-
-        def _teardown_modal() -> None:
-            self._slash_confirm_state = None
-            self._slash_confirm_deadline = 0
-            self._restore_modal_input_snapshot()
-            self._invalidate()
-
-        def _run_on_app_loop(fn) -> bool:
-            if in_main_thread or app_loop is None:
-                fn()
-                return True
-            ready = threading.Event()
-
-            def _wrapped() -> None:
-                try:
-                    fn()
-                finally:
-                    ready.set()
-
-            try:
-                app_loop.call_soon_threadsafe(_wrapped)
-            except Exception:
-                return False
-            return ready.wait(timeout=5)
-
-        if not _run_on_app_loop(_setup_modal):
-            return self._prompt_text_input("Choice [1/2/3]: ")
+        self._capture_modal_input_snapshot()
+        self._slash_confirm_state = {
+            "title": title,
+            "detail": detail,
+            "choices": choices,
+            "selected": 0,
+            "response_queue": response_queue,
+        }
+        self._slash_confirm_deadline = _time.monotonic() + timeout
+        self._invalidate()
 
         _last_countdown_refresh = _time.monotonic()
         try:
             while True:
                 try:
                     result = response_queue.get(timeout=1)
-                    _run_on_app_loop(_teardown_modal)
+                    self._slash_confirm_state = None
+                    self._slash_confirm_deadline = 0
+                    self._restore_modal_input_snapshot()
+                    self._invalidate()
                     return result
                 except queue.Empty:
                     remaining = self._slash_confirm_deadline - _time.monotonic()
@@ -7353,7 +7223,10 @@ class HermesCLI:
                         self._invalidate()
         finally:
             if self._slash_confirm_state is not None:
-                _run_on_app_loop(_teardown_modal)
+                self._slash_confirm_state = None
+                self._slash_confirm_deadline = 0
+                self._restore_modal_input_snapshot()
+                self._invalidate()
         return None
 
     def _submit_slash_confirm_response(self, value: str | None) -> None:
@@ -7691,19 +7564,8 @@ class HermesCLI:
         parts = cmd_original.split(None, 1)  # split off '/model'
         raw_args = parts[1].strip() if len(parts) > 1 else ""
 
-        # Parse --provider, --global, and --refresh flags
-        model_input, explicit_provider, persist_global, force_refresh = parse_model_flags(raw_args)
-
-        # --refresh: wipe the on-disk picker cache before building the
-        # provider list. Forces a live re-fetch of every authed provider's
-        # /v1/models endpoint on this open.
-        if force_refresh:
-            try:
-                from hermes_cli.models import clear_provider_models_cache
-                clear_provider_models_cache()
-                _cprint("  Cleared model picker cache. Refreshing...")
-            except Exception:
-                pass
+        # Parse --provider and --global flags
+        model_input, explicit_provider, persist_global = parse_model_flags(raw_args)
 
         # Single inventory context — replaces the inline config-slice the
         # dashboard / TUI used to duplicate. Overlay live session state
@@ -7742,7 +7604,6 @@ class HermesCLI:
                 _cprint("")
                 _cprint("  /model <name>                        switch model")
                 _cprint("  /model --provider <slug>             switch provider")
-                _cprint("  /model --refresh                     re-fetch live model lists")
                 return
 
             self._open_model_picker(
@@ -9818,92 +9679,20 @@ class HermesCLI:
         }
         _cprint(labels.get(self.tool_progress_mode, ""))
 
-    def _transfer_session_yolo(self, old_session_id: str, new_session_id: str) -> None:
-        """Move YOLO bypass state from an old session key to a new one.
-
-        Called whenever ``self.session_id`` is reassigned mid-run — ``/branch``
-        forks into a new session, and auto-compression rotates the agent's
-        session id into a fresh continuation session. Without this transfer
-        the user's ``/yolo ON`` toggle would silently revert on the very next
-        turn (the same UX failure mode that motivated this entire fix), since
-        ``_session_yolo`` is keyed by session id.
-
-        Mirrors ``tui_gateway/server.py`` (~line 1297-1305) which performs the
-        same transfer for the TUI's session-rename path. No-op when YOLO
-        wasn't enabled or when the ids match.
-        """
-        if not old_session_id or not new_session_id or old_session_id == new_session_id:
-            return
-        try:
-            from tools.approval import (
-                disable_session_yolo,
-                enable_session_yolo,
-                is_session_yolo_enabled,
-            )
-        except Exception:
-            return
-        if is_session_yolo_enabled(old_session_id):
-            enable_session_yolo(new_session_id)
-            disable_session_yolo(old_session_id)
-
-    def _is_session_yolo_active(self) -> bool:
-        """Whether YOLO bypass is currently enabled for this CLI session.
-
-        Reads from ``tools.approval._session_yolo`` (the same set that
-        ``enable_session_yolo`` / ``disable_session_yolo`` write to) so the
-        status bar reflects the actual bypass state instead of a stale env
-        var. Also honors the process-start ``--yolo`` flag, which freezes
-        ``HERMES_YOLO_MODE`` into ``_YOLO_MODE_FROZEN`` before tool imports
-        happen.
-        """
-        try:
-            from tools.approval import (
-                _YOLO_MODE_FROZEN,
-                is_session_yolo_enabled,
-            )
-        except Exception:
-            return False
-        if _YOLO_MODE_FROZEN:
-            return True
-        # Use ``getattr`` so test fixtures that build a CLI via ``__new__``
-        # (skipping ``__init__``) don't trip an AttributeError here; the
-        # status-bar builders swallow exceptions silently but lose every
-        # field after the failure.
-        session_key = getattr(self, "session_id", None) or "default"
-        return is_session_yolo_enabled(session_key)
-
     def _toggle_yolo(self):
-        """Toggle YOLO mode — skip all dangerous command approval prompts.
-
-        Per-session toggle that mirrors the gateway and TUI ``/yolo`` handlers
-        (see ``gateway/run.py:_handle_yolo_command`` and
-        ``tui_gateway/server.py`` key=="yolo"). We deliberately do NOT mutate
-        ``HERMES_YOLO_MODE`` here — that env var is read once at module import
-        time into ``tools.approval._YOLO_MODE_FROZEN`` to keep prompt-injected
-        skills from flipping the bypass mid-session, so setting it after CLI
-        startup is a silent no-op. Routing through ``enable_session_yolo`` /
-        ``disable_session_yolo`` gives the same auditable, per-session bypass
-        the other surfaces have. ``run_conversation`` binds
-        ``self.session_id`` as the active approval session key via
-        ``set_current_session_key`` so the bypass takes effect on the very
-        next dangerous command in this run.
-        """
+        """Toggle YOLO mode — skip all dangerous command approval prompts."""
+        import os
         from hermes_cli.colors import Colors as _Colors
-        from tools.approval import (
-            disable_session_yolo,
-            enable_session_yolo,
-            is_session_yolo_enabled,
-        )
 
-        session_key = self.session_id or "default"
-        if is_session_yolo_enabled(session_key):
-            disable_session_yolo(session_key)
+        current = is_truthy_value(os.environ.get("HERMES_YOLO_MODE"))
+        if current:
+            os.environ.pop("HERMES_YOLO_MODE", None)
             _cprint(
                 f"  ⚠ YOLO mode {_Colors.BOLD}{_Colors.RED}OFF{_Colors.RESET}"
                 " — dangerous commands will require approval."
             )
         else:
-            enable_session_yolo(session_key)
+            os.environ["HERMES_YOLO_MODE"] = "1"
             _cprint(
                 f"  ⚡ YOLO mode {_Colors.BOLD}{_Colors.GREEN}ON{_Colors.RESET}"
                 " — all commands auto-approved. Use with caution."
@@ -10950,8 +10739,7 @@ class HermesCLI:
         if not reqs.get("stt_available", reqs.get("stt_key_set")):
             raise RuntimeError(
                 "Voice mode requires an STT provider for transcription.\n"
-                "Option 1: uv pip install faster-whisper  "
-                "(free, local; `pip install faster-whisper` also works if pip is on PATH)\n"
+                "Option 1: pip install faster-whisper  (free, local)\n"
                 "Option 2: Set GROQ_API_KEY (free tier)\n"
                 "Option 3: Set VOICE_TOOLS_OPENAI_KEY (paid)"
             )
@@ -11827,6 +11615,31 @@ class HermesCLI:
         except Exception:
             logger.debug("Terminal light cue emission failed", exc_info=True)
 
+    def _update_agent_lights_context(self, *, current_context: Optional[str] = None, chat_summary: Optional[str] = None) -> None:
+        """Best-effort per-slot context sidecar update for the Agent Lights menu."""
+        try:
+            service = self._get_light_cue_service()
+            service.update_slot_context(
+                session_id=getattr(self, "session_id", None),
+                current_context=self._agent_lights_compact_text(current_context),
+                chat_summary=self._agent_lights_compact_text(chat_summary),
+                provider=getattr(self, "provider", None),
+                model_name=getattr(self, "model", None),
+            )
+        except Exception:
+            logger.debug("Agent Lights context update failed", exc_info=True)
+
+    @staticmethod
+    def _agent_lights_compact_text(value: Any, *, limit: int = 220) -> Optional[str]:
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            value = str(value)
+        text = " ".join(value.strip().split())
+        if not text:
+            return None
+        return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
     def chat(self, message, images: list = None) -> Optional[str]:
         """
         Send a message to the agent and get a response.
@@ -11971,6 +11784,11 @@ class HermesCLI:
             # Run the conversation with interrupt monitoring
             result = None
             self._emit_light_cue(LightCueEvent.WORKING)
+            self._update_agent_lights_context(
+                current_context=f"Working on: {message}" if isinstance(message, str) else "Working on multimodal input",
+                chat_summary="Turn in progress",
+            )
+            last_context_refresh_at = time.time()
 
             # Reset streaming display state for this turn
             self._reset_stream_state()
@@ -12062,23 +11880,6 @@ class HermesCLI:
                     set_secret_capture_callback(self._secret_capture_callback)
                 except Exception:
                     pass
-                # Bind this turn's approval session key into the contextvar so
-                # ``tools.approval.is_current_session_yolo_enabled()`` resolves
-                # against the same key that ``/yolo`` toggles under (see
-                # ``_toggle_yolo`` → ``enable_session_yolo(self.session_id)``).
-                # Mirrors ``tui_gateway/server.py`` and ``gateway/run.py`` which
-                # bind the same contextvar before invoking the agent.
-                try:
-                    from tools.approval import (
-                        reset_current_session_key,
-                        set_current_session_key,
-                    )
-                    _approval_session_token = set_current_session_key(
-                        self.session_id or "default"
-                    )
-                except Exception:
-                    reset_current_session_key = None  # type: ignore[assignment]
-                    _approval_session_token = None
                 agent_message = _voice_prefix + message if _voice_prefix else message
                 # Prepend pending model switch note so the model knows about the switch
                 _msn = getattr(self, '_pending_model_switch_note', None)
@@ -12120,15 +11921,6 @@ class HermesCLI:
                         set_secret_capture_callback(None)
                     except Exception:
                         pass
-                    # Release the per-turn approval session key. ``_session_yolo``
-                    # state itself is preserved across turns (so /yolo persists
-                    # for the whole CLI run); we just unbind the contextvar so a
-                    # reused thread doesn't see stale identity on its next run.
-                    if _approval_session_token is not None and reset_current_session_key is not None:
-                        try:
-                            reset_current_session_key(_approval_session_token)
-                        except Exception:
-                            pass
 
             # Start agent in background thread (daemon so it cannot keep the
             # process alive when the user closes the terminal tab — SIGHUP
@@ -12148,6 +11940,13 @@ class HermesCLI:
             # so we skip interrupt processing to avoid stealing that input.
             interrupt_msg = None
             while agent_thread.is_alive():
+                now = time.time()
+                if now - last_context_refresh_at >= 300:
+                    self._update_agent_lights_context(
+                        current_context=f"Still working on: {message}" if isinstance(message, str) else "Still working on multimodal input",
+                        chat_summary="Turn still in progress",
+                    )
+                    last_context_refresh_at = now
                 if hasattr(self, '_interrupt_queue'):
                     try:
                         interrupt_msg = self._interrupt_queue.get(timeout=0.1)
@@ -12259,12 +12058,16 @@ class HermesCLI:
                 and getattr(self.agent, "session_id", None)
                 and self.agent.session_id != self.session_id
             ):
-                self._transfer_session_yolo(self.session_id, self.agent.session_id)
                 self.session_id = self.agent.session_id
                 self._pending_title = None
 
             # Get the final response
             response = result.get("final_response", "") if result else ""
+            if response:
+                self._update_agent_lights_context(
+                    current_context=f"Latest ask: {message}" if isinstance(message, str) else "Latest ask included multimodal input",
+                    chat_summary=f"Latest answer: {response}",
+                )
 
             # Auto-generate session title after first exchange (non-blocking)
             if response and result and not result.get("failed") and not result.get("partial"):
@@ -12603,8 +12406,6 @@ class HermesCLI:
             return _state_fragment("class:prompt-working", "?")
         if self._command_running:
             return _state_fragment("class:prompt-working", self._command_spinner_frame())
-        if self._input_compactor_running:
-            return _state_fragment("class:prompt-working", self._command_spinner_frame())
         if self._agent_running:
             return _state_fragment("class:prompt-working", "⚕")
         if self._voice_mode:
@@ -12933,23 +12734,9 @@ class HermesCLI:
 
         if os.environ.get("HERMES_DEFER_AGENT_STARTUP") != "1":
             self._ensure_tirith_security()
-        
+
         # Key bindings for the input area
         kb = KeyBindings()
-
-        from prompt_toolkit.keys import Keys as _IgnoreKeys
-
-        @kb.add(_IgnoreKeys.Ignore, eager=True)
-        def handle_ignored_terminal_sequence(event):
-            """Consume parser-level ignored terminal sequences before self-insert.
-
-            install_ignored_terminal_sequences() in hermes_cli.pt_input_extras
-            registers focus reports (CSI I / CSI O) as Keys.Ignore at the
-            VT100 parser level. Without this no-op binding the default
-            self-insert path would still fire and the bytes would land in
-            the buffer.
-            """
-            return None
 
         def handle_enter(event):
             """Handle Enter key - submit input.
@@ -12964,10 +12751,6 @@ class HermesCLI:
             Commands (starting with /) always go to _pending_input so they're
             handled as commands, not sent as interrupt text to the agent.
             """
-            def _reset_input_compactor_state() -> None:
-                self._input_compactor_compacted_up_to = 0
-                self._input_compactor_compacted_prefix = ""
-
             # --- Sudo password prompt: submit the typed password ---
             if self._sudo_state:
                 text = event.app.current_buffer.text
@@ -13052,7 +12835,6 @@ class HermesCLI:
                         self._should_exit = True
                         if event.app.is_running:
                             event.app.exit()
-                    _reset_input_compactor_state()
                     event.app.current_buffer.reset(append_to_history=True)
                     return
 
@@ -13061,7 +12843,6 @@ class HermesCLI:
                 # pending prompt it is trying to remove.
                 if self._should_handle_queue_delete_command_inline(text, has_images=has_images):
                     self.process_command(text)
-                    _reset_input_compactor_state()
                     event.app.current_buffer.reset(append_to_history=True)
                     return
 
@@ -13073,7 +12854,6 @@ class HermesCLI:
                 # agent.steer() is thread-safe (holds _pending_steer_lock).
                 if self._should_handle_steer_command_inline(text, has_images=has_images):
                     self.process_command(text)
-                    _reset_input_compactor_state()
                     event.app.current_buffer.reset(append_to_history=True)
                     return
 
@@ -13141,7 +12921,6 @@ class HermesCLI:
                         pass
                 else:
                     self._pending_input.put(payload)
-                _reset_input_compactor_state()
                 event.app.current_buffer.reset(append_to_history=True)
 
         _bind_prompt_submit_keys(kb, handle_enter)
@@ -13186,129 +12965,6 @@ class HermesCLI:
         def handle_open_in_editor(event):
             """Ctrl+G (or Alt+G in VSCode/Cursor) opens the current draft in an external editor."""
             cli_ref._open_external_editor(event.current_buffer)
-
-        def _compact_current_buffer(event, *, whole_buffer: bool = False):
-            """Compact the current input draft natively, preserving review before submit."""
-            buf = event.current_buffer
-            original = buf.text
-            notice = input_compaction_notice(original)
-            if notice:
-                _cprint(f"\n{_DIM}{notice}{_RST}")
-                return
-
-            compactor_lock = cli_ref._input_compactor_lock
-            if not compactor_lock.acquire(blocking=False):
-                return
-
-            offset, compacted_prefix = refresh_input_compaction_offset(
-                original,
-                compacted_prefix=cli_ref._input_compactor_compacted_prefix,
-                compacted_up_to=cli_ref._input_compactor_compacted_up_to,
-            )
-            cli_ref._input_compactor_compacted_up_to = offset
-            cli_ref._input_compactor_compacted_prefix = compacted_prefix
-            source = input_compaction_source(original, compacted_up_to=offset, whole_buffer=whole_buffer)
-            if source is None:
-                compactor_lock.release()
-                return
-
-            compactor = resolve_input_compactor_path(getattr(cli_ref, "config", None))
-            if compactor is None:
-                compactor_lock.release()
-                _cprint(f"\n{_DIM}Set HERMES_INPUT_COMPACTOR or input_compactor_path to enable input compaction.{_RST}")
-                return
-            if not compactor.exists():
-                compactor_lock.release()
-                _cprint(f"\n{_DIM}Input compactor not found: {compactor}{_RST}")
-                return
-
-            cursor = buf.cursor_position
-            start_version = cli_ref._input_compactor_edit_version
-            app = event.app
-
-            def _call_on_ui(callback):
-                loop = getattr(app, "loop", None)
-                if loop is not None and getattr(loop, "is_running", lambda: False)():
-                    loop.call_soon_threadsafe(callback)
-                    return True
-                return False
-
-            previous_status = getattr(cli_ref, "_command_status", "")
-            cli_ref._input_compactor_running = True
-            cli_ref._command_status = INPUT_COMPACTOR_STATUS
-            app.invalidate()
-
-            def _run_compactor():
-                try:
-                    proc = subprocess.run(
-                        [str(compactor), "--stdin"],
-                        input=source.text,
-                        text=True,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE,
-                        timeout=90,
-                        check=False,
-                    )
-                    if proc.returncode != 0:
-                        err = (proc.stderr or proc.stdout or "compactor failed").strip().splitlines()
-                        message = err[-1] if err else "compactor failed"
-                        raise RuntimeError(message[:300])
-                    compacted = proc.stdout.strip()
-                    if not compacted:
-                        raise RuntimeError("compactor returned empty output")
-
-                    def _apply_result():
-                        # Do not clobber if the user kept typing while the compactor ran.
-                        if input_compaction_result_is_stale(
-                            original,
-                            buf.text,
-                            start_version=start_version,
-                            current_version=cli_ref._input_compactor_edit_version,
-                        ):
-                            _cprint(f"\n{_DIM}Compactor finished, but draft changed; leaving current input untouched.{_RST}")
-                            return
-                        result = splice_input_compaction_result(original, start=source.start, compacted=compacted)
-                        buf.text = result.text
-                        buf.cursor_position = result.cursor_position
-                        cli_ref._input_compactor_compacted_up_to = result.compacted_up_to
-                        cli_ref._input_compactor_compacted_prefix = result.text[: result.compacted_up_to]
-
-                    _call_on_ui(_apply_result)
-                except Exception as exc:
-                    error_message = str(exc)
-
-                    def _show_error():
-                        _cprint(f"\n{_DIM}Input compactor failed: {error_message}{_RST}")
-                        if buf.text == original:
-                            buf.cursor_position = min(cursor, len(buf.text))
-
-                    _call_on_ui(_show_error)
-                finally:
-                    def _finish():
-                        if getattr(cli_ref, "_command_status", "") == INPUT_COMPACTOR_STATUS:
-                            cli_ref._command_status = previous_status
-                        cli_ref._input_compactor_running = False
-                        compactor_lock.release()
-                        app.invalidate()
-
-                    if not _call_on_ui(_finish):
-                        cli_ref._input_compactor_running = False
-                        if getattr(cli_ref, "_command_status", "") == INPUT_COMPACTOR_STATUS:
-                            cli_ref._command_status = previous_status
-                        compactor_lock.release()
-
-            threading.Thread(target=_run_compactor, daemon=True).start()
-
-        @kb.add('c-t', filter=_editor_filter, eager=True)
-        def handle_compact_latest_input_segment(event):
-            """Ctrl+T compacts only the latest uncompacted input segment."""
-            _compact_current_buffer(event, whole_buffer=False)
-
-        @kb.add('escape', 't', filter=_editor_filter)
-        @kb.add('escape', 'T', filter=_editor_filter)
-        def handle_compact_whole_input_buffer(event):
-            """Alt+T compacts the whole current draft buffer."""
-            _compact_current_buffer(event, whole_buffer=True)
 
         @kb.add('tab', eager=True)
         def handle_tab(event):
@@ -13974,11 +13630,6 @@ class HermesCLI:
         # EEXIST. The suffix keeps markdown highlighting without that bug.
         input_area.buffer.tempfile_suffix = '.md'
 
-        def _note_input_compactor_edit(_buffer) -> None:
-            cli_ref._input_compactor_edit_version += 1
-
-        input_area.buffer.on_text_changed += _note_input_compactor_edit
-
         # Dynamic height: accounts for both explicit newlines AND visual
         # wrapping of long lines so the input area always fits its content.
         def _input_height():
@@ -14114,7 +13765,7 @@ class HermesCLI:
                 return "type your answer here and press Enter"
             if cli_ref._clarify_state:
                 return ""
-            if cli_ref._command_running or cli_ref._input_compactor_running:
+            if cli_ref._command_running:
                 frame = cli_ref._command_spinner_frame()
                 status = cli_ref._command_status or "Processing command..."
                 return f"{frame} {status}"
@@ -14177,14 +13828,11 @@ class HermesCLI:
                 return [
                     ('class:hint', f'  {frame} command in progress · input temporarily disabled'),
                 ]
-            if cli_ref._input_compactor_running:
-                frame = cli_ref._command_spinner_frame()
-                return [('class:hint', f'  {frame} {INPUT_COMPACTOR_STATUS}')]
 
             return []
 
         def get_hint_height():
-            if cli_ref._sudo_state or cli_ref._secret_state or cli_ref._approval_state or cli_ref._slash_confirm_state or cli_ref._clarify_state or cli_ref._command_running or cli_ref._input_compactor_running:
+            if cli_ref._sudo_state or cli_ref._secret_state or cli_ref._approval_state or cli_ref._slash_confirm_state or cli_ref._clarify_state or cli_ref._command_running:
                 return 1
             # Keep a spacer while the agent runs on roomy terminals, but reclaim
             # the row on narrow/mobile screens where every line matters.
@@ -15473,39 +15121,6 @@ def main(
                     time.sleep(_grace)
         except Exception:
             pass  # never block signal handling
-        # Kanban worker exit path (#28181): SIGTERM hits a dispatcher-spawned
-        # worker that's likely in a non-daemon thread waiting on a child
-        # subprocess in _wait_for_process. Raising KeyboardInterrupt only
-        # unwinds the main thread; the worker thread keeps running, the
-        # process gets reparented to init, and the dispatcher's _pid_alive
-        # check returns True forever — task stuck in 'running' indefinitely.
-        # Skip the controlled-unwind dance and call os._exit(0) so the kernel
-        # reclaims the PID immediately and detect_crashed_workers can reclaim
-        # the stale claim on the next tick. Flush logging + stdout/stderr
-        # first so the final debug trace isn't lost; SIGALRM deadman guards
-        # the flush against any rare blocking-I/O case (the reporter measured
-        # flush in <1ms; the alarm is a failsafe, not the common path).
-        if os.environ.get("HERMES_KANBAN_TASK"):
-            try:
-                import signal as _sig_mod
-                if hasattr(_sig_mod, "SIGALRM"):
-                    # Cancel any pre-existing alarm to avoid colliding with
-                    # caller-installed timers.
-                    _sig_mod.signal(_sig_mod.SIGALRM, lambda *_: os._exit(0))
-                    _sig_mod.alarm(2)
-            except Exception:
-                pass
-            try:
-                import logging as _lg
-                _lg.shutdown()
-            except Exception:
-                pass
-            for _stream in (sys.stdout, sys.stderr):
-                try:
-                    _stream.flush()
-                except Exception:
-                    pass
-            os._exit(0)
         raise KeyboardInterrupt()
     try:
         import signal as _signal
@@ -15518,50 +15133,13 @@ def main(
     # Handle single query mode
     if query or image:
         query, single_query_images = _collect_query_images(query, image)
-        # Kanban workers spawn with ``hermes chat -q "work kanban task <id>"``;
-        # the actual task description lives in the task body. Mirror the
-        # gateway/CLI behaviour for inbound images by scanning the body for
-        # local image paths and http(s) image URLs and attaching them to the
-        # worker's first turn. Without this, users who paste a screenshot
-        # path or URL into a kanban task body never get it routed to the
-        # model's vision input.
-        single_query_image_urls: list[str] = []
-        _kanban_task_id = os.environ.get("HERMES_KANBAN_TASK", "").strip()
-        if _kanban_task_id:
-            try:
-                from hermes_cli import kanban_db as _kb
-                from agent.image_routing import extract_image_refs as _extract_refs
-
-                _conn = _kb.connect()
-                try:
-                    _task = _kb.get_task(_conn, _kanban_task_id)
-                finally:
-                    try:
-                        _conn.close()
-                    except Exception:
-                        pass
-                _body = getattr(_task, "body", "") if _task is not None else ""
-                if _body:
-                    _kb_paths, _kb_urls = _extract_refs(_body)
-                    if _kb_paths:
-                        # Dedupe against any --image the user already passed.
-                        _seen = {str(p) for p in single_query_images}
-                        for _p in _kb_paths:
-                            if _p not in _seen:
-                                _seen.add(_p)
-                                single_query_images.append(Path(_p))
-                    if _kb_urls:
-                        single_query_image_urls.extend(_kb_urls)
-            except Exception as _exc:
-                # Best-effort enrichment; never block worker startup on it.
-                logger.debug("kanban image-ref extraction failed: %s", _exc)
         if quiet:
             # Quiet mode: suppress banner, spinner, tool previews.
             # Only print the final response and parseable session info.
             cli.tool_progress_mode = "off"
             if cli._ensure_runtime_credentials():
                 effective_query: Any = query
-                if single_query_images or single_query_image_urls:
+                if single_query_images:
                     # Honour the same image-routing decision used by the
                     # interactive path. With a vision-capable model (incl.
                     # custom-provider models declared via
@@ -15590,26 +15168,19 @@ def main(
                             _parts, _skipped = _build_parts(
                                 query if isinstance(query, str) else "",
                                 [str(p) for p in single_query_images],
-                                image_urls=list(single_query_image_urls) or None,
                             )
                             if any(p.get("type") == "image_url" for p in _parts):
                                 effective_query = _parts
                             else:
                                 # All images unreadable — text fallback.
-                                # ``_preprocess_images_with_vision`` only knows
-                                # about local files; URLs would be lost there,
-                                # so keep the original query text intact when
-                                # only URLs were supplied.
-                                if single_query_images:
-                                    effective_query = cli._preprocess_images_with_vision(
-                                        query, single_query_images, announce=False,
-                                    )
-                        except Exception:
-                            if single_query_images:
                                 effective_query = cli._preprocess_images_with_vision(
                                     query, single_query_images, announce=False,
                                 )
-                    elif single_query_images:
+                        except Exception:
+                            effective_query = cli._preprocess_images_with_vision(
+                                query, single_query_images, announce=False,
+                            )
+                    else:
                         effective_query = cli._preprocess_images_with_vision(
                             query,
                             single_query_images,

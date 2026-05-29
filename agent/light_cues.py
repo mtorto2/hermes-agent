@@ -11,7 +11,7 @@ import logging
 import os
 from pathlib import Path
 import subprocess
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 from agent.wiz_light import WiZLightCueBackend, WiZLightCueConfig
 
@@ -94,6 +94,7 @@ class AgentLightsMenuBarLauncher:
     executable_name = "AgentLightsMenuBar"
     bundle_relative_path = Path("apps/agent-lights-menu-bar/.build/AgentLightsMenuBar.app")
     binary_relative_path = Path("apps/agent-lights-menu-bar/.build/debug/AgentLightsMenuBar")
+    arch_binary_relative_glob = "apps/agent-lights-menu-bar/.build/*/debug/AgentLightsMenuBar"
 
     def __init__(self, *, repo_root: Path | None = None):
         self.repo_root = repo_root or Path(__file__).resolve().parents[1]
@@ -119,6 +120,26 @@ class AgentLightsMenuBarLauncher:
             return False
         return completed.returncode == 0
 
+    def _candidate_binary_paths(self) -> list[Path]:
+        candidates = [self.repo_root / self.binary_relative_path]
+        candidates.extend(self.repo_root.glob(self.arch_binary_relative_glob))
+        unique: dict[Path, Path] = {}
+        for candidate in candidates:
+            if candidate.exists() and candidate.is_file():
+                unique[candidate.resolve()] = candidate
+        return sorted(
+            unique.values(),
+            key=lambda path: (
+                path.stat().st_mtime,
+                1 if "-apple-macosx" in str(path) else 0,
+            ),
+            reverse=True,
+        )
+
+    def _built_binary_path(self) -> Path | None:
+        candidates = self._candidate_binary_paths()
+        return candidates[0] if candidates else None
+
     def _is_running(self) -> bool:
         try:
             completed = subprocess.run(
@@ -135,8 +156,8 @@ class AgentLightsMenuBarLauncher:
     def _ensure_app_bundle(self) -> Path | None:
         app_path = self.repo_root / self.bundle_relative_path
         executable_path = app_path / "Contents" / "MacOS" / self.executable_name
-        binary_path = self.repo_root / self.binary_relative_path
-        if not binary_path.exists():
+        binary_path = self._built_binary_path()
+        if binary_path is None:
             return app_path if executable_path.exists() else None
 
         try:
@@ -281,6 +302,9 @@ class SlotStatusFileBackend:
         profile = cls._first_nonempty(os.environ.get("HERMES_PROFILE"))
         if profile:
             payload["profile"] = profile
+        session_id = cls._first_nonempty(os.environ.get("HERMES_SESSION_ID"))
+        if session_id:
+            payload["session_id"] = session_id
         if os.environ.get("HERMES_KANBAN_TASK"):
             payload["source"] = "kanban_worker"
             payload["kanban_task_id"] = os.environ.get("HERMES_KANBAN_TASK")
@@ -401,10 +425,56 @@ class SlotStatusFileBackend:
         tmp.replace(path)
         return True
 
+    def emit_context(
+        self,
+        *,
+        session_id: str | None = None,
+        current_context: str | None = None,
+        chat_summary: str | None = None,
+        tab_name: str | None = None,
+        provider: str | None = None,
+        model_name: str | None = None,
+    ) -> bool:
+        """Write the per-slot menu context sidecar consumed by Agent Lights."""
+        if os.environ.get("HERMES_KANBAN_TASK"):
+            return False
+        path = self._directory.parent / "context" / f"{self.slot}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        process_payload = self._process_payload(model_name or self.model_name)
+        payload: dict[str, Any] = {
+            "slot": self.slot,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "pid": os.getpid(),
+            "process_started_at": self._process_started_at(os.getpid()),
+            "source": "hermes",
+        }
+        for key in ("profile", "session_id", "model_name"):
+            if process_payload.get(key):
+                payload[key] = process_payload[key]
+        for key, value in {
+            "session_id": session_id,
+            "current_context": current_context,
+            "chat_summary": chat_summary,
+            "tab_name": tab_name,
+            "provider": provider,
+            "model_name": model_name,
+        }.items():
+            text = self._first_nonempty(value)
+            if text:
+                payload[key] = text
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        tmp.replace(path)
+        return True
+
     def clear_if_owned(self) -> bool:
         """Remove this process's slot and lock files during normal shutdown."""
         removed = False
-        for path in (self._directory / f"{self.slot}.json", self._lock_path(self._directory, self.slot)):
+        for path in (
+            self._directory / f"{self.slot}.json",
+            self._lock_path(self._directory, self.slot),
+            self._directory.parent / "context" / f"{self.slot}.json",
+        ):
             if not self._slot_pid_matches(path, os.getpid()):
                 continue
             try:
@@ -451,12 +521,26 @@ class LightCueService:
         *,
         mode: LightCueMode | str | None = None,
         slot_status_backend: SlotStatusBackend | None = None,
+        slot_status_backend_factory: Callable[[], SlotStatusBackend | None] | None = None,
         menu_bar_launcher: MenuBarLauncher | None = None,
     ):
         self.backend = backend or NullLightCueBackend()
         self.mode = LightCueMode.from_value(mode) if mode is not None else load_light_cue_mode()
         self.slot_status_backend = slot_status_backend
+        self.slot_status_backend_factory = slot_status_backend_factory
         self.menu_bar_launcher = menu_bar_launcher
+
+    def _ensure_slot_status_backend(self) -> SlotStatusBackend | None:
+        if self.slot_status_backend is not None:
+            return self.slot_status_backend
+        if self.slot_status_backend_factory is None:
+            return None
+        try:
+            self.slot_status_backend = self.slot_status_backend_factory()
+        except Exception as exc:
+            logger.debug("Slot status backend retry failed: %s", exc)
+            self.slot_status_backend = None
+        return self.slot_status_backend
 
     def set_mode(self, mode: LightCueMode | str, *, persist: bool = True) -> LightCueMode:
         self.mode = LightCueMode.from_value(mode)
@@ -466,15 +550,18 @@ class LightCueService:
 
     def mark_slot_online(self) -> bool:
         """Write an idle slot status without touching physical light backends."""
-        if self.slot_status_backend is None:
+        slot_status_backend = self._ensure_slot_status_backend()
+        if slot_status_backend is None:
             return False
+        if self.menu_bar_launcher is None:
+            self.menu_bar_launcher = AgentLightsMenuBarLauncher()
         if self.menu_bar_launcher is not None:
             try:
                 self.menu_bar_launcher.ensure_running()
             except Exception as exc:
                 logger.debug("Agent Lights menu bar launch failed during startup idle mark: %s", exc)
         try:
-            return bool(self.slot_status_backend.emit_event(LightCueEvent.IDLE))
+            return bool(slot_status_backend.emit_event(LightCueEvent.IDLE))
         except Exception as exc:
             logger.debug("Slot status backend failed during startup idle mark: %s", exc)
             return False
@@ -511,9 +598,10 @@ class LightCueService:
         # Reload the sticky profile-level mode before every cue so long-lived
         # terminal and gateway processes observe menu changes made elsewhere.
         event = LightCueEvent.from_value(event)
-        if self.slot_status_backend is not None:
+        slot_status_backend = self._ensure_slot_status_backend()
+        if slot_status_backend is not None:
             try:
-                self.slot_status_backend.emit_event(event)
+                slot_status_backend.emit_event(event)
             except Exception as exc:
                 logger.debug("Slot status backend failed: %s", exc)
         self.mode = load_light_cue_mode(self.mode)
@@ -524,6 +612,34 @@ class LightCueService:
             return bool(self.backend.emit(action))
         except Exception as exc:
             logger.debug("Light cue backend failed: %s", exc)
+            return False
+
+    def update_slot_context(
+        self,
+        *,
+        session_id: str | None = None,
+        current_context: str | None = None,
+        chat_summary: str | None = None,
+        tab_name: str | None = None,
+        provider: str | None = None,
+        model_name: str | None = None,
+    ) -> bool:
+        """Best-effort Agent Lights context sidecar update for normal Hermes slots."""
+        backend = self._ensure_slot_status_backend()
+        emit_context = getattr(backend, "emit_context", None)
+        if not callable(emit_context):
+            return False
+        try:
+            return bool(emit_context(
+                session_id=session_id,
+                current_context=current_context,
+                chat_summary=chat_summary,
+                tab_name=tab_name,
+                provider=provider,
+                model_name=model_name,
+            ))
+        except Exception as exc:
+            logger.debug("Slot context sidecar update failed: %s", exc)
             return False
 
 
@@ -544,7 +660,10 @@ def build_light_cue_service_from_config(config: dict[str, Any] | None = None, *,
         elif isinstance(model_config, str):
             configured_model = model_config
     configured_model = configured_model.strip() if isinstance(configured_model, str) and configured_model.strip() else None
-    slot_status_backend = SlotStatusFileBackend.from_env(auto_assign=auto_assign_slot, model_name=configured_model)
+    def slot_status_backend_factory() -> SlotStatusFileBackend | None:
+        return SlotStatusFileBackend.from_env(auto_assign=auto_assign_slot, model_name=configured_model)
+
+    slot_status_backend = slot_status_backend_factory()
     menu_bar_launcher = AgentLightsMenuBarLauncher() if slot_status_backend is not None else None
     mode = LightCueMode.from_value((config.get("light_cues") or {}).get("mode")) if isinstance(config, dict) else LightCueMode.DEFAULT
     wiz_cfg: Any = None
@@ -574,8 +693,14 @@ def build_light_cue_service_from_config(config: dict[str, Any] | None = None, *,
                 backend=WiZLightCueBackend(wiz_config),
                 mode=mode,
                 slot_status_backend=slot_status_backend,
+                slot_status_backend_factory=slot_status_backend_factory if auto_assign_slot else None,
                 menu_bar_launcher=menu_bar_launcher,
             )
         except Exception as exc:
             logger.debug("Failed to build WiZ light cue backend from config: %s", exc)
-    return LightCueService(mode=mode, slot_status_backend=slot_status_backend, menu_bar_launcher=menu_bar_launcher)
+    return LightCueService(
+        mode=mode,
+        slot_status_backend=slot_status_backend,
+        slot_status_backend_factory=slot_status_backend_factory if auto_assign_slot else None,
+        menu_bar_launcher=menu_bar_launcher,
+    )
