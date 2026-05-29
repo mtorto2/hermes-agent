@@ -12,6 +12,7 @@ def test_telegram_status_suppresses_auxiliary_and_retry_noise():
     noisy_messages = [
         "⚠ Auxiliary title generation failed: HTTP 400: Operation contains cybersecurity risk",
         "⚠ Compression summary failed: upstream error. Inserted a fallback context marker.",
+        "🗜️ Compacting context — summarizing earlier conversation so I can continue...",
         "ℹ Configured compression model 'small-model' failed (timeout). Recovered using main model — check auxiliary.compression.model in config.yaml.",
         "⚠️ Model returned empty after tool calls — nudging to continue",
         "⏳ Retrying in 4.2s (attempt 1/3)...",
