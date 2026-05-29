@@ -902,6 +902,92 @@ def test_launch_tui_sets_resume_env_from_resume_arg(monkeypatch, main_mod):
     assert captured["env"]["HERMES_TUI_RESUME"] == "20260518_000000_goodid"
 
 
+def test_launch_tui_exports_input_compactor_path_from_config(monkeypatch, main_mod):
+    captured = {}
+
+    monkeypatch.delenv("HERMES_INPUT_COMPACTOR", raising=False)
+    monkeypatch.setattr(
+        main_mod,
+        "_make_tui_argv",
+        lambda tui_dir, tui_dev: (["node", "dist/entry.js"], Path(".")),
+    )
+    monkeypatch.setattr(
+        main_mod.subprocess,
+        "call",
+        lambda argv, cwd=None, env=None: captured.update({"env": env}) or 1,
+    )
+
+    import hermes_cli.config as config_mod
+
+    monkeypatch.setattr(
+        config_mod,
+        "load_config",
+        lambda: {
+            "display": {"input_compactor_path": "~/bin/display-compactor"},
+            "input_compactor_path": "~/bin/root-compactor",
+        },
+    )
+
+    with pytest.raises(SystemExit):
+        main_mod._launch_tui()
+
+    assert captured["env"]["HERMES_INPUT_COMPACTOR"] == os.path.expanduser("~/bin/display-compactor")
+
+
+def test_launch_tui_preserves_explicit_input_compactor_env(monkeypatch, main_mod):
+    captured = {}
+
+    monkeypatch.setenv("HERMES_INPUT_COMPACTOR", "/tmp/env-compactor")
+    monkeypatch.setattr(
+        main_mod,
+        "_make_tui_argv",
+        lambda tui_dir, tui_dev: (["node", "dist/entry.js"], Path(".")),
+    )
+    monkeypatch.setattr(
+        main_mod.subprocess,
+        "call",
+        lambda argv, cwd=None, env=None: captured.update({"env": env}) or 1,
+    )
+
+    import hermes_cli.config as config_mod
+
+    monkeypatch.setattr(
+        config_mod,
+        "load_config",
+        lambda: {"display": {"input_compactor_path": "~/bin/display-compactor"}},
+    )
+
+    with pytest.raises(SystemExit):
+        main_mod._launch_tui()
+
+    assert captured["env"]["HERMES_INPUT_COMPACTOR"] == "/tmp/env-compactor"
+
+
+def test_launch_tui_exports_input_compactor_root_fallback(monkeypatch, main_mod):
+    captured = {}
+
+    monkeypatch.delenv("HERMES_INPUT_COMPACTOR", raising=False)
+    monkeypatch.setattr(
+        main_mod,
+        "_make_tui_argv",
+        lambda tui_dir, tui_dev: (["node", "dist/entry.js"], Path(".")),
+    )
+    monkeypatch.setattr(
+        main_mod.subprocess,
+        "call",
+        lambda argv, cwd=None, env=None: captured.update({"env": env}) or 1,
+    )
+
+    import hermes_cli.config as config_mod
+
+    monkeypatch.setattr(config_mod, "load_config", lambda: {"input_compactor_path": "~/bin/root-compactor"})
+
+    with pytest.raises(SystemExit):
+        main_mod._launch_tui()
+
+    assert captured["env"]["HERMES_INPUT_COMPACTOR"] == os.path.expanduser("~/bin/root-compactor")
+
+
 def test_make_tui_argv_dev_prebuilds_hermes_ink(monkeypatch, main_mod, tmp_path):
     tui_dir = tmp_path / "ui-tui"
     tsx = tui_dir / "node_modules" / ".bin" / "tsx"
