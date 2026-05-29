@@ -517,10 +517,10 @@ def test_load_enabled_toolsets_rejects_disabled_mcp_env(monkeypatch, capsys):
         config_mod, "load_config", lambda: {"platform_toolsets": {"cli": ["memory"]}}
     )
 
-    # Sorted: ["kanban", "memory"]. `kanban` is auto-recovered by
-    # _get_platform_tools because it's a non-configurable platform toolset
-    # whose tools live in hermes-cli's universe (see toolsets.py).
-    assert server._load_enabled_toolsets() == ["kanban", "memory"]
+    # Sorted: ["apple_calendar", "kanban", "memory"]. `apple_calendar` and
+    # `kanban` are auto-recovered by _get_platform_tools because they are
+    # non-configurable platform toolsets (see toolsets.py).
+    assert server._load_enabled_toolsets() == ["apple_calendar", "kanban", "memory"]
     err = capsys.readouterr().err
     assert "ignoring disabled MCP servers" in err
     assert "mcp-off" in err
@@ -541,7 +541,7 @@ def test_load_enabled_toolsets_falls_back_when_tui_env_invalid(monkeypatch, caps
         config_mod, "load_config", lambda: {"platform_toolsets": {"cli": ["memory"]}}
     )
 
-    assert server._load_enabled_toolsets() == ["kanban", "memory"]
+    assert server._load_enabled_toolsets() == ["apple_calendar", "kanban", "memory"]
     assert "using configured CLI toolsets" in capsys.readouterr().err
 
 
