@@ -1,12 +1,15 @@
-import { describe, expect, it } from 'vitest'
+import { EventEmitter } from 'node:events'
+
+import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import {
   canRunInputCompactor,
   inputCompactionNotice,
   inputCompactionSource,
-  isInputCompactionKey,
   isAltTInputCompactionRaw,
+  isInputCompactionKey,
   refreshInputCompactionOffset,
+  runInputCompactorProcess,
   spliceInputCompactionResult
 } from '../components/textInput.js'
 
@@ -64,5 +67,128 @@ describe('input compactor helpers', () => {
       compactedPrefix: '',
       compactedUpTo: 0
     })
+  })
+})
+
+
+class FakeStream extends EventEmitter {
+  chunks: string[] = []
+  encoding = ''
+  endedWith = ''
+
+  setEncoding(encoding: string) {
+    this.encoding = encoding
+  }
+
+  end(text: string) {
+    this.endedWith = text
+  }
+}
+
+class FakeChild extends EventEmitter {
+  exitCode: number | null = null
+  killedSignals: string[] = []
+  stderr = new FakeStream()
+  stdin = new FakeStream()
+  stdout = new FakeStream()
+
+  kill(signal: string) {
+    this.killedSignals.push(signal)
+
+    return true
+  }
+}
+
+describe('runInputCompactorProcess', () => {
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it('writes source text to stdin and returns compacted stdout on clean close', () => {
+    const child = new FakeChild()
+    const onFailure = vi.fn()
+    const onSettled = vi.fn()
+    const onSuccess = vi.fn()
+
+    runInputCompactorProcess({
+      compactorPath: '/tmp/compact',
+      onFailure,
+      onSettled,
+      onSuccess,
+      sourceText: 'raw dictation',
+      spawnImpl: vi.fn(() => child as any)
+    })
+
+    child.stdout.emit('data', 'tight request\n')
+    child.emit('close', 0)
+
+    expect(child.stdin.endedWith).toBe('raw dictation')
+    expect(onSuccess).toHaveBeenCalledWith('tight request')
+    expect(onFailure).not.toHaveBeenCalled()
+    expect(onSettled).toHaveBeenCalledTimes(1)
+  })
+
+  it('reports subprocess stderr on non-zero close', () => {
+    const child = new FakeChild()
+    const onFailure = vi.fn()
+
+    runInputCompactorProcess({
+      compactorPath: '/tmp/compact',
+      onFailure,
+      onSettled: vi.fn(),
+      onSuccess: vi.fn(),
+      sourceText: 'raw dictation',
+      spawnImpl: vi.fn(() => child as any)
+    })
+
+    child.stderr.emit('data', 'first\nlast error')
+
+    child.emit('close', 2)
+
+    expect(onFailure).toHaveBeenCalledWith('Input compactor failed: last error')
+  })
+
+  it('sends SIGTERM on timeout, escalates to SIGKILL, and clears kill timer on close', () => {
+    vi.useFakeTimers()
+    const child = new FakeChild()
+    const onFailure = vi.fn()
+    const onSettled = vi.fn()
+
+    runInputCompactorProcess({
+      compactorPath: '/tmp/compact',
+      killGraceMs: 25,
+      onFailure,
+      onSettled,
+      onSuccess: vi.fn(),
+      sourceText: 'raw dictation',
+      spawnImpl: vi.fn(() => child as any),
+      timeoutMs: 50
+    })
+
+    vi.advanceTimersByTime(50)
+    expect(child.killedSignals).toEqual(['SIGTERM'])
+    expect(onFailure).toHaveBeenCalledWith('Input compactor failed: timed out after 90 seconds')
+    expect(onSettled).toHaveBeenCalledTimes(1)
+
+    vi.advanceTimersByTime(25)
+    expect(child.killedSignals).toEqual(['SIGTERM', 'SIGKILL'])
+
+    const exitsAfterTerm = new FakeChild()
+    runInputCompactorProcess({
+      compactorPath: '/tmp/compact',
+      killGraceMs: 25,
+      onFailure: vi.fn(),
+      onSettled: vi.fn(),
+      onSuccess: vi.fn(),
+      sourceText: 'raw dictation',
+      spawnImpl: vi.fn(() => exitsAfterTerm as any),
+      timeoutMs: 50
+    })
+
+    vi.advanceTimersByTime(50)
+    exitsAfterTerm.exitCode = 143
+    exitsAfterTerm.emit('close', 143)
+    vi.advanceTimersByTime(25)
+    expect(exitsAfterTerm.killedSignals).toEqual(['SIGTERM'])
   })
 })

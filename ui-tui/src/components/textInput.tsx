@@ -183,6 +183,119 @@ export const isInputCompactionKey = (input: string, key: Key, eventRaw: string):
 
 export const canRunInputCompactor = (enabled: boolean, mask?: string): boolean => enabled && !mask
 
+
+interface InputCompactorProcessOptions {
+  compactorPath: string
+  killGraceMs?: number
+  onFailure: (message: string) => void
+  onSettled: () => void
+  onSuccess: (compacted: string) => void
+  sourceText: string
+  spawnImpl?: typeof spawn
+  timeoutMs?: number
+}
+
+export const runInputCompactorProcess = ({
+  compactorPath,
+  killGraceMs = 2_000,
+  onFailure,
+  onSettled,
+  onSuccess,
+  sourceText,
+  spawnImpl = spawn,
+  timeoutMs = 90_000
+}: InputCompactorProcessOptions) => {
+  const child = spawnImpl(compactorPath, ['--stdin'], { stdio: ['pipe', 'pipe', 'pipe'] })
+  let stdoutText = ''
+  let stderrText = ''
+  let settled = false
+  let killTimer: ReturnType<typeof setTimeout> | null = null
+
+  const clearKillTimer = () => {
+    if (killTimer) {
+      clearTimeout(killTimer)
+      killTimer = null
+    }
+  }
+
+  const finish = () => {
+    clearTimeout(timeout)
+    clearKillTimer()
+    onSettled()
+  }
+
+  const fail = (message: string) => {
+    onFailure(message)
+    finish()
+  }
+
+  const timeout = setTimeout(() => {
+    if (settled) {
+      return
+    }
+
+    settled = true
+    child.kill('SIGTERM')
+    clearTimeout(timeout)
+    onFailure('Input compactor failed: timed out after 90 seconds')
+    onSettled()
+    killTimer = setTimeout(() => {
+      if (child.exitCode === null) {
+        child.kill('SIGKILL')
+      }
+    }, killGraceMs)
+  }, timeoutMs)
+
+  child.stdout.setEncoding('utf8')
+  child.stderr.setEncoding('utf8')
+  child.stdout.on('data', chunk => {
+    stdoutText += String(chunk)
+  })
+  child.stderr.on('data', chunk => {
+    stderrText += String(chunk)
+  })
+  child.on('error', error => {
+    if (settled) {
+      return
+    }
+
+    settled = true
+    fail(`Input compactor failed: ${error.message.slice(0, 300)}`)
+  })
+  child.on('close', code => {
+    if (settled) {
+      clearKillTimer()
+
+      return
+    }
+
+    settled = true
+
+    if (code !== 0) {
+      const lines = (stderrText || stdoutText || 'compactor failed').trim().split(/\r?\n/)
+      const message = lines.at(-1) || 'compactor failed'
+      fail(`Input compactor failed: ${message.slice(0, 300)}`)
+
+      return
+    }
+
+    const compacted = stdoutText.trim()
+
+    if (!compacted) {
+      fail('Input compactor failed: compactor returned empty output')
+
+      return
+    }
+
+    onSuccess(compacted)
+    finish()
+  })
+  child.stdin.on('error', () => {})
+  child.stdin.end(sourceText)
+
+  return child
+}
+
 export const refreshInputCompactionOffset = (
   value: string,
   compactedPrefix: string,
@@ -841,93 +954,27 @@ export function TextInput({
     inputCompactorRunningRef.current = true
     setInputCompactionMessage(INPUT_COMPACTOR_STATUS)
 
-    const child = spawn(compactorPath, ['--stdin'], { stdio: ['pipe', 'pipe', 'pipe'] })
-    let stdoutText = ''
-    let stderrText = ''
-    let settled = false
-    let killTimer: ReturnType<typeof setTimeout> | null = null
+    runInputCompactorProcess({
+      compactorPath,
+      onFailure: message => setInputCompactionMessage(message, true),
+      onSettled: () => {
+        inputCompactorRunningRef.current = false
+      },
+      onSuccess: compacted => {
+        if (editVersionRef.current !== startVersion || vRef.current !== original) {
+          setInputCompactionMessage('Compactor finished, but draft changed; leaving current input untouched.', true)
 
-    const timeout = setTimeout(() => {
-      if (settled) {
-        return
-      }
-
-      settled = true
-      child.kill('SIGTERM')
-      finish('Input compactor failed: timed out after 90 seconds')
-      killTimer = setTimeout(() => {
-        if (child.exitCode === null) {
-          child.kill('SIGKILL')
+          return
         }
-      }, 2_000)
-    }, 90_000)
 
-    const finish = (message?: string) => {
-      clearTimeout(timeout)
-      if (killTimer) {
-        clearTimeout(killTimer)
-        killTimer = null
-      }
-      inputCompactorRunningRef.current = false
-      setInputCompactionMessage(message ?? null, !!message)
-    }
-
-    child.stdout.setEncoding('utf8')
-    child.stderr.setEncoding('utf8')
-    child.stdout.on('data', chunk => {
-      stdoutText += String(chunk)
+        const result = spliceInputCompactionResult(original, source.start, compacted)
+        compactedUpToRef.current = result.compactedUpTo
+        compactedPrefixRef.current = result.text.slice(0, result.compactedUpTo)
+        commit(result.text, result.cursor)
+        setInputCompactionMessage(null)
+      },
+      sourceText: source.text
     })
-    child.stderr.on('data', chunk => {
-      stderrText += String(chunk)
-    })
-    child.on('error', error => {
-      if (settled) {
-        return
-      }
-
-      settled = true
-      finish(`Input compactor failed: ${error.message.slice(0, 300)}`)
-    })
-    child.on('close', code => {
-      if (settled) {
-        if (killTimer) {
-          clearTimeout(killTimer)
-          killTimer = null
-        }
-        return
-      }
-
-      settled = true
-      if (code !== 0) {
-        const lines = (stderrText || stdoutText || 'compactor failed').trim().split(/\r?\n/)
-        const message = lines.at(-1) || 'compactor failed'
-        finish(`Input compactor failed: ${message.slice(0, 300)}`)
-
-        return
-      }
-
-      const compacted = stdoutText.trim()
-
-      if (!compacted) {
-        finish('Input compactor failed: compactor returned empty output')
-
-        return
-      }
-
-      if (editVersionRef.current !== startVersion || vRef.current !== original) {
-        finish('Compactor finished, but draft changed; leaving current input untouched.')
-
-        return
-      }
-
-      const result = spliceInputCompactionResult(original, source.start, compacted)
-      compactedUpToRef.current = result.compactedUpTo
-      compactedPrefixRef.current = result.text.slice(0, result.compactedUpTo)
-      commit(result.text, result.cursor)
-      finish()
-    })
-    child.stdin.on('error', () => {})
-    child.stdin.end(source.text)
   }
 
   const emitPaste = (e: PasteEvent) => {
