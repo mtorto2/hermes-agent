@@ -114,6 +114,65 @@ final class SlotStatusTests: XCTestCase {
         XCTAssertEqual(ordered.map(\.slot), [1, 2])
     }
 
+    func testTerminalTabTitleUsesSingleSlotLetterAtEndForReadableMacOSTabs() throws {
+        let status = try SlotStatus.decode(from: """
+        {"slot":2,"state":"working","pid":202,"source":"hermes","model_name":"openai/gpt-5.5"}
+        """.data(using: .utf8)!)
+
+        XCTAssertEqual(status.terminalTabTitle, "Hermes B")
+    }
+
+    func testTerminalTabTitleScriptSetsExactOscTitleForMatchingTTYOnly() {
+        let script = TerminalTabTitleScript.script(forTTY: "ttys001", title: "Hermes B")
+
+        XCTAssertNotNil(script)
+        XCTAssertTrue(script?.contains("if tty of t is \"/dev/ttys001\"") == true)
+        XCTAssertTrue(script?.contains("set title displays custom title of t to false") == true)
+        XCTAssertTrue(script?.contains("set custom title of t to \"\"") == true)
+        XCTAssertTrue(script?.contains("do shell script \"/usr/bin/printf") == true)
+        XCTAssertTrue(script?.contains("Hermes B") == true)
+        XCTAssertTrue(script?.contains("/dev/ttys001") == true)
+        XCTAssertNil(TerminalTabTitleScript.script(forTTY: "../../bad", title: "B"))
+    }
+
+    func testSlotContextProvidesExpandableMenuRows() throws {
+        let context = try SlotContext.decode(from: """
+        {
+          "slot": 2,
+          "tab_name": "Build lights",
+          "provider": "openai-codex",
+          "model_name": "gpt-5.5",
+          "session_id": "20260529_123456_abcd",
+          "current_context": "Implement Agent Lights per-tab context submenu.",
+          "chat_summary": "Tests are red; wiring Swift menu next.",
+          "updated_at": "2026-05-29T12:34:56+00:00"
+        }
+        """.data(using: .utf8)!)
+
+        XCTAssertEqual(context.slot, 2)
+        XCTAssertEqual(context.detailRows, [
+            "Tab: B — Build lights",
+            "Provider / Model: openai-codex / gpt-5.5",
+            "Session: 20260529_123456_abcd",
+            "Current Context: Implement Agent Lights per-tab context submenu.",
+            "Chat Summary: Tests are red; wiring Swift menu next.",
+            "Updated: 2026-05-29T12:34:56+00:00",
+        ])
+    }
+
+    func testSlotContextFallbackStillCreatesSubmenuRowsWithoutSidecar() throws {
+        let status = try SlotStatus.decode(from: """
+        {"slot":1,"state":"working","source":"hermes","model_name":"openai/gpt-5.5"}
+        """.data(using: .utf8)!)
+
+        let context = SlotContext.fallback(for: status)
+
+        XCTAssertEqual(context.detailRows, [
+            "Tab: A",
+            "Provider / Model: openai/gpt-5.5",
+        ])
+    }
+
     func testAgentRingGroupShowsEightCapacitySlotsWhenAnyAgentIsRunning() throws {
         let first = try SlotStatus.decode(from: """
         {"slot":1,"state":"working","source":"kanban_worker","model_name":"openai-codex/gpt-5.5"}

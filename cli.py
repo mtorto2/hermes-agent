@@ -818,6 +818,8 @@ def _sync_process_session_id(session_id: str) -> None:
     from gateway.session_context import set_current_session_id
 
     set_current_session_id(session_id)
+    if session_id:
+        os.environ["HERMES_SESSION_ID"] = session_id
 
 # Cron job system for scheduled tasks (execution is handled by the gateway)
 def get_job(*args, **kwargs):
@@ -11613,6 +11615,31 @@ class HermesCLI:
         except Exception:
             logger.debug("Terminal light cue emission failed", exc_info=True)
 
+    def _update_agent_lights_context(self, *, current_context: Optional[str] = None, chat_summary: Optional[str] = None) -> None:
+        """Best-effort per-slot context sidecar update for the Agent Lights menu."""
+        try:
+            service = self._get_light_cue_service()
+            service.update_slot_context(
+                session_id=getattr(self, "session_id", None),
+                current_context=self._agent_lights_compact_text(current_context),
+                chat_summary=self._agent_lights_compact_text(chat_summary),
+                provider=getattr(self, "provider", None),
+                model_name=getattr(self, "model", None),
+            )
+        except Exception:
+            logger.debug("Agent Lights context update failed", exc_info=True)
+
+    @staticmethod
+    def _agent_lights_compact_text(value: Any, *, limit: int = 220) -> Optional[str]:
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            value = str(value)
+        text = " ".join(value.strip().split())
+        if not text:
+            return None
+        return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
     def chat(self, message, images: list = None) -> Optional[str]:
         """
         Send a message to the agent and get a response.
@@ -11757,6 +11784,11 @@ class HermesCLI:
             # Run the conversation with interrupt monitoring
             result = None
             self._emit_light_cue(LightCueEvent.WORKING)
+            self._update_agent_lights_context(
+                current_context=f"Working on: {message}" if isinstance(message, str) else "Working on multimodal input",
+                chat_summary="Turn in progress",
+            )
+            last_context_refresh_at = time.time()
 
             # Reset streaming display state for this turn
             self._reset_stream_state()
@@ -11908,6 +11940,13 @@ class HermesCLI:
             # so we skip interrupt processing to avoid stealing that input.
             interrupt_msg = None
             while agent_thread.is_alive():
+                now = time.time()
+                if now - last_context_refresh_at >= 300:
+                    self._update_agent_lights_context(
+                        current_context=f"Still working on: {message}" if isinstance(message, str) else "Still working on multimodal input",
+                        chat_summary="Turn still in progress",
+                    )
+                    last_context_refresh_at = now
                 if hasattr(self, '_interrupt_queue'):
                     try:
                         interrupt_msg = self._interrupt_queue.get(timeout=0.1)
@@ -12024,6 +12063,11 @@ class HermesCLI:
 
             # Get the final response
             response = result.get("final_response", "") if result else ""
+            if response:
+                self._update_agent_lights_context(
+                    current_context=f"Latest ask: {message}" if isinstance(message, str) else "Latest ask included multimodal input",
+                    chat_summary=f"Latest answer: {response}",
+                )
 
             # Auto-generate session title after first exchange (non-blocking)
             if response and result and not result.get("failed") and not result.get("partial"):
