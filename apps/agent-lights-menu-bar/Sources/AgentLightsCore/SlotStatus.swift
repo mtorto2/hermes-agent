@@ -25,6 +25,7 @@ public struct SlotStatus: Equatable {
     public let kanbanTaskId: String?
     public let kanbanTaskTitle: String?
     public let profile: String?
+    public let sessionId: String?
 
     public var isKanbanWorker: Bool {
         source == "kanban_worker"
@@ -32,6 +33,10 @@ public struct SlotStatus: Equatable {
 
     public var menuDetail: String {
         "\(slotLetter): \(displayModelName) - \(state.menuLabel)"
+    }
+
+    public var terminalTabTitle: String {
+        "Hermes \(slotLetter)"
     }
 
     public var agentMenuDetail: String {
@@ -67,7 +72,7 @@ public struct SlotStatus: Equatable {
     }
 
     public static func missing(slot: Int) -> SlotStatus {
-        SlotStatus(slot: slot, state: .missing, event: nil, updatedAt: nil, pid: nil, processStartedAt: nil, source: nil, modelName: nil, kanbanBoard: nil, kanbanTaskId: nil, kanbanTaskTitle: nil, profile: nil)
+        SlotStatus(slot: slot, state: .missing, event: nil, updatedAt: nil, pid: nil, processStartedAt: nil, source: nil, modelName: nil, kanbanBoard: nil, kanbanTaskId: nil, kanbanTaskTitle: nil, profile: nil, sessionId: nil)
     }
 
     public static func decode(from data: Data) throws -> SlotStatus {
@@ -85,7 +90,8 @@ public struct SlotStatus: Equatable {
             kanbanBoard: payload.kanbanBoard,
             kanbanTaskId: payload.kanbanTaskId,
             kanbanTaskTitle: payload.kanbanTaskTitle,
-            profile: payload.profile
+            profile: payload.profile,
+            sessionId: payload.sessionId
         )
     }
 
@@ -476,6 +482,66 @@ public enum TerminalFocusScript {
     }
 }
 
+public enum TerminalTabTitleScript {
+    public static func script(forTTY tty: String, title: String) -> String? {
+        let trimmedTTY = tty.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmedTTY.range(of: #"^ttys[0-9]+$"#, options: .regularExpression) != nil else {
+            return nil
+        }
+        let trimmedTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedTitle.isEmpty else { return nil }
+        let terminalTTY = "/dev/\(trimmedTTY)"
+        let escapedTTY = appleScriptEscaped(terminalTTY)
+        let titleCommand = "/usr/bin/printf "
+            + shellSingleQuoted("\\033]1;\(trimmedTitle)\\007")
+            + " > "
+            + shellSingleQuoted(terminalTTY)
+        let escapedCommand = appleScriptEscaped(titleCommand)
+        return """
+        tell application "Terminal"
+            repeat with w in windows
+                repeat with t in tabs of w
+                    if tty of t is "\(escapedTTY)" then
+                        try
+                            set title displays custom title of t to false
+                        end try
+                        try
+                            set custom title of t to ""
+                        end try
+                        try
+                            set title displays device name of t to false
+                        end try
+                        try
+                            set title displays shell path of t to false
+                        end try
+                        try
+                            set title displays window size of t to false
+                        end try
+                        try
+                            set title displays file name of t to false
+                        end try
+                        do shell script "\(escapedCommand)"
+                        return true
+                    end if
+                end repeat
+            end repeat
+        end tell
+        return false
+        """
+    }
+
+    private static func appleScriptEscaped(_ value: String) -> String {
+        value
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+            .replacingOccurrences(of: "\n", with: " ")
+    }
+
+    private static func shellSingleQuoted(_ value: String) -> String {
+        "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+}
+
 public enum KanbanCardOpenScript {
     public static func script(taskId: String?, board: String?) -> String? {
         guard let rawTaskId = trimmed(taskId),
@@ -527,6 +593,7 @@ private struct SlotStatusPayload: Decodable {
     let kanbanTaskId: String?
     let kanbanTaskTitle: String?
     let profile: String?
+    let sessionId: String?
 
     enum CodingKeys: String, CodingKey {
         case slot
@@ -541,5 +608,6 @@ private struct SlotStatusPayload: Decodable {
         case kanbanTaskId = "kanban_task_id"
         case kanbanTaskTitle = "kanban_task_title"
         case profile
+        case sessionId = "session_id"
     }
 }

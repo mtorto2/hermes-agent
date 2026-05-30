@@ -60,6 +60,14 @@ from both pools so completed/abandoned Kanban worker rings do not persist as
 ghosts. Normal Hermes shutdown also removes the slot owned by that process when
 shutdown is clean.
 
+For normal Hermes Terminal tabs, the companion app best-effort keeps each tab
+labeled with a compact stable title such as `Hermes A`. Terminal's regular
+AppleScript `custom title` field still allows macOS to append active-process
+suffixes like `python3 .../hermes --tui`, so the app uses OSC tab-title control
+written to the slot TTY and disables Terminal title components for the tab. This
+keeps the visible tab label focused on the durable slot identity without
+restarting or interrupting the running TUI session.
+
 Clicking the menu bar item opens a vertical status menu. The first row uses this
 compact count format:
 
