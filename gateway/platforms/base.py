@@ -2448,11 +2448,51 @@ class BasePlatformAdapter(ABC):
             text = f"{caption}\n{text}"
         return await self.send(chat_id=chat_id, content=text, reply_to=reply_to, metadata=metadata)
 
+    @staticmethod
+    def _normalize_tts_currency(text: str) -> str:
+        """Make dollar amounts listener-friendly before synthesis."""
+
+        def repl(match: re.Match) -> str:
+            dollars_raw = match.group(1)
+            cents_raw = match.group(2)
+            dollars_text = dollars_raw.replace(",", "")
+            try:
+                dollars = int(dollars_text)
+            except ValueError:
+                return match.group(0)
+            dollar_word = "dollar" if dollars == 1 else "dollars"
+            if cents_raw and cents_raw != "00":
+                cents = int(cents_raw)
+                cent_word = "cent" if cents == 1 else "cents"
+                return f"{dollars} {dollar_word} and {cents} {cent_word}"
+            return f"{dollars} {dollar_word}"
+
+        return re.sub(r"\$(\d{1,3}(?:,\d{3})*|\d+)(?:\.(\d{2}))?\b", repl, text)
+
+    @staticmethod
+    def _normalize_tts_exact_hour_times(text: str) -> str:
+        """Avoid TTS reading exact-hour times as 'ten zero zero A M'."""
+
+        def repl(match: re.Match) -> str:
+            hour = str(int(match.group(1)))
+            meridiem = match.group(2).upper()
+            return f"{hour} {meridiem} M"
+
+        return re.sub(r"\b(\d{1,2}):00\s*([AaPp])\.?[Mm]\.?\b", repl, text)
+
+    @classmethod
+    def normalize_tts_spoken_text(cls, text: str) -> str:
+        """Apply narrow, safe spoken-form cleanups for gateway auto-TTS."""
+        text = cls._normalize_tts_currency(text)
+        text = cls._normalize_tts_exact_hour_times(text)
+        return text
+
     def prepare_tts_text(self, text: str) -> str:
         """Prepare text for TTS. Override to filter tool output, code, etc.
 
         Default strips markdown formatting, removes the Telegram voice-transcript
-        audit block from the spoken text, and truncates to 4000 chars.
+        audit block, applies narrow spoken-form cleanups, and truncates to 4000
+        chars.
         """
         # Telegram voice replies may be prefixed by GatewayRunner with a visible
         # transcript audit block like:
@@ -2468,7 +2508,9 @@ class BasePlatformAdapter(ABC):
             count=1,
             flags=re.DOTALL,
         )
-        return re.sub(r'[*_`#\[\]()]', '', text)[:4000].strip()
+        text = re.sub(r'[*_`#\[\]()]', '', text)
+        text = self.normalize_tts_spoken_text(text)
+        return text[:4000].strip()
 
     async def play_tts(
         self,

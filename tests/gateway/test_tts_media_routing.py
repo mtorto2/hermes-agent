@@ -62,6 +62,29 @@ def _allowed_media_path(tmp_path, monkeypatch, name):
     return media_file.resolve()
 
 
+def test_prepare_tts_text_normalizes_money_and_exact_hour_times():
+    adapter = _MediaRoutingAdapter()
+
+    spoken = adapter.prepare_tts_text(
+        '🎙️ You said: "send it"\n\n'
+        'Reminder set for **Monday at 10:00 AM**. Total is **$850.00**.'
+    )
+
+    assert 'You said' not in spoken
+    assert '10 A M' in spoken
+    assert '$850.00' not in spoken
+    assert '850 dollars' in spoken
+
+
+def test_prepare_tts_text_preserves_non_exact_times_and_cent_amounts():
+    adapter = _MediaRoutingAdapter()
+
+    spoken = adapter.prepare_tts_text('Meet at 10:30 PM. Charge $12.50.')
+
+    assert '10:30 PM' in spoken
+    assert '12 dollars and 50 cents' in spoken
+
+
 @pytest.mark.asyncio
 async def test_base_adapter_routes_telegram_flac_media_tag_to_document_sender(tmp_path, monkeypatch):
     adapter = _MediaRoutingAdapter()
