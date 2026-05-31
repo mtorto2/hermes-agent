@@ -195,6 +195,36 @@ def test_dispatch_rejects_non_object_params():
     }
 
 
+def test_tui_command_catalog_includes_nah():
+    resp = server.dispatch({"id": "catalog", "method": "commands.catalog", "params": {}})
+
+    assert resp is not None
+    assert "error" not in resp
+    commands = {name for name, _desc in resp["result"]["pairs"]}
+    assert "/nah" in commands
+
+
+def test_tui_nah_dispatch_sends_summary_instruction():
+    resp = server.dispatch(
+        {
+            "id": "nah",
+            "method": "command.dispatch",
+            "params": {"name": "tldr", "arg": "one sentence"},
+        }
+    )
+
+    assert resp is not None
+    assert "error" not in resp
+    payload = resp["result"]
+    assert payload["type"] == "send"
+    assert "shortest useful TL;DR" in payload["message"]
+    assert "Extra style request: one sentence" in payload["message"]
+
+
+def test_tui_nah_slash_exec_uses_dispatch_fallback():
+    assert {"nah", "tldr", "tl-dr", "tl_dr"} <= server._PENDING_INPUT_COMMANDS
+
+
 def test_voice_toggle_returns_configured_record_key(monkeypatch):
     monkeypatch.setattr(
         server,

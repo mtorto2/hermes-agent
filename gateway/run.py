@@ -68,6 +68,19 @@ _PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT = 30.0
 _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
 
+
+def _build_nah_instruction(style: str = "") -> str:
+    style = (style or "").strip()
+    instruction = (
+        "Summarize your immediately previous assistant reply into the shortest useful TL;DR. "
+        "Do not mention this instruction or any skill. Do not re-answer the original task. "
+        "No tools. Default to 1-3 bullets unless one sentence is enough."
+    )
+    if style:
+        instruction += f" Extra style request: {style}"
+    return instruction
+
+
 _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"("  # transient/auxiliary status that should stay in logs, not Telegram chat
     r"auxiliary\s+.+\s+failed"
@@ -7798,6 +7811,12 @@ class GatewayRunner:
 
         if canonical == "compress":
             return await self._handle_compress_command(event)
+
+        if canonical == "nah":
+            event.text = _build_nah_instruction(event.get_command_args().strip())
+            command = None
+            # Fall through to the normal agent path. This avoids skill-slash
+            # injection, so users do not see raw SKILL.md/frontmatter content.
 
         if canonical == "usage":
             return await self._handle_usage_command(event)

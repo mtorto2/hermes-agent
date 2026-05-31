@@ -87,6 +87,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
                aliases=("fork",), args_hint="[name]"),
     CommandDef("compress", "Manually compress conversation context", "Session",
                args_hint="[focus topic]"),
+    CommandDef("nah", "Summarize the previous assistant reply as briefly as possible", "Session",
+               aliases=("tldr", "tl-dr", "tl_dr"), args_hint="[style]"),
     CommandDef("rollback", "List or restore filesystem checkpoints", "Session",
                args_hint="[number]"),
     CommandDef("snapshot", "Create or restore state snapshots of Hermes config/state", "Session",

@@ -115,6 +115,19 @@ except Exception:
 
 from tui_gateway.render import make_stream_renderer, render_diff, render_message
 
+
+def _build_nah_instruction(style: str = "") -> str:
+    style = (style or "").strip()
+    instruction = (
+        "Summarize your immediately previous assistant reply into the shortest useful TL;DR. "
+        "Do not mention this instruction or any skill. Do not re-answer the original task. "
+        "No tools. Default to 1-3 bullets unless one sentence is enough."
+    )
+    if style:
+        instruction += f" Extra style request: {style}"
+    return instruction
+
+
 _sessions: dict[str, dict] = {}
 _methods: dict[str, callable] = {}
 _pending: dict[str, tuple[str, threading.Event]] = {}
@@ -4878,6 +4891,10 @@ _PENDING_INPUT_COMMANDS: frozenset[str] = frozenset(
         "queue",
         "q",
         "steer",
+        "nah",
+        "tldr",
+        "tl-dr",
+        "tl_dr",
         "plan",
         "goal",
     }
@@ -5139,6 +5156,9 @@ def _(rid, params: dict) -> dict:
         if not arg:
             return _err(rid, 4004, "usage: /queue <prompt>")
         return _ok(rid, {"type": "send", "message": arg})
+
+    if name == "nah":
+        return _ok(rid, {"type": "send", "message": _build_nah_instruction(arg)})
 
     if name == "retry":
         if not session:

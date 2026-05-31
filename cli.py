@@ -278,6 +278,18 @@ def _assistant_copy_text(content: Any) -> str:
     return _strip_reasoning_tags(_assistant_content_as_text(content))
 
 
+def _build_nah_instruction(style: str = "") -> str:
+    style = (style or "").strip()
+    instruction = (
+        "Summarize your immediately previous assistant reply into the shortest useful TL;DR. "
+        "Do not mention this instruction or any skill. Do not re-answer the original task. "
+        "No tools. Default to 1-3 bullets unless one sentence is enough."
+    )
+    if style:
+        instruction += f" Extra style request: {style}"
+    return instruction
+
+
 # =============================================================================
 # Configuration Loading
 # =============================================================================
@@ -8603,6 +8615,11 @@ class HermesCLI:
             self._handle_fast_command(cmd_original)
         elif canonical == "compress":
             self._manual_compress(cmd_original)
+        elif canonical == "nah":
+            parts = cmd_original.split(maxsplit=1)
+            style = parts[1].strip() if len(parts) > 1 else ""
+            if hasattr(self, '_pending_input'):
+                self._pending_input.put(_build_nah_instruction(style))
         elif canonical == "usage":
             self._show_usage()
         elif canonical == "insights":
