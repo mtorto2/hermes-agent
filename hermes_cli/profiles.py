@@ -189,7 +189,47 @@ _DEFAULT_EXPORT_EXCLUDE_ROOT = frozenset({
     "browser_screenshots", "checkpoints",
     "sandboxes",
     "logs",                 # gateway logs
+    "backups",              # may contain full credential/runtime snapshots
+    "state-snapshots",      # may contain .env/auth/state DB snapshots
+    "sessions",             # request dumps can contain prompt/tool payloads
+    "pastes",               # ad-hoc captured user/runtime content
+    # Local service/application runtimes and bulky generated artifacts.
+    "homeassistant",
+    "video-editing-venv",
+    "video-editing-work",
+    "cache",
+    "media_cache",
+    "video_cache",
+    "models_dev_cache.json",
+    # OAuth/app-specific credential stores commonly created under default home.
+    "google",
+    "outlook",
+    "titan_mail",
+    "swiftbar-plugins",     # host-specific plugin symlinks; can be dangling
 })
+
+_EXPORT_SECRETISH_NAME_SUBSTRINGS = frozenset({
+    "token",
+    "secret",
+    "credential",
+    "cookie",
+    "password",
+    "passwd",
+    "oauth",
+})
+
+_EXPORT_SECRETISH_EXACT_NAMES = frozenset({
+    ".env",
+    "auth.json",
+    "auth.lock",
+})
+
+_EXPORT_SECRETISH_SUFFIXES = (
+    ".pem",
+    ".key",
+    ".p12",
+    ".pfx",
+)
 
 # Names that cannot be used as profile aliases
 _RESERVED_NAMES = frozenset({
@@ -1239,11 +1279,19 @@ def _default_export_ignore(root_dir: Path):
     def _ignore(directory: str, contents: list) -> set:
         ignored: set = set()
         for entry in contents:
+            entry_lower = entry.lower()
             # Universal exclusions (any depth)
             if entry == "__pycache__" or entry.endswith((".sock", ".tmp")):
                 ignored.add(entry)
             # npm lockfiles can appear at root
             elif entry in {"package.json", "package-lock.json"}:
+                ignored.add(entry)
+            elif (
+                entry in _EXPORT_SECRETISH_EXACT_NAMES
+                or entry.startswith(".env")
+                or entry_lower.endswith(_EXPORT_SECRETISH_SUFFIXES)
+                or any(part in entry_lower for part in _EXPORT_SECRETISH_NAME_SUBSTRINGS)
+            ):
                 ignored.add(entry)
         # Root-level exclusions
         if Path(directory) == root_dir:
@@ -1280,6 +1328,7 @@ def export_profile(name: str, output_path: str) -> Path:
                 profile_dir,
                 staged,
                 ignore=_default_export_ignore(profile_dir),
+                ignore_dangling_symlinks=True,
             )
             result = shutil.make_archive(base, "gztar", tmpdir, "default")
             return Path(result)
