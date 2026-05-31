@@ -185,6 +185,39 @@ class TestCreateProfile:
         assert (profile_dir / ".env").read_text() == "KEY=val"
         assert (profile_dir / "SOUL.md").read_text() == "Be helpful."
 
+    def test_clone_config_tightens_env_permissions(self, profile_env):
+        tmp_path = profile_env
+        default_home = tmp_path / ".hermes"
+        env = default_home / ".env"
+        env.write_text("KEY=val")
+        env.chmod(0o644)
+
+        profile_dir = create_profile("coder", clone_config=True, no_alias=True)
+
+        assert oct((profile_dir / ".env").stat().st_mode & 0o777) == "0o600"
+
+    def test_clone_config_does_not_copy_runtime_state(self, profile_env):
+        tmp_path = profile_env
+        default_home = tmp_path / ".hermes"
+        (default_home / "config.yaml").write_text("model: test")
+        (default_home / "state.db").write_text("state")
+        (default_home / "sessions").mkdir(exist_ok=True)
+        (default_home / "sessions" / "session.json").write_text("session")
+        (default_home / "cron").mkdir(exist_ok=True)
+        (default_home / "cron" / "jobs.json").write_text("jobs")
+        (default_home / "logs").mkdir(exist_ok=True)
+        (default_home / "logs" / "gateway.log").write_text("log")
+        (default_home / "auth.json").write_text("{}")
+
+        profile_dir = create_profile("coder", clone_config=True, no_alias=True)
+
+        assert (profile_dir / "config.yaml").read_text() == "model: test"
+        assert not (profile_dir / "state.db").exists()
+        assert not (profile_dir / "sessions" / "session.json").exists()
+        assert not (profile_dir / "cron" / "jobs.json").exists()
+        assert not (profile_dir / "logs" / "gateway.log").exists()
+        assert not (profile_dir / "auth.json").exists()
+
     def test_clone_config_copies_source_skills(self, profile_env):
         tmp_path = profile_env
         default_home = tmp_path / ".hermes"
