@@ -1870,7 +1870,8 @@ def text_to_speech_tool(
     # and needs ffmpeg for conversion.
     from gateway.session_context import get_session_env
     platform = get_session_env("HERMES_SESSION_PLATFORM", "").lower()
-    want_opus = (platform == "telegram")
+    cron_delivery_platform = get_session_env("HERMES_CRON_AUTO_DELIVER_PLATFORM", "").lower()
+    want_opus = (platform == "telegram" or cron_delivery_platform == "telegram")
 
     # Determine output path
     if output_path:
