@@ -78,15 +78,16 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("save", "Save the current conversation", "Session",
                cli_only=True),
     CommandDef("retry", "Retry the last message (resend to agent)", "Session"),
-    CommandDef("undo", "Remove the last user/assistant exchange", "Session"),
+    CommandDef("undo", "Back up N user turns and re-prompt (default 1)", "Session",
+               args_hint="[N]"),
     CommandDef("title", "Set a title for the current session", "Session",
                args_hint="[name]"),
     CommandDef("handoff", "Hand off this session to a messaging platform (Telegram, Discord, etc.)", "Session",
                args_hint="<platform>", cli_only=True),
     CommandDef("branch", "Branch the current session (explore a different path)", "Session",
                aliases=("fork",), args_hint="[name]"),
-    CommandDef("compress", "Manually compress conversation context", "Session",
-               args_hint="[focus topic]"),
+    CommandDef("compress", "Compress conversation context (add 'here [N]' to keep recent N turns)", "Session",
+               args_hint="[here [N] | focus topic]"),
     CommandDef("nah", "Summarize the previous assistant reply as briefly as possible", "Session",
                aliases=("tldr", "tl-dr", "tl_dr"), args_hint="[style]"),
     CommandDef("rollback", "List or restore filesystem checkpoints", "Session",
@@ -1074,22 +1075,36 @@ def slack_native_slashes() -> list[tuple[str, str, str]]:
         entries.append((slack_name, desc[:140], hint[:100]))
         seen.add(slack_name)
 
-    # First pass: canonical names (so they win slots if we hit the cap).
+    # Slack only allows 50 slash commands per app. Keep parity with the
+    # curated Telegram menu first, then reserve the few Matt-critical aliases
+    # that are faster than their canonical forms. Everything else remains
+    # reachable through /hermes <command>.
+    telegram_priority = [name for name, _desc in telegram_bot_commands()]
+    telegram_norm_priority = {name.replace("_", "-") for name in telegram_priority}
+    priority_aliases = ("reset", "bg", "btw", "q")
+
     for cmd in COMMAND_REGISTRY:
         if not _is_gateway_available(cmd, overrides):
             continue
-        _add(cmd.name, cmd.description, cmd.args_hint or "")
+        if _sanitize_telegram_name(cmd.name) in telegram_priority or cmd.name in telegram_norm_priority:
+            _add(cmd.name, cmd.description, cmd.args_hint or "")
 
-    # Second pass: aliases.
+    for alias in priority_aliases:
+        cmd = resolve_command(alias)
+        if not cmd or not _is_gateway_available(cmd, overrides):
+            continue
+        _add(alias, f"Alias for /{cmd.name} — {cmd.description}", cmd.args_hint or "")
+
+    # Fill any remaining slots with other aliases, canonical commands, then
+    # plugins. This normally only runs if Slack raises its cap or the curated
+    # Telegram menu shrinks.
     for cmd in COMMAND_REGISTRY:
         if not _is_gateway_available(cmd, overrides):
             continue
         for alias in cmd.aliases:
-            # Skip aliases that only differ from canonical by case/punctuation
-            # normalization (already covered by _add dedup).
             _add(alias, f"Alias for /{cmd.name} — {cmd.description}", cmd.args_hint or "")
+        _add(cmd.name, cmd.description, cmd.args_hint or "")
 
-    # Third pass: plugin commands.
     for name, description, args_hint in _iter_plugin_command_entries():
         _add(name, description, args_hint or "")
 
