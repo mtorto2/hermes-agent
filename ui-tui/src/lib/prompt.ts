@@ -1,5 +1,23 @@
 const TERMUX_SAFE_PROMPT = '>'
 
+export function profilePromptLabel(profileName?: null | string): null | string {
+  const normalized = (profileName ?? '').trim().toLowerCase()
+
+  if (!normalized || normalized === 'default' || normalized === 'custom') {
+    return null
+  }
+
+  if (normalized === 'business' || normalized === 'tate') {
+    return 'Tate'
+  }
+
+  if (normalized === 'personal' || normalized === 'aurelius') {
+    return 'Aurelius'
+  }
+
+  return profileName?.trim() || null
+}
+
 export function composerPromptText(
   prompt: string,
   profileName?: null | string,
@@ -11,6 +29,8 @@ export function composerPromptText(
     return '$'
   }
 
+  const profileLabel = profilePromptLabel(profileName)
+
   if (termuxMode) {
     // Termux fonts/terminal backends can render decorative prompt glyphs with
     // ambiguous width; keep the live composer marker strictly single-cell ASCII
@@ -20,15 +40,15 @@ export function composerPromptText(
     // On very wide panes we can still include profile context. On narrow/mobile
     // panes this burns precious columns and increases wrap/clipping risk.
     const wideEnoughForProfile = typeof totalCols === 'number' ? totalCols >= 90 : false
-    if (wideEnoughForProfile && profileName && !['default', 'custom'].includes(profileName)) {
-      return `${profileName} ${basePrompt}`
+    if (wideEnoughForProfile && profileLabel) {
+      return `${profileLabel} ${basePrompt}`
     }
 
     return basePrompt
   }
 
-  if (profileName && !['default', 'custom'].includes(profileName)) {
-    return `${profileName} ${prompt}`
+  if (profileLabel) {
+    return `${profileLabel} ${prompt}`
   }
 
   return prompt
