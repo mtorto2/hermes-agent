@@ -15,7 +15,7 @@ from typing import Any, Callable, Protocol
 
 from agent.wiz_light import WiZLightCueBackend, WiZLightCueConfig
 
-from hermes_constants import get_hermes_home
+from hermes_constants import get_default_hermes_root, get_hermes_home
 
 logger = logging.getLogger(__name__)
 
@@ -233,7 +233,18 @@ class SlotStatusFileBackend:
 
     @staticmethod
     def _default_directory_for_process() -> Path:
-        base = Path(get_hermes_home()) / "agent-lights"
+        """Return the shared Agent Lights status directory.
+
+        Agent Lights is a cross-profile local status surface: the menu-bar app
+        watches the root Hermes home, while profile sessions run with
+        ``HERMES_HOME=~/.hermes/profiles/<name>``.  Use the default Hermes root
+        for slot files so default/Hermes, Tate/business, and Aurelius/personal
+        all appear in the same four-circle surface.  Keep an env override for
+        tests and unusual deployments.
+        """
+        raw_override = os.environ.get("HERMES_AGENT_LIGHTS_HOME", "").strip()
+        base_home = Path(raw_override) if raw_override else get_default_hermes_root()
+        base = base_home / "agent-lights"
         if os.environ.get("HERMES_KANBAN_TASK"):
             return base / "agents"
         return base / "slots"

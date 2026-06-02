@@ -576,6 +576,24 @@ def test_slot_status_file_backend_auto_assigns_first_available_slot(tmp_path, mo
     assert (tmp_path / "agent-lights" / "slots" / "1.lock").exists()
 
 
+def test_slot_status_file_backend_profile_home_writes_to_shared_root(tmp_path, monkeypatch):
+    profile_home = tmp_path / "profiles" / "business"
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    monkeypatch.setenv("HERMES_PROFILE", "business")
+    monkeypatch.delenv("HERMES_SLOT", raising=False)
+
+    backend = SlotStatusFileBackend.from_env(auto_assign=True)
+
+    assert backend is not None
+    assert backend.slot == 1
+    assert (tmp_path / "agent-lights" / "slots" / "1.lock").exists()
+    assert not (profile_home / "agent-lights" / "slots" / "1.lock").exists()
+    assert backend.emit_event(LightCueEvent.IDLE) is True
+    payload = json.loads((tmp_path / "agent-lights" / "slots" / "1.json").read_text(encoding="utf-8"))
+    assert payload["profile"] == "business"
+    assert payload["state"] == "idle"
+
+
 def test_slot_status_file_backend_auto_assign_skips_live_lock_claim(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.delenv("HERMES_SLOT", raising=False)
