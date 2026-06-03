@@ -300,6 +300,27 @@ class TestFormatFooter:
         bullet_lines = [ln for ln in lines if ln.lstrip().startswith("•")]
         assert len(bullet_lines) == 11  # 10 shown + 1 summary
 
+    def test_file_changed_after_failed_patch_is_not_reported(self, tmp_path):
+        """If another approved tool fixes the file later in the same turn,
+        the verifier must not keep claiming the target was not modified."""
+        target = tmp_path / "config.yaml"
+        target.write_text("approvals:\n  mode: manual\n")
+
+        agent = _bare_agent()
+        agent._record_file_mutation_result(
+            "patch",
+            {"mode": "replace", "path": str(target), "old_string": "missing", "new_string": "x"},
+            json.dumps({"error": "Refusing to write to Hermes config file"}),
+            is_error=True,
+        )
+        failed = getattr(agent, "_turn_failed_file_mutations")
+        assert str(target) in failed
+
+        target.write_text("approvals:\n  mode: smart\n")
+
+        out = AIAgent._format_file_mutation_failure_footer(failed)
+        assert out == ""
+
     def test_paths_are_backtick_wrapped(self):
         """Footer paths must be inline-code wrapped so the gateway's bare-path
         media extractor can't auto-attach them (#35584 defense-in-depth)."""
