@@ -32,7 +32,12 @@ public struct SlotStatus: Equatable {
     }
 
     public var menuDetail: String {
-        "\(slotLetter): \(displayModelName) - \(state.menuLabel)"
+        menuDetail(displayName: nil)
+    }
+
+    public func menuDetail(displayName: String?) -> String {
+        let label = trimmed(displayName) ?? displayModelName
+        return "\(slotLetter): \(label) - \(state.menuLabel)"
     }
 
     public var terminalTabTitle: String {
@@ -205,8 +210,10 @@ public struct SlotStatusMenuModel: Equatable {
         self.init(hermesStatuses: hermesStatuses, agentStatuses: agentStatuses, agentCount: agentCount)
     }
 
-    public init(hermesStatuses: [SlotStatus], agentStatuses: [SlotStatus], agentCount: Int? = nil) {
-        let hermesRows = hermesStatuses.map(\.menuDetail)
+    public init(hermesStatuses: [SlotStatus], agentStatuses: [SlotStatus], agentCount: Int? = nil, hermesDisplayNames: [Int: String] = [:]) {
+        let hermesRows = hermesStatuses.map { status in
+            status.menuDetail(displayName: hermesDisplayNames[status.slot])
+        }
         let agentRows = agentStatuses.map(\.agentMenuDetail)
         let resolvedAgentCount = agentCount ?? agentStatuses.count
         self.rowTitles = hermesRows + agentRows
@@ -479,66 +486,6 @@ public enum TerminalFocusScript {
         end tell
         return false
         """
-    }
-}
-
-public enum TerminalTabTitleScript {
-    public static func script(forTTY tty: String, title: String) -> String? {
-        let trimmedTTY = tty.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard trimmedTTY.range(of: #"^ttys[0-9]+$"#, options: .regularExpression) != nil else {
-            return nil
-        }
-        let trimmedTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmedTitle.isEmpty else { return nil }
-        let terminalTTY = "/dev/\(trimmedTTY)"
-        let escapedTTY = appleScriptEscaped(terminalTTY)
-        let titleCommand = "/usr/bin/printf "
-            + shellSingleQuoted("\\033]1;\(trimmedTitle)\\007")
-            + " > "
-            + shellSingleQuoted(terminalTTY)
-        let escapedCommand = appleScriptEscaped(titleCommand)
-        return """
-        tell application "Terminal"
-            repeat with w in windows
-                repeat with t in tabs of w
-                    if tty of t is "\(escapedTTY)" then
-                        try
-                            set title displays custom title of t to false
-                        end try
-                        try
-                            set custom title of t to ""
-                        end try
-                        try
-                            set title displays device name of t to false
-                        end try
-                        try
-                            set title displays shell path of t to false
-                        end try
-                        try
-                            set title displays window size of t to false
-                        end try
-                        try
-                            set title displays file name of t to false
-                        end try
-                        do shell script "\(escapedCommand)"
-                        return true
-                    end if
-                end repeat
-            end repeat
-        end tell
-        return false
-        """
-    }
-
-    private static func appleScriptEscaped(_ value: String) -> String {
-        value
-            .replacingOccurrences(of: "\\", with: "\\\\")
-            .replacingOccurrences(of: "\"", with: "\\\"")
-            .replacingOccurrences(of: "\n", with: " ")
-    }
-
-    private static func shellSingleQuoted(_ value: String) -> String {
-        "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 }
 

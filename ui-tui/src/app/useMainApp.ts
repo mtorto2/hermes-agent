@@ -21,7 +21,7 @@ import { useGitBranch } from '../hooks/useGitBranch.js'
 import { useVirtualHistory } from '../hooks/useVirtualHistory.js'
 import { composerPromptWidth } from '../lib/inputMetrics.js'
 import { appendTranscriptMessage } from '../lib/messages.js'
-import { buildHermesTerminalTitle } from '../lib/terminalTitle.js'
+import { buildHermesTerminalTitle, shouldUseHermesTerminalTitle } from '../lib/terminalTitle.js'
 import { DEFAULT_VOICE_RECORD_KEY, isMac, type ParsedVoiceRecordKey } from '../lib/platform.js'
 import { asRpcResult, rpcErrorMessage } from '../lib/rpc.js'
 import { terminalParityHints } from '../lib/terminalParity.js'
@@ -533,13 +533,17 @@ export function useMainApp(gw: GatewayClient) {
 
   const tabCwd = ui.info?.cwd
 
+  const tabSlot = process.env.HERMES_SLOT
+
   useTerminalTitle(
-    buildHermesTerminalTitle({
-      cwd: tabCwd,
-      marker,
-      model,
-      slot: process.env.HERMES_SLOT,
-    })
+    shouldUseHermesTerminalTitle(tabSlot)
+      ? buildHermesTerminalTitle({
+          cwd: tabCwd,
+          marker,
+          model,
+          slot: tabSlot,
+        })
+      : null
   )
 
   useEffect(() => {

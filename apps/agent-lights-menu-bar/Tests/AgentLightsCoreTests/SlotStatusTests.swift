@@ -77,6 +77,30 @@ final class SlotStatusTests: XCTestCase {
         )
     }
 
+    func testMenuModelUsesManualTerminalDisplayNamesWhenAvailable() throws {
+        let first = try SlotStatus.decode(from: """
+        {"slot":1,"state":"idle","source":"hermes","model_name":"openai/gpt-5.5"}
+        """.data(using: .utf8)!)
+        let second = try SlotStatus.decode(from: """
+        {"slot":2,"state":"working","source":"hermes","model_name":"anthropic/claude-opus-4.8"}
+        """.data(using: .utf8)!)
+
+        let model = SlotStatusMenuModel(
+            hermesStatuses: [first, second],
+            agentStatuses: [],
+            hermesDisplayNames: [2: "Matt · hermes-agent"]
+        )
+
+        XCTAssertEqual(model.rowTitles, [
+            "A: GPT-5.5 - idle",
+            "B: Matt · hermes-agent - working",
+        ])
+        XCTAssertEqual(
+            model.tooltip,
+            "Hermes: 2 active  Agents: 0 active\nA: GPT-5.5 - idle\nB: Matt · hermes-agent - working"
+        )
+    }
+
     func testHermesStatusesCanBeOrderedByTerminalTabTtyInsteadOfSlotNumber() throws {
         let firstSlot = try SlotStatus.decode(from: """
         {"slot":1,"state":"final_answer","pid":101,"source":"hermes","model_name":"openai/gpt-5.5"}
@@ -120,19 +144,6 @@ final class SlotStatusTests: XCTestCase {
         """.data(using: .utf8)!)
 
         XCTAssertEqual(status.terminalTabTitle, "Hermes B")
-    }
-
-    func testTerminalTabTitleScriptSetsExactOscTitleForMatchingTTYOnly() {
-        let script = TerminalTabTitleScript.script(forTTY: "ttys001", title: "Hermes B")
-
-        XCTAssertNotNil(script)
-        XCTAssertTrue(script?.contains("if tty of t is \"/dev/ttys001\"") == true)
-        XCTAssertTrue(script?.contains("set title displays custom title of t to false") == true)
-        XCTAssertTrue(script?.contains("set custom title of t to \"\"") == true)
-        XCTAssertTrue(script?.contains("do shell script \"/usr/bin/printf") == true)
-        XCTAssertTrue(script?.contains("Hermes B") == true)
-        XCTAssertTrue(script?.contains("/dev/ttys001") == true)
-        XCTAssertNil(TerminalTabTitleScript.script(forTTY: "../../bad", title: "B"))
     }
 
     func testSlotContextProvidesExpandableMenuRows() throws {

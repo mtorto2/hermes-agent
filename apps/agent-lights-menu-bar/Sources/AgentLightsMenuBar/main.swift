@@ -10,11 +10,10 @@ private final class StatusRowAction: NSObject {
     }
 }
 
-private struct TerminalTabTitleSyncRequest {
-    let slot: Int
-    let pid: Int
-    let title: String
-    let cacheKey: String
+private func trimmed(_ value: String?) -> String? {
+    guard let value else { return nil }
+    let trimmedValue = value.trimmingCharacters(in: .whitespacesAndNewlines)
+    return trimmedValue.isEmpty ? nil : trimmedValue
 }
 
 @MainActor
@@ -30,11 +29,9 @@ private final class AgentLightsApp: NSObject, NSApplicationDelegate, NSMenuDeleg
     private let slotsDirectory: URL
     private let agentsDirectory: URL
     private let contextDirectory: URL
-    private let tabTitleSyncQueue = DispatchQueue(label: "com.savant.hermes-agent-lights.tab-title-sync", qos: .utility)
     private let subprocessTimeout: TimeInterval = 2.0
     private var terminalTTYOrderCache: (loadedAt: Date, ttys: [String])?
-    private var appliedTerminalTabTitleKeys: [Int: String] = [:]
-    private var pendingTerminalTabTitleSlots: Set<Int> = []
+    private var terminalCustomTitlesCache: (loadedAt: Date, titlesByTTY: [String: String])?
 
     override init() {
         let home = ProcessInfo.processInfo.environment["HERMES_HOME"]
@@ -111,12 +108,19 @@ private final class AgentLightsApp: NSObject, NSApplicationDelegate, NSMenuDeleg
         // but not for visual ordering; Terminal's AppleScript window order changes
         // with focus and made the dots jump around.
         let orderedHermesStatuses = hermesStatuses.sorted { $0.slot < $1.slot }
-        syncTerminalTabTitles(for: orderedHermesStatuses)
+        // Agent Lights must not write Terminal tab titles. Terminal Inspector titles
+        // are user-owned and should persist across Hermes prompts; Agent Lights only
+        // reads manual titles for menu labels and click-to-focus context.
 
         let agentGroup = AgentRingGroup(statuses: allAgentStatuses)
         statusItem.button?.image = DotRenderer.image(for: orderedHermesStatuses, agentGroup: agentGroup)
         removeAgentStatusItemIfPresent()
-        let menuModel = SlotStatusMenuModel(hermesStatuses: orderedHermesStatuses, agentStatuses: allAgentStatuses)
+        let terminalDisplayNames = terminalDisplayNamesBySlot(for: orderedHermesStatuses)
+        let menuModel = SlotStatusMenuModel(
+            hermesStatuses: orderedHermesStatuses,
+            agentStatuses: allAgentStatuses,
+            hermesDisplayNames: terminalDisplayNames
+        )
         statusItem.button?.toolTip = menuModel.tooltip
         statusSummaryItem.title = menuModel.summaryTitle
         let slotContexts = loadSlotContexts(for: orderedHermesStatuses)
@@ -178,6 +182,104 @@ private final class AgentLightsApp: NSObject, NSApplicationDelegate, NSMenuDeleg
             .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
         terminalTTYOrderCache = (loadedAt: now, ttys: ttys)
         return ttys
+    }
+
+    private func terminalDisplayNamesBySlot(for statuses: [SlotStatus]) -> [Int: String] {
+        let titlesByTTY = terminalCustomTitlesByTTY()
+        guard !titlesByTTY.isEmpty else { return [:] }
+        var result: [Int: String] = [:]
+        for status in statuses {
+            guard let pid = status.pid,
+                  let tty = ttyForProcess(pid: pid),
+                  let normalized = normalizedTTY(tty),
+                  let title = titlesByTTY[normalized] else { continue }
+            result[status.slot] = title
+        }
+        return result
+    }
+
+    private func terminalCustomTitlesByTTY() -> [String: String] {
+        let now = Date()
+        if let cache = terminalCustomTitlesCache, now.timeIntervalSince(cache.loadedAt) < 2.0 {
+            return cache.titlesByTTY
+        }
+        let script = """
+        set output to ""
+        set delimiter to ASCII character 9
+        tell application "Terminal"
+            repeat with w in windows
+                repeat with t in tabs of w
+                    try
+                        set tabCustomTitle to custom title of t
+                        set displaysCustom to title displays custom title of t
+                        set windowTitle to name of w
+                        set output to output & (tty of t) & delimiter & displaysCustom & delimiter & tabCustomTitle & delimiter & windowTitle & linefeed
+                    end try
+                end repeat
+            end repeat
+        end tell
+        return output
+        """
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        process.arguments = ["-e", script]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = Pipe()
+        do {
+            try process.run()
+            process.waitUntilExit()
+        } catch {
+            terminalCustomTitlesCache = (loadedAt: now, titlesByTTY: [:])
+            return [:]
+        }
+        guard process.terminationStatus == 0 else {
+            terminalCustomTitlesCache = (loadedAt: now, titlesByTTY: [:])
+            return [:]
+        }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        let output = String(data: data, encoding: .utf8) ?? ""
+        var titlesByTTY: [String: String] = [:]
+        for line in output.split(whereSeparator: \.isNewline).map(String.init) {
+            let parts = line.split(separator: "\t", maxSplits: 3, omittingEmptySubsequences: false)
+            guard parts.count == 4,
+                  let tty = normalizedTTY(String(parts[0])) else { continue }
+            let displaysCustom = String(parts[1]).trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "true"
+            let tabTitle = trimmed(String(parts[2]))
+            let windowTitle = trimmed(String(parts[3]))
+            if let tabTitle, shouldUseTerminalDisplayName(tabTitle, displaysCustom: displaysCustom) {
+                titlesByTTY[tty] = tabTitle
+            } else if let windowTitle, shouldUseTerminalDisplayName(windowTitle, displaysCustom: false) {
+                titlesByTTY[tty] = windowTitle
+            }
+        }
+        terminalCustomTitlesCache = (loadedAt: now, titlesByTTY: titlesByTTY)
+        return titlesByTTY
+    }
+
+    private func shouldUseTerminalDisplayName(_ title: String, displaysCustom: Bool) -> Bool {
+        if displaysCustom {
+            return true
+        }
+        let trimmedTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedTitle.isEmpty else { return false }
+        let lowerTitle = trimmedTitle.lowercased()
+        if lowerTitle == "terminal" || lowerTitle == "login" || lowerTitle == "bash" || lowerTitle == "zsh" {
+            return false
+        }
+        if trimmedTitle.range(of: #"^((✓|⏳|⚠|V)\s+.*(GPT|Claude|Sonnet|Opus|Haiku).*|Hermes\s+[A-Z])$"#, options: .regularExpression) != nil {
+            return false
+        }
+        return true
+    }
+
+    private func normalizedTTY(_ tty: String) -> String? {
+        let trimmedTTY = tty.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedTTY.isEmpty, trimmedTTY != "??" else { return nil }
+        if trimmedTTY.hasPrefix("/dev/") {
+            return String(trimmedTTY.dropFirst(5))
+        }
+        return trimmedTTY
     }
 
     private func removeAgentStatusItemIfPresent() {
@@ -259,43 +361,6 @@ private final class AgentLightsApp: NSObject, NSApplicationDelegate, NSMenuDeleg
             return
         }
         executeAppleScript(script)
-    }
-
-    private func syncTerminalTabTitles(for statuses: [SlotStatus]) {
-        let requests = statuses.compactMap { status -> TerminalTabTitleSyncRequest? in
-            guard let pid = status.pid else { return nil }
-            let title = status.terminalTabTitle
-            let cacheKey = "\(pid):\(title)"
-            guard appliedTerminalTabTitleKeys[status.slot] != cacheKey,
-                  !pendingTerminalTabTitleSlots.contains(status.slot) else {
-                return nil
-            }
-            pendingTerminalTabTitleSlots.insert(status.slot)
-            return TerminalTabTitleSyncRequest(slot: status.slot, pid: pid, title: title, cacheKey: cacheKey)
-        }
-        guard !requests.isEmpty else { return }
-
-        let timeout = subprocessTimeout
-        tabTitleSyncQueue.async { [weak self] in
-            for request in requests {
-                let succeeded: Bool
-                if let tty = Self.ttyForProcess(pid: request.pid, timeout: timeout),
-                   let script = TerminalTabTitleScript.script(forTTY: tty, title: request.title) {
-                    succeeded = Self.executeAppleScriptReturnsBool(script, timeout: timeout)
-                } else {
-                    succeeded = false
-                }
-                Task { @MainActor [weak self] in
-                    guard let self else { return }
-                    self.pendingTerminalTabTitleSlots.remove(request.slot)
-                    if succeeded {
-                        self.appliedTerminalTabTitleKeys[request.slot] = request.cacheKey
-                    } else if self.appliedTerminalTabTitleKeys[request.slot] == request.cacheKey {
-                        self.appliedTerminalTabTitleKeys.removeValue(forKey: request.slot)
-                    }
-                }
-            }
-        }
     }
 
     private func executeAppleScript(_ script: String) {

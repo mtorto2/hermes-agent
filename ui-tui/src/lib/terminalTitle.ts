@@ -36,6 +36,24 @@ export function displayModelName(model: string | null | undefined): string {
   return leaf.replaceAll('_', ' ')
 }
 
+export function shouldUseHermesTerminalTitle(
+  slot: string | number | null | undefined,
+  termProgram: string | null | undefined = process.env.TERM_PROGRAM
+): boolean {
+  // Terminal.app treats OSC title updates as tab-title writes and they can
+  // clobber a human's Terminal Inspector (⌘I) custom tab title on every
+  // busy/idle transition.  Agent Lights can still apply compact fallback slot
+  // labels for Terminal.app tabs when no manual Inspector title is present, so
+  // the TUI should stay completely out of Terminal.app tab naming.
+  if (String(termProgram ?? '').trim() === 'Apple_Terminal') {
+    return false
+  }
+
+  // Outside Terminal.app, Agent Lights owns slot-backed tab naming.  Leave
+  // those untouched while preserving TUI title updates for ordinary terminals.
+  return !slotLetter(slot)
+}
+
 export function buildHermesTerminalTitle({ cwd, marker, model, slot }: HermesTerminalTitleInput): string {
   const modelLabel = displayModelName(model)
   const letter = slotLetter(slot)
