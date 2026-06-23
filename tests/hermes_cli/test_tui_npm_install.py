@@ -112,6 +112,53 @@ def test_need_install_when_marker_missing(tmp_path: Path, main_mod) -> None:
     assert main_mod._tui_need_npm_install(tmp_path) is True
 
 
+def test_successful_tui_workspace_marker_suppresses_root_workspace_false_positive(
+    tmp_path: Path, main_mod
+) -> None:
+    """A ui-tui-only install must not be invalidated by unrelated root packages.
+
+    Desktop TUI launch runs ``npm install --workspace ui-tui``. The root
+    package-lock can still list apps/desktop or web packages that are not in
+    the hidden lockfile after that scoped install; once the scoped install has
+    succeeded, the marker is the source of truth until relevant manifests
+    change.
+    """
+    tui_dir = tmp_path / "ui-tui"
+    tui_dir.mkdir()
+    (tui_dir / "package.json").write_text("{}")
+    _touch_ink(tmp_path)
+    (tmp_path / "package-lock.json").write_text(
+        '{"packages":{"apps/desktop":{"version":"1.0.0"},"node_modules/foo":{"version":"1.0.0"}}}'
+    )
+    (tmp_path / "node_modules" / ".package-lock.json").write_text(
+        '{"packages":{"node_modules/foo":{"version":"1.0.0"}}}'
+    )
+    main_mod._write_tui_install_marker(tui_dir)
+
+    assert main_mod._tui_need_npm_install(tui_dir) is False
+
+
+def test_tui_workspace_marker_invalidates_when_lockfile_changes(
+    tmp_path: Path, main_mod
+) -> None:
+    tui_dir = tmp_path / "ui-tui"
+    tui_dir.mkdir()
+    (tui_dir / "package.json").write_text("{}")
+    _touch_ink(tmp_path)
+    (tmp_path / "package-lock.json").write_text(
+        '{"packages":{"node_modules/foo":{"version":"1.0.0"}}}'
+    )
+    (tmp_path / "node_modules" / ".package-lock.json").write_text(
+        '{"packages":{"node_modules/foo":{"version":"1.0.0"}}}'
+    )
+    main_mod._write_tui_install_marker(tui_dir)
+    (tmp_path / "package-lock.json").write_text(
+        '{"packages":{"node_modules/foo":{"version":"2.0.0"}}}'
+    )
+
+    assert main_mod._tui_need_npm_install(tui_dir) is True
+
+
 def test_no_install_without_lockfile_when_ink_present(tmp_path: Path, main_mod) -> None:
     _touch_ink(tmp_path)
     assert main_mod._tui_need_npm_install(tmp_path) is False

@@ -1237,6 +1237,9 @@ to avoid false-positive reinstalls on every launch.
 """
 
 
+_TUI_INSTALL_MARKER = ".hermes-tui-install.json"
+
+
 def _workspace_root(dir: Path) -> Path:
     """Return the npm workspace root for *dir*.
 
@@ -1262,6 +1265,78 @@ def _workspace_root(dir: Path) -> Path:
     ):
         return dir.parent
     return dir
+
+
+def _tui_install_marker_path(root: Path) -> Path:
+    """Return the per-workspace marker written after a successful TUI install."""
+    return _workspace_root(root) / "node_modules" / _TUI_INSTALL_MARKER
+
+
+def _tui_install_fingerprint(root: Path) -> str:
+    """Fingerprint files that should invalidate a TUI workspace install.
+
+    The TUI launch only runs ``npm install --workspace ui-tui`` in desktop
+    mode. npm's hidden lockfile is workspace-root scoped and may not include
+    desktop/web packages when only the TUI workspace was installed. A successful
+    install marker prevents those unrelated root-workspace packages from
+    triggering a false-positive reinstall on every launch, while this
+    fingerprint still invalidates after lockfile or TUI manifest changes.
+    """
+    ws_root = _workspace_root(root)
+    h = hashlib.sha256()
+    candidates = [
+        ws_root / "package-lock.json",
+        ws_root / "package.json",
+        root / "package.json",
+    ]
+    packages_dir = root / "packages"
+    if packages_dir.is_dir():
+        for child in sorted(packages_dir.iterdir()):
+            if child.is_dir():
+                candidates.append(child / "package.json")
+    for path in candidates:
+        try:
+            label = path.relative_to(ws_root).as_posix()
+        except ValueError:
+            label = str(path)
+        h.update(label.encode("utf-8"))
+        h.update(b"\0")
+        try:
+            h.update(path.read_bytes())
+        except OSError:
+            h.update(b"<missing>")
+        h.update(b"\0")
+    return h.hexdigest()
+
+
+def _tui_install_marker_matches(root: Path) -> bool:
+    try:
+        data = json.loads(_tui_install_marker_path(root).read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    return data.get("fingerprint") == _tui_install_fingerprint(root)
+
+
+def _write_tui_install_marker(root: Path) -> None:
+    marker = _tui_install_marker_path(root)
+    try:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "fingerprint": _tui_install_fingerprint(root),
+                    "workspace": str(_workspace_root(root)),
+                },
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+    except OSError:
+        # Marker is an optimization only. If it cannot be written, keep launch
+        # functional and fall back to lockfile checks next time.
+        pass
 
 
 def _termux_workspace_install_context(
@@ -1333,6 +1408,8 @@ def _tui_need_npm_install(root: Path) -> bool:
     ink = ws_root / "node_modules" / "@hermes" / "ink" / "package.json"
     if not ink.is_file():
         return True
+    if _tui_install_marker_matches(root):
+        return False
     if not lock.is_file():
         return False
     marker = ws_root / "node_modules" / ".package-lock.json"
@@ -1602,6 +1679,7 @@ def _make_tui_argv(tui_dir: Path, tui_dev: bool) -> tuple[list[str], Path]:
                 print(preview)
             sys.exit(1)
         did_install = True
+        _write_tui_install_marker(tui_dir)
 
     if tui_dev:
         # Keep the local @hermes/ink package exports in sync with source.
