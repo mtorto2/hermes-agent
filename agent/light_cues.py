@@ -224,7 +224,7 @@ class SlotStatusFileBackend:
             slot = int(raw_slot)
         except ValueError:
             slot = 0
-        if slot in {1, 2, 3, 4}:
+        if slot in cls._valid_slots(resolved_directory):
             return cls._with_exit_cleanup(cls(slot=slot, directory=resolved_directory, model_name=model_name))
         if not auto_assign:
             return None
@@ -255,16 +255,26 @@ class SlotStatusFileBackend:
         return backend
 
     @classmethod
+    def _valid_slots(cls, directory: Path) -> range:
+        return range(1, cls._slot_capacity(directory) + 1)
+
+    @classmethod
+    def _slot_capacity(cls, directory: Path) -> int:
+        if os.environ.get("HERMES_KANBAN_TASK") or directory.name == "agents":
+            return 8
+        return 4
+
+    @classmethod
     def _claim_available_slot(cls, directory: Path) -> int | None:
         """Atomically claim the current process's slot or the first free slot."""
         directory.mkdir(parents=True, exist_ok=True)
         current_pid = os.getpid()
-        for slot in range(1, 5):
+        for slot in cls._valid_slots(directory):
             if cls._slot_pid_matches(directory / f"{slot}.json", current_pid) or cls._slot_pid_matches(
                 cls._lock_path(directory, slot), current_pid
             ):
                 return slot
-        for slot in range(1, 5):
+        for slot in cls._valid_slots(directory):
             path = directory / f"{slot}.json"
             lock_path = cls._lock_path(directory, slot)
             if not cls._slot_is_available(path, lock_path=lock_path):
@@ -479,10 +489,26 @@ class SlotStatusFileBackend:
         return True
 
     def clear_if_owned(self) -> bool:
-        """Remove this process's slot and lock files during normal shutdown."""
+        """Release this process's Agent Lights files during normal shutdown."""
         removed = False
+        slot_path = self._directory / f"{self.slot}.json"
+        if self._slot_pid_matches(slot_path, os.getpid()):
+            payload = self._slot_payload(slot_path) or {}
+            preserve_terminal_kanban_state = payload.get("source") == "kanban_worker" and payload.get("state") in {
+                LightCueEvent.FINAL_ANSWER.value,
+                LightCueEvent.HUMAN_INTERVENTION.value,
+                LightCueEvent.ERROR.value,
+            }
+            if not preserve_terminal_kanban_state:
+                try:
+                    slot_path.unlink()
+                    removed = True
+                except FileNotFoundError:
+                    pass
+                except OSError as exc:
+                    logger.debug("Failed to clear Agent Lights slot file %s: %s", slot_path, exc)
+
         for path in (
-            self._directory / f"{self.slot}.json",
             self._lock_path(self._directory, self.slot),
             self._directory.parent / "context" / f"{self.slot}.json",
         ):

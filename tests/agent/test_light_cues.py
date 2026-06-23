@@ -406,6 +406,26 @@ def test_slot_status_backend_clears_owned_slot_and_lock(tmp_path, monkeypatch):
     assert not lock_path.exists()
 
 
+def test_kanban_worker_clear_preserves_terminal_slot_status_but_releases_lock(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_done1234")
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "hermes-agent")
+    agents = tmp_path / "agent-lights" / "agents"
+    backend = SlotStatusFileBackend(slot=1, directory=agents)
+    assert backend.emit_event(LightCueEvent.FINAL_ANSWER) is True
+    slot_path = agents / "1.json"
+    lock_path = agents / "1.lock"
+    lock_path.write_text(slot_path.read_text(encoding="utf-8"), encoding="utf-8")
+
+    assert backend.clear_if_owned() is True
+
+    payload = json.loads(slot_path.read_text(encoding="utf-8"))
+    assert payload["source"] == "kanban_worker"
+    assert payload["state"] == "final_answer"
+    assert payload["kanban_task_id"] == "t_done1234"
+    assert not lock_path.exists()
+
+
 def test_slot_status_backend_does_not_clear_unowned_slot(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     backend = SlotStatusFileBackend(slot=1)
@@ -664,6 +684,26 @@ def test_slot_status_file_backend_auto_assign_caps_at_four_live_slots(tmp_path, 
     monkeypatch.setattr(SlotStatusFileBackend, "_pid_is_running", staticmethod(lambda pid: True))
 
     assert SlotStatusFileBackend.from_env(auto_assign=True) is None
+
+
+def test_kanban_worker_auto_assign_uses_eight_agent_slots(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv("HERMES_SLOT", raising=False)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_slot5")
+    agents = tmp_path / "agent-lights" / "agents"
+    agents.mkdir(parents=True)
+    for slot in range(1, 5):
+        (agents / f"{slot}.json").write_text(
+            json.dumps({"slot": slot, "pid": 100 + slot, "state": "working", "source": "kanban_worker"}),
+            encoding="utf-8",
+        )
+    monkeypatch.setattr(SlotStatusFileBackend, "_pid_is_running", staticmethod(lambda pid: 100 < pid < 105))
+
+    backend = SlotStatusFileBackend.from_env(auto_assign=True)
+
+    assert backend is not None
+    assert backend.slot == 5
+    assert (agents / "5.lock").exists()
 
 
 def test_light_cue_service_retries_slot_claim_when_capacity_frees(tmp_path, monkeypatch):
