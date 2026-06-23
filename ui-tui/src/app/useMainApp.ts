@@ -174,6 +174,7 @@ export function useMainApp(gw: GatewayClient) {
   const [voiceRecordKey, setVoiceRecordKey] = useState<ParsedVoiceRecordKey>(DEFAULT_VOICE_RECORD_KEY)
   const [sessionStartedAt, setSessionStartedAt] = useState(() => Date.now())
   const [turnStartedAt, setTurnStartedAt] = useState<null | number>(null)
+  const [lastTurnEndedAt, setLastTurnEndedAt] = useState<null | number>(null)
   const [goodVibesTick, setGoodVibesTick] = useState(0)
   const [bellOnComplete, setBellOnComplete] = useState(false)
 
@@ -501,10 +502,14 @@ export function useMainApp(gw: GatewayClient) {
   useEffect(() => {
     if (ui.busy) {
       setTurnStartedAt(prev => prev ?? Date.now())
-    } else {
+    } else if (turnStartedAt != null) {
+      // Only stamp the idle marker when a turn was actually live — busy is
+      // also false on mount and we don't want a phantom "done" timestamp
+      // before the first turn has completed.
+      setLastTurnEndedAt(Date.now())
       setTurnStartedAt(null)
     }
-  }, [ui.busy])
+  }, [ui.busy, turnStartedAt])
 
   useConfigSync({ gw, setBellOnComplete, setVoiceEnabled, setVoiceRecordKey, sid: ui.sid })
 
@@ -525,12 +530,22 @@ export function useMainApp(gw: GatewayClient) {
           if (!stopped && result?.sessions) {
             const liveSessionCount = result.sessions.length
 
-            // Only patch when the count actually changed. patchUiState always
+            // Surface the current session's (auto-)title for the terminal
+            // titlebar. The active_list poll already carries it, so no extra
+            // round-trip is needed.
+            const currentSid = getUiState().sid
+
+            const sessionTitle =
+              result.sessions.find(s => s.current || s.id === currentSid)?.title?.trim() ?? ''
+
+            // Only patch when something actually changed. patchUiState always
             // produces a new state object, which notifies every $uiState
             // subscriber; patching unconditionally on each 1.5s poll re-renders
             // the whole TUI and causes idle flicker.
-            if (getUiState().liveSessionCount !== liveSessionCount) {
-              patchUiState({ liveSessionCount })
+            const prev = getUiState()
+
+            if (prev.liveSessionCount !== liveSessionCount || prev.sessionTitle !== sessionTitle) {
+              patchUiState({ liveSessionCount, sessionTitle })
             }
           }
         })
@@ -547,6 +562,7 @@ export function useMainApp(gw: GatewayClient) {
   }, [gw, ui.sid])
 
   // Tab title: `⚠` waiting on approval/sudo/secret/clarify, `⏳` busy, `✓` idle.
+  // Format: `<marker> <session name> · <model> · <cwd>` — name/cwd omitted when absent.
   const model = ui.info?.model?.replace(/^.*\//, '') ?? ''
 
   const marker = overlay.approval || overlay.sudo || overlay.secret || overlay.clarify ? '⚠' : ui.busy ? '⏳' : '✓'
@@ -827,6 +843,7 @@ export function useMainApp(gw: GatewayClient) {
         composer: {
           enqueue: composerActions.enqueue,
           hasSelection,
+          openEditor: composerActions.openEditor,
           paste,
           queueRef: composerRefs.queueRef,
           selection,
@@ -1089,6 +1106,7 @@ export function useMainApp(gw: GatewayClient) {
       // essentials and truncates this further on narrow terminals.
       cwdLabel: fmtCwdBranch(cwd, gitBranch, 28),
       goodVibesTick,
+      lastTurnEndedAt: ui.sid ? lastTurnEndedAt : null,
       sessionStartedAt: ui.sid ? sessionStartedAt : null,
       showStickyPrompt: !!stickyPrompt,
       statusColor: statusColorOf(ui.status, ui.theme.color),
@@ -1102,6 +1120,7 @@ export function useMainApp(gw: GatewayClient) {
       cwd,
       gitBranch,
       goodVibesTick,
+      lastTurnEndedAt,
       sessionStartedAt,
       stickyPrompt,
       turnStartedAt,

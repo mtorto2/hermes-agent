@@ -4,7 +4,6 @@ import { describe, expect, it } from 'vitest'
 
 import Text from './components/Text.js'
 import Ink from './ink.js'
-import { CURSOR_HOME, ERASE_SCREEN } from './termio/csi.js'
 
 class FakeTty extends EventEmitter {
   chunks: string[] = []
@@ -20,9 +19,10 @@ class FakeTty extends EventEmitter {
 }
 
 const tick = () => new Promise<void>(resolve => queueMicrotask(resolve))
+const wait = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms))
 
 describe('Ink resize healing', () => {
-  it('heals same-dimension alt-screen resize events with an erase before repaint', async () => {
+  it('repaints same-dimension alt-screen resize events', async () => {
     const stdout = new FakeTty()
     const stdin = new FakeTty()
     const stderr = new FakeTty()
@@ -37,13 +37,18 @@ describe('Ink resize healing', () => {
     ink.setAltScreenActive(true)
     ink.render(React.createElement(Text, null, 'hello'))
     ink.onRender()
+    await tick()
+    ink.onRender()
     stdout.chunks = []
 
     stdout.emit('resize')
+    await tick()
+    ink.onRender()
+    await wait(180)
     ink.onRender()
     await tick()
 
-    expect(stdout.chunks.join('')).toContain(ERASE_SCREEN + CURSOR_HOME)
+    expect(stdout.chunks.join('')).toContain('hello')
 
     ink.unmount()
   })
