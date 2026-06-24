@@ -19,6 +19,9 @@ export default defineConfig({
     // present." Pinning the config makes the build hermetic.
     postcss: { plugins: [] }
   },
+  test: {
+    setupFiles: ['./src/test/setup.ts']
+  },
   build: {
     // Keep desktop packaging stable: Shiki ships many dynamic chunks by
     // default, and electron-builder can OOM scanning thousands of files.

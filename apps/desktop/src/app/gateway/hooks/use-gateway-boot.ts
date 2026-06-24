@@ -166,6 +166,8 @@ export function useGatewayBoot({
         if (!cancelled && isGatewayReauthRequired(err) && !reauthNotified) {
           reauthNotified = true
           notifyError(err, translateNow('boot.errors.gatewaySignInRequired'))
+        } else if (!cancelled && reconnectAttempt >= 6 && !$desktopBoot.get().error) {
+          failDesktopBoot('Could not reconnect to Hermes gateway. Use Retry, Sign in, or switch to local gateway.')
         }
       } finally {
         reconnecting = false
