@@ -2,36 +2,69 @@ import { atom, computed } from 'nanostores'
 
 import { MOUSE_TRACKING } from '../config/env.js'
 import { ZERO } from '../domain/usage.js'
-import { DEFAULT_THEME } from '../theme.js'
+import { DEFAULT_THEME, fromSkin } from '../theme.js'
 
 import { DEFAULT_INDICATOR_STYLE, type UiState } from './interfaces.js'
 
-const buildUiState = (): UiState => ({
-  bgTasks: new Set(),
-  busy: false,
-  busyInputMode: 'queue',
-  compact: false,
-  detailsMode: 'collapsed',
-  detailsModeCommandOverride: false,
-  indicatorStyle: DEFAULT_INDICATOR_STYLE,
-  info: null,
-  liveSessionCount: 0,
-  inlineDiffs: true,
-  mouseTracking: MOUSE_TRACKING,
-  notice: null,
-  pasteCollapseLines: 5,
-  pasteCollapseChars: 2000,
-  sections: {},
-  sessionTitle: '',
-  showCost: false,
-  showReasoning: false,
-  sid: null,
-  status: 'summoning hermes…',
-  statusBar: 'top',
-  streaming: true,
-  theme: DEFAULT_THEME,
-  usage: ZERO
-})
+const initialTheme = () => {
+  const raw = process.env.HERMES_TUI_INITIAL_SKIN
+
+  if (!raw) {
+    return DEFAULT_THEME
+  }
+
+  try {
+    const skin = JSON.parse(raw) as {
+      banner_hero?: string
+      banner_logo?: string
+      branding?: Record<string, string>
+      colors?: Record<string, string>
+      help_header?: string
+      tool_prefix?: string
+    }
+
+    return fromSkin(
+      skin.colors ?? {},
+      skin.branding ?? {},
+      skin.banner_logo ?? '',
+      skin.banner_hero ?? '',
+      skin.tool_prefix ?? '',
+      skin.help_header ?? ''
+    )
+  } catch {
+    return DEFAULT_THEME
+  }
+}
+
+const buildUiState = (): UiState => {
+  const theme = initialTheme()
+
+  return ({
+    bgTasks: new Set(),
+    busy: false,
+    busyInputMode: 'queue',
+    compact: false,
+    detailsMode: 'collapsed',
+    detailsModeCommandOverride: false,
+    indicatorStyle: DEFAULT_INDICATOR_STYLE,
+    info: null,
+    liveSessionCount: 0,
+    inlineDiffs: true,
+    mouseTracking: MOUSE_TRACKING,
+    notice: null,
+    pasteCollapseLines: 5,
+    pasteCollapseChars: 2000,
+    sections: {},
+    sessionTitle: '',
+    showReasoning: false,
+    sid: null,
+    status: `summoning ${theme.brand.name.toLowerCase()}…`,
+    statusBar: 'top',
+    streaming: true,
+    theme,
+    usage: ZERO
+  })
+}
 
 export const $uiState = atom<UiState>(buildUiState())
 

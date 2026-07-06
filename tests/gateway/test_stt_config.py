@@ -97,7 +97,9 @@ async def test_enrich_message_with_transcription_avoids_bogus_no_provider_messag
         )
 
     assert "No STT provider is configured" not in result
-    assert "trouble transcribing" in result
+    assert "[voice message could not be transcribed]" in result
+    # The opaque backend cause must NOT leak into the LLM-visible prompt.
+    assert "VOICE_TOOLS_OPENAI_KEY" not in result
     assert "caption" in result
     assert transcripts == []
 
@@ -146,7 +148,7 @@ async def test_prepare_inbound_message_text_transcribes_queued_voice_event():
     from gateway.run import GatewayRunner
 
     runner = GatewayRunner.__new__(GatewayRunner)
-    runner.config = GatewayConfig(stt_enabled=True)
+    runner.config = GatewayConfig(stt_enabled=True, stt_echo_transcripts=False)
     runner.adapters = {}
     runner._model = "test-model"
     runner._base_url = ""
@@ -180,8 +182,10 @@ async def test_prepare_inbound_message_text_transcribes_queued_voice_event():
         )
 
     assert result is not None
+    # Success path: the transcript passes through as a plain quoted line, with
+    # no "voice message" meta-commentary that the LLM would echo back.
     assert "queued voice transcript" in result
-    assert "voice message" in result.lower()
+
     assert runner._voice_transcript_echo_by_session["agent:main:telegram:dm:123"] == [
         "queued voice transcript"
     ]
@@ -237,3 +241,4 @@ async def test_prepare_inbound_message_text_does_not_echo_audio_attachment_trans
     assert result is not None
     assert "audio file attachment" in result
     assert runner._voice_transcript_echo_by_session == {}
+

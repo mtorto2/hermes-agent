@@ -44,6 +44,10 @@ export function composerPromptText(
       return `${profileLabel} ${basePrompt}`
     }
 
+    if (wideEnoughForProfile && profileName && !['default', 'custom'].includes(profileName)) {
+      return `${profileName} ${basePrompt}`
+    }
+
     return basePrompt
   }
 
