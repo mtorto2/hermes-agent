@@ -12,6 +12,7 @@ failure.
 """
 
 import ast
+import importlib
 import pathlib
 
 import hermes_bootstrap
@@ -79,3 +80,45 @@ def test_guard_handles_absolute_cwd_path():
         )
     finally:
         sys.path[:] = original
+
+
+def test_tty_watchdog_exits_when_terminal_backed_gateway_loses_tty(monkeypatch):
+    """A standalone TUI gateway that started with a real tty must exit if it
+    later becomes detached (ps tty ``??``), otherwise Agent Lights keeps drawing
+    a live-PID circle for a Terminal tab that no longer exists.
+    """
+
+    entry = importlib.import_module("tui_gateway.entry")
+    monkeypatch.setattr(entry, "_process_tty", lambda pid=None: "??")
+    monkeypatch.setattr(entry, "_pid_is_running", lambda pid: True)
+
+    assert entry._should_exit_for_lost_terminal(
+        started_with_tty=True,
+        parent_pid=123,
+    ) is True
+
+
+def test_tty_watchdog_preserves_headless_or_currently_attached_gateway(monkeypatch):
+    entry = importlib.import_module("tui_gateway.entry")
+    monkeypatch.setattr(entry, "_process_tty", lambda pid=None: "ttys003")
+    monkeypatch.setattr(entry, "_pid_is_running", lambda pid: True)
+
+    assert entry._should_exit_for_lost_terminal(
+        started_with_tty=True,
+        parent_pid=123,
+    ) is False
+    assert entry._should_exit_for_lost_terminal(
+        started_with_tty=False,
+        parent_pid=123,
+    ) is False
+
+
+def test_tty_watchdog_exits_when_recorded_parent_disappears(monkeypatch):
+    entry = importlib.import_module("tui_gateway.entry")
+    monkeypatch.setattr(entry, "_process_tty", lambda pid=None: "ttys003")
+    monkeypatch.setattr(entry, "_pid_is_running", lambda pid: False)
+
+    assert entry._should_exit_for_lost_terminal(
+        started_with_tty=True,
+        parent_pid=123,
+    ) is True

@@ -452,6 +452,21 @@ def _release_active_session_slot(session: dict | None) -> None:
         logger.debug("Failed to release active session slot", exc_info=True)
 
 
+def _release_agent_lights_slot(session: dict | None) -> None:
+    """Clear this gateway process's Agent Lights slot during session teardown."""
+    if not session:
+        return
+    service = session.get("_light_cue_service")
+    backend = getattr(service, "slot_status_backend", None)
+    clear_if_owned = getattr(backend, "clear_if_owned", None)
+    if not callable(clear_if_owned):
+        return
+    try:
+        clear_if_owned()
+    except Exception:
+        logger.debug("Failed to release Agent Lights slot", exc_info=True)
+
+
 def _transfer_active_session_slot(
     sid: str,
     session: dict,
@@ -518,6 +533,7 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
         return
     session["_finalized"] = True
     _release_active_session_slot(session)
+    _release_agent_lights_slot(session)
     stop_event = session.get("_notif_stop")
     if stop_event is not None:
         stop_event.set()

@@ -1857,6 +1857,32 @@ def test_session_close_commits_memory_and_fires_finalize_hook(monkeypatch):
         server._sessions.pop("sid", None)
 
 
+def test_finalize_session_releases_agent_lights_slot(monkeypatch):
+    """TUI session teardown should clear its Agent Lights slot immediately.
+
+    Orphaned menu-bar circles can survive when a TUI backend process stays
+    alive after the visible Terminal tab is gone. Process exit still has an
+    atexit cleanup, but the session-finalize chokepoint should also release the
+    slot so every orderly TUI close path removes its own light state.
+    """
+
+    calls = []
+
+    class _SlotBackend:
+        def clear_if_owned(self):
+            calls.append("clear")
+            return True
+
+    class _LightService:
+        slot_status_backend = _SlotBackend()
+
+    session = _session(_light_cue_service=_LightService())
+
+    server._finalize_session(session)
+
+    assert calls == ["clear"]
+
+
 def test_ws_orphan_reap_closes_worker_when_session_stays_detached(monkeypatch):
     """A detached WS session past its grace window has its slash_worker closed.
 

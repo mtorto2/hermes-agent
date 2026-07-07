@@ -13,6 +13,8 @@ hermes_bootstrap.harden_import_path()
 import json
 import logging
 import signal
+import subprocess
+import threading
 import time
 import traceback
 
@@ -204,6 +206,82 @@ def _log_exit(reason: str) -> None:
     print(f"[gateway-exit] {reason}", file=sys.stderr, flush=True)
 
 
+def _process_tty(pid: int | None = None) -> str | None:
+    try:
+        completed = subprocess.run(
+            ["/bin/ps", "-o", "tty=", "-p", str(pid or os.getpid())],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=1,
+        )
+    except Exception:
+        return None
+    tty = completed.stdout.strip()
+    return tty or None
+
+
+def _pid_is_running(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except Exception:
+        return False
+
+
+def _should_exit_for_lost_terminal(*, started_with_tty: bool, parent_pid: int) -> bool:
+    """True when a terminal-backed gateway has become detached/orphaned."""
+    if not started_with_tty:
+        return False
+    tty = _process_tty()
+    if tty in {"??", "?"}:
+        return True
+    return not _pid_is_running(parent_pid)
+
+
+def _start_lost_terminal_watchdog() -> None:
+    initial_tty = _process_tty()
+    started_with_tty = initial_tty not in {None, "??", "?"}
+    parent_pid = os.getppid()
+    if not started_with_tty:
+        return
+
+    try:
+        interval = float(os.environ.get("HERMES_TUI_TERMINAL_WATCHDOG_S") or "5")
+    except ValueError:
+        interval = 5.0
+    interval = max(1.0, interval)
+
+    def _watch() -> None:
+        while True:
+            time.sleep(interval)
+            if not _should_exit_for_lost_terminal(
+                started_with_tty=started_with_tty,
+                parent_pid=parent_pid,
+            ):
+                continue
+            _log_exit(
+                "lost controlling terminal or parent "
+                f"(initial_tty={initial_tty!r}, current_tty={_process_tty()!r}, "
+                f"parent_pid={parent_pid})"
+            )
+            try:
+                server._shutdown_sessions()
+            except Exception:
+                pass
+            os._exit(0)
+
+    thread = threading.Thread(target=_watch, name="tui-lost-terminal-watchdog", daemon=True)
+    thread.start()
+
+
 def wait_for_mcp_discovery(timeout: "float | None" = None) -> None:
     """Block until background MCP discovery finishes, up to the resolved bound.
 
@@ -291,6 +369,7 @@ def join_mcp_discovery(timeout: float | None = None) -> bool:
 
 
 def main():
+    _start_lost_terminal_watchdog()
     _install_sidecar_publisher()
 
     # MCP tool discovery — runs in a background daemon thread so a slow or
