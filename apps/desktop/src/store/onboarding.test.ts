@@ -5,11 +5,14 @@ import type { OAuthProvider } from '@/types/hermes'
 
 import {
   $desktopOnboarding,
+  cancelOnboardingFlow,
   type DesktopOnboardingState,
   type OnboardingContext,
   refreshOnboarding,
   requestDesktopOnboarding,
   saveOnboardingLocalEndpoint,
+  setOnboardingCode,
+  startProviderOAuth,
   submitOnboardingCode
 } from './onboarding'
 
@@ -268,6 +271,7 @@ describe('OAuth onboarding', () => {
   })
 
   afterEach(() => {
+    vi.useRealTimers()
     window.localStorage.clear()
     $desktopOnboarding.set(baseState())
     vi.restoreAllMocks()
@@ -276,11 +280,14 @@ describe('OAuth onboarding', () => {
   it('clears stale readiness errors after OAuth succeeds and model confirmation is shown', async () => {
     const model = 'anthropic/claude-opus-4.8'
     const calls: { body?: unknown; path: string }[] = []
+    let submitted = false
 
     installApiMock(async ({ body, path }: { body?: unknown; path: string }) => {
       calls.push({ body, path })
 
       if (path === '/api/providers/oauth/nous/submit') {
+        submitted = true
+
         return { ok: true, status: 'approved' }
       }
 
@@ -317,6 +324,12 @@ describe('OAuth onboarding', () => {
       }
 
       if (method === 'setup.runtime_check') {
+        if (params == null) {
+          return submitted
+            ? ({ ok: true } as never)
+            : ({ ok: false, error: 'Existing runtime is not available.' } as never)
+        }
+
         expect(params).toEqual({ provider: 'nous' })
 
         return { ok: true } as never
@@ -364,6 +377,205 @@ describe('OAuth onboarding', () => {
     expect(optionsIndex).toBeGreaterThanOrEqual(0)
     expect(recommendedIndex).toBeGreaterThan(optionsIndex)
     expect(setIndex).toBeGreaterThan(recommendedIndex)
+  })
+
+  it('preserves a working default through the normal PKCE start flow', async () => {
+    const calls: { body?: unknown; path: string }[] = []
+    const onCompleted = vi.fn()
+
+    vi.spyOn(window, 'open').mockImplementation(() => null)
+    installApiMock(async ({ body, path }: { body?: unknown; path: string }) => {
+      calls.push({ body, path })
+
+      if (path === '/api/providers/oauth/anthropic/start') {
+        return {
+          auth_url: 'https://anthropic.example/auth',
+          expires_in: 600,
+          flow: 'pkce',
+          session_id: 'anthropic-session'
+        }
+      }
+
+      if (path === '/api/providers/oauth/anthropic/submit') {
+        return { ok: true, status: 'approved' }
+      }
+
+      if (path === '/api/model/options' || path.startsWith('/api/model/recommended-default') || path === '/api/model/set') {
+        throw new Error(`should not fetch or write model defaults while preserving: ${path}`)
+      }
+
+      throw new Error(`unexpected api path: ${path}`)
+    })
+
+    const requestGateway: OnboardingContext['requestGateway'] = async method => {
+      if (method === 'reload.env') {
+        return {} as never
+      }
+
+      if (method === 'setup.status') {
+        return { provider_configured: true } as never
+      }
+
+      if (method === 'setup.runtime_check') {
+        return { ok: true } as never
+      }
+
+      throw new Error(`unexpected gateway method: ${method}`)
+    }
+
+    await startProviderOAuth(provider('anthropic', 'Anthropic'), { requestGateway, onCompleted })
+    expect($desktopOnboarding.get().flow.status).toBe('awaiting_user')
+
+    setOnboardingCode('fresh-code')
+    await submitOnboardingCode({ requestGateway, onCompleted })
+
+    expect(calls.map(c => c.path)).toEqual([
+      '/api/providers/oauth/anthropic/start',
+      '/api/providers/oauth/anthropic/submit'
+    ])
+    expect($desktopOnboarding.get().configured).toBe(true)
+    expect($desktopOnboarding.get().flow.status).toBe('idle')
+    expect(onCompleted).toHaveBeenCalledTimes(1)
+  })
+
+  it('ignores stale device-code poll completions after the flow changes', async () => {
+    vi.useFakeTimers()
+
+    let resolvePoll!: (value: { status: 'approved' }) => void
+    const pollPromise = new Promise<{ status: 'approved' }>(resolve => {
+      resolvePoll = resolve
+    })
+    const calls: string[] = []
+    const deviceProvider: OAuthProvider = {
+      ...provider('nous', 'Nous Portal'),
+      flow: 'device_code'
+    }
+
+    vi.spyOn(window, 'open').mockImplementation(() => null)
+    installApiMock(async ({ path }: { path: string }) => {
+      calls.push(path)
+
+      if (path === '/api/providers/oauth/nous/start') {
+        return {
+          expires_in: 600,
+          flow: 'device_code',
+          session_id: 'old-session',
+          user_code: 'ABCD-EFGH',
+          verification_url: 'https://portal.example/device'
+        }
+      }
+
+      if (path === '/api/providers/oauth/nous/poll/old-session') {
+        return pollPromise
+      }
+
+      if (path === '/api/providers/oauth/cancel/old-session') {
+        return { ok: true }
+      }
+
+      if (path === '/api/model/options' || path.startsWith('/api/model/recommended-default') || path === '/api/model/set') {
+        throw new Error(`stale poll should not continue onboarding: ${path}`)
+      }
+
+      throw new Error(`unexpected api path: ${path}`)
+    })
+
+    const requestGateway: OnboardingContext['requestGateway'] = async method => {
+      if (method === 'setup.status') {
+        return { provider_configured: true } as never
+      }
+
+      if (method === 'setup.runtime_check') {
+        return { ok: false, error: 'No existing runtime.' } as never
+      }
+
+      if (method === 'reload.env') {
+        return {} as never
+      }
+
+      throw new Error(`unexpected gateway method: ${method}`)
+    }
+
+    await startProviderOAuth(deviceProvider, onboardingContext(requestGateway))
+    expect($desktopOnboarding.get().flow.status).toBe('polling')
+
+    vi.advanceTimersByTime(2000)
+    await Promise.resolve()
+    cancelOnboardingFlow()
+    expect($desktopOnboarding.get().flow.status).toBe('idle')
+
+    resolvePoll({ status: 'approved' })
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect($desktopOnboarding.get().flow.status).toBe('idle')
+    expect(calls).not.toContain('/api/model/set')
+  })
+
+  it('ignores stale device-code poll failures after the flow changes', async () => {
+    vi.useFakeTimers()
+
+    let rejectPoll!: (reason: Error) => void
+    const pollPromise = new Promise<never>((_, reject) => {
+      rejectPoll = reject
+    })
+    const calls: string[] = []
+    const deviceProvider: OAuthProvider = {
+      ...provider('nous', 'Nous Portal'),
+      flow: 'device_code'
+    }
+
+    vi.spyOn(window, 'open').mockImplementation(() => null)
+    installApiMock(async ({ path }: { path: string }) => {
+      calls.push(path)
+
+      if (path === '/api/providers/oauth/nous/start') {
+        return {
+          expires_in: 600,
+          flow: 'device_code',
+          session_id: 'old-session',
+          user_code: 'ABCD-EFGH',
+          verification_url: 'https://portal.example/device'
+        }
+      }
+
+      if (path === '/api/providers/oauth/nous/poll/old-session') {
+        return pollPromise
+      }
+
+      if (path === '/api/providers/oauth/cancel/old-session') {
+        return { ok: true }
+      }
+
+      throw new Error(`unexpected api path: ${path}`)
+    })
+
+    const requestGateway: OnboardingContext['requestGateway'] = async method => {
+      if (method === 'setup.status') {
+        return { provider_configured: true } as never
+      }
+
+      if (method === 'setup.runtime_check') {
+        return { ok: false, error: 'No existing runtime.' } as never
+      }
+
+      throw new Error(`unexpected gateway method: ${method}`)
+    }
+
+    await startProviderOAuth(deviceProvider, onboardingContext(requestGateway))
+    expect($desktopOnboarding.get().flow.status).toBe('polling')
+
+    vi.advanceTimersByTime(2000)
+    await Promise.resolve()
+    cancelOnboardingFlow()
+    expect($desktopOnboarding.get().flow.status).toBe('idle')
+
+    rejectPoll(new Error('network failed after cancel'))
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect($desktopOnboarding.get().flow.status).toBe('idle')
+    expect(calls).not.toContain('/api/model/set')
   })
 })
 

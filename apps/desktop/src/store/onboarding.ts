@@ -24,10 +24,10 @@ export type OnboardingMode = 'apikey' | 'oauth'
 export type OnboardingFlow =
   | { status: 'idle' }
   | { provider: OAuthProvider; status: 'starting' }
-  | { code: string; provider: OAuthProvider; start: PkceStart; status: 'awaiting_user' }
-  | { copied: boolean; provider: OAuthProvider; start: DeviceStart; status: 'polling' }
-  | { provider: OAuthProvider; start: OAuthStartResponse; status: 'submitting' }
-  | { copied: boolean; provider: OAuthProvider; status: 'external_pending' }
+  | { code: string; preserveExistingDefault?: boolean; provider: OAuthProvider; start: PkceStart; status: 'awaiting_user' }
+  | { copied: boolean; preserveExistingDefault?: boolean; provider: OAuthProvider; start: DeviceStart; status: 'polling' }
+  | { preserveExistingDefault?: boolean; provider: OAuthProvider; start: OAuthStartResponse; status: 'submitting' }
+  | { copied: boolean; preserveExistingDefault?: boolean; provider: OAuthProvider; status: 'external_pending' }
   | { provider: OAuthProvider; status: 'success' }
   | {
       // After successful credential acquisition, before completing
@@ -183,6 +183,14 @@ async function checkRuntime(ctx: OnboardingContext, requestedProvider?: string):
   })
 }
 
+async function hasWorkingProfileDefault(ctx: OnboardingContext): Promise<boolean> {
+  try {
+    return (await checkRuntime(ctx)).ready
+  } catch {
+    return false
+  }
+}
+
 function shouldPreserveConfiguredOnFallback(runtime: RuntimeReadinessResult, state: DesktopOnboardingState): boolean {
   // A fallback result means both runtime probes were non-authoritative
   // (transport timeout/disconnect). Keep a previously verified configured
@@ -306,9 +314,21 @@ async function completeWithModelConfirm(
   // When true, a failing runtime check no longer blocks progression — the
   // user is allowed through onboarding regardless. Used by the API-key path,
   // where we intentionally don't validate the key (it blocked too many users).
-  ignoreRuntimeGate = false
+  ignoreRuntimeGate = false,
+  // Captured before credential submission/reload. A runtime check after OAuth
+  // can succeed because of the newly authenticated provider, which does not
+  // prove there was a durable profile default worth preserving.
+  preserveExistingDefault = false
 ) {
   await ctx.requestGateway('reload.env').catch(() => undefined)
+
+  if (preserveExistingDefault) {
+    notifyReady(providerLabel)
+    completeDesktopOnboarding()
+    ctx.onCompleted?.()
+
+    return
+  }
 
   const defaults = await fetchProviderDefaultModel(preferredSlugs)
 
@@ -569,8 +589,10 @@ async function openSignInUrl(url: string) {
 export async function startProviderOAuth(provider: OAuthProvider, ctx: OnboardingContext) {
   clearPoll()
 
+  const preserveExistingDefault = await hasWorkingProfileDefault(ctx)
+
   if (provider.flow === 'external') {
-    setFlow({ status: 'external_pending', provider, copied: false })
+    setFlow({ status: 'external_pending', provider, copied: false, preserveExistingDefault })
 
     return
   }
@@ -583,12 +605,12 @@ export async function startProviderOAuth(provider: OAuthProvider, ctx: Onboardin
     await openSignInUrl(browserUrl)
 
     if (start.flow === 'pkce') {
-      setFlow({ status: 'awaiting_user', provider, start, code: '' })
+      setFlow({ status: 'awaiting_user', provider, start, code: '', preserveExistingDefault })
 
       return
     }
 
-    setFlow({ status: 'polling', provider, start, copied: false })
+    setFlow({ status: 'polling', provider, start, copied: false, preserveExistingDefault })
     pollTimer = window.setInterval(() => void pollSession(provider, start, ctx), POLL_MS)
   } catch (error) {
     setFlow({ status: 'error', provider, message: `Could not start sign-in: ${errMessage(error)}` })
@@ -599,22 +621,41 @@ export async function startProviderOAuth(provider: OAuthProvider, ctx: Onboardin
 async function pollSession(provider: OAuthProvider, start: DeviceStart, ctx: OnboardingContext) {
   try {
     const { error_message, status } = await pollOAuthSession(provider.id, start.session_id)
+    const flow = $desktopOnboarding.get().flow
+
+    if (flow.status !== 'polling' || flow.start.session_id !== start.session_id) {
+      return
+    }
 
     if (status === 'approved') {
+      const preserveExistingDefault = flow.preserveExistingDefault === true
+
       clearPoll()
       setFlow({ status: 'success', provider })
-      await completeWithModelConfirm(ctx, provider.name, [provider.id], reason =>
-        setFlow({
-          status: 'error',
-          provider,
-          message: providerResolutionFailure(reason)
-        })
+      await completeWithModelConfirm(
+        ctx,
+        provider.name,
+        [provider.id],
+        reason =>
+          setFlow({
+            status: 'error',
+            provider,
+            message: providerResolutionFailure(reason)
+          }),
+        false,
+        preserveExistingDefault
       )
     } else if (status !== 'pending') {
       clearPoll()
       setFlow({ status: 'error', provider, start, message: error_message || `Sign-in ${status}.` })
     }
   } catch (error) {
+    const flow = $desktopOnboarding.get().flow
+
+    if (flow.status !== 'polling' || flow.start.session_id !== start.session_id) {
+      return
+    }
+
     clearPoll()
     setFlow({ status: 'error', provider, start, message: `Polling failed: ${errMessage(error)}` })
   }
@@ -636,19 +677,26 @@ export async function submitOnboardingCode(ctx: OnboardingContext) {
   }
 
   const { provider, start, code } = flow
-  setFlow({ status: 'submitting', provider, start })
+  const preserveExistingDefault = flow.preserveExistingDefault ?? (await hasWorkingProfileDefault(ctx))
+  setFlow({ status: 'submitting', provider, start, preserveExistingDefault })
 
   try {
     const resp = await submitOAuthCode(provider.id, start.session_id, code.trim())
 
     if (resp.ok && resp.status === 'approved') {
       setFlow({ status: 'success', provider })
-      await completeWithModelConfirm(ctx, provider.name, [provider.id], reason =>
-        setFlow({
-          status: 'error',
-          provider,
-          message: providerResolutionFailure(reason)
-        })
+      await completeWithModelConfirm(
+        ctx,
+        provider.name,
+        [provider.id],
+        reason =>
+          setFlow({
+            status: 'error',
+            provider,
+            message: providerResolutionFailure(reason)
+          }),
+        false,
+        preserveExistingDefault
       )
     } else {
       setFlow({ status: 'error', provider, start, message: resp.message || 'Token exchange failed.' })
@@ -722,14 +770,20 @@ export async function recheckExternalSignin(ctx: OnboardingContext) {
   }
 
   const { provider } = flow
-  await completeWithModelConfirm(ctx, provider.name, [provider.id], reason =>
-    setFlow({
-      status: 'error',
-      provider,
-      message:
-        reason?.trim() ||
-        `Hermes still cannot reach ${provider.name}. Run \`${provider.cli_command}\` in a terminal first.`
-    })
+  await completeWithModelConfirm(
+    ctx,
+    provider.name,
+    [provider.id],
+    reason =>
+      setFlow({
+        status: 'error',
+        provider,
+        message:
+          reason?.trim() ||
+          `Hermes still cannot reach ${provider.name}. Run \`${provider.cli_command}\` in a terminal first.`
+      }),
+    false,
+    flow.preserveExistingDefault === true
   )
 }
 
@@ -762,6 +816,8 @@ export async function saveOnboardingApiKey(
   // legitimate users (corporate proxies, regional blocks, flaky/rate-limited
   // provider probes, self-hosted endpoints). We now save the value as-is and
   // let the user proceed; an actually-bad key surfaces later at chat time.
+  const preserveExistingDefault = await hasWorkingProfileDefault(ctx)
+
   try {
     await setEnvVar(envKey, trimmed)
     // For API-key flows we don't have a definitive provider id (the
@@ -772,7 +828,7 @@ export async function saveOnboardingApiKey(
     // provider returned by /api/model/options if none match.
     const slugCandidates = [envKey.replace(/_API_KEY$/, '').toLowerCase(), label.toLowerCase()]
     // ignoreRuntimeGate=true: never block onboarding on the runtime check.
-    await completeWithModelConfirm(ctx, label, slugCandidates, () => undefined, true)
+    await completeWithModelConfirm(ctx, label, slugCandidates, () => undefined, true, preserveExistingDefault)
 
     return { ok: true }
   } catch (error) {
