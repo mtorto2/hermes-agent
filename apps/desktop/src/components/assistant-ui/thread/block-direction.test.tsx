@@ -7,8 +7,8 @@
 // blocks stay attribute-free (the plaintext CSS owns them). jsdom does not
 // resolve dir="auto", so the contract is asserted at the attribute level.
 import { AssistantRuntimeProvider, type ThreadMessage, useExternalStoreRuntime } from '@assistant-ui/react'
-import { render, screen } from '@testing-library/react'
-import { describe, expect, it, vi } from 'vitest'
+import { cleanup, render, screen } from '@testing-library/react'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { Thread } from '.'
 
@@ -27,6 +27,10 @@ vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) =>
 vi.stubGlobal('cancelAnimationFrame', (id: number) => window.clearTimeout(id))
 
 Element.prototype.scrollTo = function scrollTo() {}
+
+afterEach(() => {
+  cleanup()
+})
 
 function stubOffsetDimension(
   prop: 'offsetHeight' | 'offsetWidth',
