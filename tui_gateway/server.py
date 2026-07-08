@@ -587,6 +587,12 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
     stop_event = session.get("_notif_stop")
     if stop_event is not None:
         stop_event.set()
+    notif_thread = session.get("_notif_thread")
+    if notif_thread is not None and notif_thread is not threading.current_thread():
+        try:
+            notif_thread.join(timeout=1.0)
+        except Exception:
+            pass
 
     agent = session.get("agent")
     lock = session.get("history_lock")
@@ -8816,6 +8822,11 @@ def _notification_poller_loop(
         except Exception:
             continue
 
+        with _sessions_lock:
+            if _sessions.get(sid) is not session:
+                process_registry.completion_queue.put(evt)
+                break
+
         # Multiple desktop sessions share this one process-wide queue. Only
         # consume events that belong to *this* session — otherwise a background
         # process started in session A would surface its completion in whichever
@@ -9007,6 +9018,7 @@ def _start_notification_poller(sid: str, session: dict) -> threading.Event:
         args=(stop, sid, session),
         daemon=True,
     )
+    session["_notif_thread"] = t
     t.start()
     return stop
 
