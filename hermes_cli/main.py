@@ -2088,6 +2088,13 @@ def _launch_tui(
         apply_terminal_config_to_env(env=env)
     except Exception:
         logger.debug("Failed to apply terminal config bridge for TUI launch", exc_info=True)
+    # Pin profile identity in the child environment. Node passes this through to
+    # tui_gateway.entry, keeping concurrent Default/Tate/Aurelius TUI launches
+    # isolated and letting shared Agent Lights slots identify their owning lane.
+    from hermes_cli.profiles import get_active_profile_name
+
+    env["HERMES_HOME"] = str(get_hermes_home())
+    env["HERMES_PROFILE"] = get_active_profile_name()
     active_session_fd, active_session_file = tempfile.mkstemp(
         prefix="hermes-tui-active-session-", suffix=".json"
     )

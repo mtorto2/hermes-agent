@@ -465,21 +465,6 @@ def _release_active_session_slot(session: dict | None) -> None:
         logger.debug("Failed to release active session slot", exc_info=True)
 
 
-def _release_agent_lights_slot(session: dict | None) -> None:
-    """Clear this gateway process's Agent Lights slot during session teardown."""
-    if not session:
-        return
-    service = session.get("_light_cue_service")
-    backend = getattr(service, "slot_status_backend", None)
-    clear_if_owned = getattr(backend, "clear_if_owned", None)
-    if not callable(clear_if_owned):
-        return
-    try:
-        clear_if_owned()
-    except Exception:
-        logger.debug("Failed to release Agent Lights slot", exc_info=True)
-
-
 def _transfer_active_session_slot(
     sid: str,
     session: dict,
@@ -583,7 +568,6 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
         return
     session["_finalized"] = True
     _release_active_session_slot(session)
-    _release_agent_lights_slot(session)
     stop_event = session.get("_notif_stop")
     if stop_event is not None:
         stop_event.set()
@@ -1234,6 +1218,24 @@ def _get_tui_light_cue_service(session: dict | None):
     except Exception:
         logger.debug("TUI light cue service unavailable", exc_info=True)
         return None
+
+
+_TUI_LIGHT_SLOT_RETRY_INTERVAL_S = 30.0
+
+
+def _retry_tui_light_slot_registration(session: dict | None) -> bool:
+    """Backfill a slot for an idle TUI that started while capacity was full."""
+    if not session:
+        return False
+    service = session.get("_light_cue_service")
+    retry = getattr(service, "retry_slot_registration", None)
+    if not callable(retry):
+        return False
+    try:
+        return bool(retry())
+    except Exception:
+        logger.debug("TUI Agent Lights slot retry failed", exc_info=True)
+        return False
 
 
 def _emit_tui_light_cue(sid: str, event: Any) -> bool:
@@ -8816,7 +8818,11 @@ def _notification_poller_loop(
     from tools.process_registry import process_registry, format_process_notification
 
     _emitted = set()  # dedup re-queued events so same completion isn't emitted 50 times while session is busy
+    next_slot_retry_at = time.monotonic()
     while not stop_event.is_set() and not session.get("_finalized"):
+        if time.monotonic() >= next_slot_retry_at:
+            _retry_tui_light_slot_registration(session)
+            next_slot_retry_at = time.monotonic() + _TUI_LIGHT_SLOT_RETRY_INTERVAL_S
         try:
             evt = process_registry.completion_queue.get(timeout=0.5)
         except Exception:

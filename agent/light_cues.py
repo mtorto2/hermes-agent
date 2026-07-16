@@ -11,6 +11,7 @@ import logging
 import os
 from pathlib import Path
 import subprocess
+import threading
 from typing import Any, Callable, Protocol
 
 from agent.wiz_light import WiZLightCueBackend, WiZLightCueConfig
@@ -320,7 +321,10 @@ class SlotStatusFileBackend:
         )
         if resolved_model:
             payload["model_name"] = resolved_model
-        profile = cls._first_nonempty(os.environ.get("HERMES_PROFILE"))
+        profile = cls._first_nonempty(
+            os.environ.get("HERMES_PROFILE"),
+            cls._profile_name_from_home(),
+        )
         if profile:
             payload["profile"] = profile
         session_id = cls._first_nonempty(os.environ.get("HERMES_SESSION_ID"))
@@ -337,6 +341,17 @@ class SlotStatusFileBackend:
         else:
             payload["source"] = "hermes"
         return payload
+
+    @staticmethod
+    def _profile_name_from_home() -> str:
+        """Infer a stable lane name when the launcher did not export one."""
+        try:
+            home = Path(get_hermes_home()).resolve()
+        except OSError:
+            return "default"
+        if home.parent.name == "profiles" and home.name:
+            return home.name
+        return "default"
 
     @staticmethod
     def _first_nonempty(*values: str | None) -> str | None:
@@ -566,6 +581,11 @@ class LightCueService:
         self.slot_status_backend = slot_status_backend
         self.slot_status_backend_factory = slot_status_backend_factory
         self.menu_bar_launcher = menu_bar_launcher
+        # The notification poller retries slot allocation while prompt/lifecycle
+        # code emits concurrently. Keep allocation and status writes linearized
+        # so the newest lifecycle state wins.
+        self._slot_status_lock = threading.RLock()
+        self._last_slot_event: LightCueEvent | None = None
 
     def _ensure_slot_status_backend(self) -> SlotStatusBackend | None:
         if self.slot_status_backend is not None:
@@ -585,23 +605,38 @@ class LightCueService:
             save_light_cue_mode(self.mode)
         return self.mode
 
-    def mark_slot_online(self) -> bool:
-        """Write an idle slot status without touching physical light backends."""
+    def _emit_slot_status_locked(self, event: LightCueEvent, *, launch_menu_bar: bool) -> bool:
+        """Write one lifecycle state while ``_slot_status_lock`` is held."""
         slot_status_backend = self._ensure_slot_status_backend()
         if slot_status_backend is None:
             return False
-        if self.menu_bar_launcher is None:
-            self.menu_bar_launcher = AgentLightsMenuBarLauncher()
-        if self.menu_bar_launcher is not None:
+        if launch_menu_bar:
+            if self.menu_bar_launcher is None:
+                self.menu_bar_launcher = AgentLightsMenuBarLauncher()
             try:
                 self.menu_bar_launcher.ensure_running()
             except Exception as exc:
-                logger.debug("Agent Lights menu bar launch failed during startup idle mark: %s", exc)
+                logger.debug("Agent Lights menu bar launch failed during slot update: %s", exc)
         try:
-            return bool(slot_status_backend.emit_event(LightCueEvent.IDLE))
+            return bool(slot_status_backend.emit_event(event))
         except Exception as exc:
-            logger.debug("Slot status backend failed during startup idle mark: %s", exc)
+            logger.debug("Slot status backend failed while emitting %s: %s", event.value, exc)
             return False
+
+    def mark_slot_online(self) -> bool:
+        """Register a passive session without overwriting a newer lifecycle event."""
+        with self._slot_status_lock:
+            if self._last_slot_event is None:
+                self._last_slot_event = LightCueEvent.IDLE
+            return self._emit_slot_status_locked(self._last_slot_event, launch_menu_bar=True)
+
+    def retry_slot_registration(self) -> bool:
+        """Claim a freed slot and restore the latest deferred lifecycle state."""
+        with self._slot_status_lock:
+            if self.slot_status_backend is not None:
+                return False
+            event = self._last_slot_event or LightCueEvent.IDLE
+            return self._emit_slot_status_locked(event, launch_menu_bar=True)
 
     def action_for(self, event: LightCueEvent | str) -> LightCueAction | None:
         event = LightCueEvent.from_value(event)
@@ -635,12 +670,9 @@ class LightCueService:
         # Reload the sticky profile-level mode before every cue so long-lived
         # terminal and gateway processes observe menu changes made elsewhere.
         event = LightCueEvent.from_value(event)
-        slot_status_backend = self._ensure_slot_status_backend()
-        if slot_status_backend is not None:
-            try:
-                slot_status_backend.emit_event(event)
-            except Exception as exc:
-                logger.debug("Slot status backend failed: %s", exc)
+        with self._slot_status_lock:
+            self._last_slot_event = event
+            self._emit_slot_status_locked(event, launch_menu_bar=False)
         self.mode = load_light_cue_mode(self.mode)
         action = self.action_for(event)
         if action is None:

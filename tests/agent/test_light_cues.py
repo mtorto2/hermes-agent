@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
+
+import pytest
 
 from agent.light_cues import (
     AgentLightsMenuBarLauncher,
@@ -728,6 +731,118 @@ def test_light_cue_service_retries_slot_claim_when_capacity_frees(tmp_path, monk
     assert payload["model_name"] == "gpt-5.5"
 
 
+def test_light_cue_service_retries_unregistered_slot_without_waiting_for_lifecycle_event(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv("HERMES_SLOT", raising=False)
+    slots = tmp_path / "agent-lights" / "slots"
+    slots.mkdir(parents=True)
+    for slot in range(1, 5):
+        (slots / f"{slot}.json").write_text(
+            json.dumps({"slot": slot, "pid": 100 + slot, "state": "idle"}),
+            encoding="utf-8",
+        )
+    monkeypatch.setattr(SlotStatusFileBackend, "_pid_is_running", staticmethod(lambda pid: True))
+
+    service = build_light_cue_service_from_config(
+        {"model": {"default": "gpt-5.5"}}, auto_assign_slot=True
+    )
+    assert service.slot_status_backend is None
+
+    (slots / "3.json").unlink()
+
+    assert service.retry_slot_registration() is True
+    payload = json.loads((slots / "3.json").read_text(encoding="utf-8"))
+    assert payload["slot"] == 3
+    assert payload["state"] == "idle"
+
+
+@pytest.mark.parametrize(
+    "event",
+    [
+        LightCueEvent.WORKING,
+        LightCueEvent.HUMAN_INTERVENTION,
+        LightCueEvent.FINAL_ANSWER,
+        LightCueEvent.ERROR,
+    ],
+)
+def test_light_cue_service_slot_retry_restores_latest_unregistered_lifecycle_state(tmp_path, monkeypatch, event):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv("HERMES_SLOT", raising=False)
+    slots = tmp_path / "agent-lights" / "slots"
+    slots.mkdir(parents=True)
+    for slot in range(1, 5):
+        (slots / f"{slot}.json").write_text(
+            json.dumps({"slot": slot, "pid": 100 + slot, "state": "idle"}),
+            encoding="utf-8",
+        )
+    monkeypatch.setattr(SlotStatusFileBackend, "_pid_is_running", staticmethod(lambda pid: True))
+
+    service = build_light_cue_service_from_config(
+        {"model": {"default": "gpt-5.5"}}, auto_assign_slot=True
+    )
+    assert service.slot_status_backend is None
+    assert service.emit(event) is False
+
+    (slots / "3.json").unlink()
+
+    assert service.retry_slot_registration() is True
+    payload = json.loads((slots / "3.json").read_text(encoding="utf-8"))
+    assert payload["state"] == event.value
+
+
+def test_light_cue_service_slot_retry_serializes_with_lifecycle_emit():
+    retry_entered_backend = threading.Event()
+    release_retry = threading.Event()
+    recorded_events = []
+
+    class BlockingSlotBackend:
+        def emit_event(self, event):
+            if event is LightCueEvent.IDLE:
+                retry_entered_backend.set()
+                assert release_retry.wait(timeout=1)
+            recorded_events.append(event)
+            return True
+
+    class NoopLauncher:
+        def ensure_running(self):
+            return True
+
+    backend = BlockingSlotBackend()
+    service = LightCueService(
+        slot_status_backend_factory=lambda: backend,
+        menu_bar_launcher=NoopLauncher(),
+    )
+
+    retry_thread = threading.Thread(target=service.retry_slot_registration)
+    retry_thread.start()
+    assert retry_entered_backend.wait(timeout=1)
+
+    lifecycle_thread = threading.Thread(target=lambda: service.emit(LightCueEvent.FINAL_ANSWER))
+    lifecycle_thread.start()
+    lifecycle_thread.join(timeout=0.1)
+    assert lifecycle_thread.is_alive(), "lifecycle emission must wait for the retry registration write"
+
+    release_retry.set()
+    retry_thread.join(timeout=1)
+    lifecycle_thread.join(timeout=1)
+    assert not retry_thread.is_alive()
+    assert not lifecycle_thread.is_alive()
+    assert recorded_events == [LightCueEvent.IDLE, LightCueEvent.FINAL_ANSWER]
+
+
+def test_light_cue_service_slot_retry_does_not_overwrite_registered_state(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_SLOT", "1")
+    service = build_light_cue_service_from_config(
+        {"model": {"default": "gpt-5.5"}}, auto_assign_slot=True
+    )
+    assert service.emit(LightCueEvent.FINAL_ANSWER) is False
+
+    assert service.retry_slot_registration() is False
+    payload = json.loads((tmp_path / "agent-lights" / "slots" / "1.json").read_text(encoding="utf-8"))
+    assert payload["state"] == "final_answer"
+
+
 def test_slot_status_file_backend_auto_assign_reuses_current_process_slot(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.delenv("HERMES_SLOT", raising=False)
@@ -769,6 +884,19 @@ def test_config_builder_enables_slot_status_backend_from_env(tmp_path, monkeypat
     assert payload["slot"] == 4
     assert payload["state"] == "idle"
     assert payload["model_name"] == "gpt-5.5"
+
+
+def test_slot_status_file_backend_derives_profile_metadata_from_profile_home(tmp_path, monkeypatch):
+    profile_home = tmp_path / "profiles" / "personal"
+    profile_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    monkeypatch.delenv("HERMES_PROFILE", raising=False)
+
+    backend = SlotStatusFileBackend(slot=1, directory=tmp_path / "agent-lights" / "slots")
+    assert backend.emit_event(LightCueEvent.IDLE) is True
+
+    payload = json.loads((tmp_path / "agent-lights" / "slots" / "1.json").read_text(encoding="utf-8"))
+    assert payload["profile"] == "personal"
 
 
 def test_config_builder_reuses_telegram_wiz_notification_light(monkeypatch):

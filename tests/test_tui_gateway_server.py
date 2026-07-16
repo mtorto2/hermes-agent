@@ -17,6 +17,53 @@ from hermes_cli.browser_connect import ChromeDebugLaunch
 from tui_gateway import server
 
 
+def test_tui_light_slot_retry_delegates_to_unregistered_service():
+    class DeferredSlotService:
+        def __init__(self):
+            self.calls = 0
+
+        def retry_slot_registration(self):
+            self.calls += 1
+            return True
+
+    service = DeferredSlotService()
+
+    assert server._retry_tui_light_slot_registration({"_light_cue_service": service}) is True
+    assert service.calls == 1
+
+
+def test_tui_notification_poller_retries_unregistered_agent_lights_slot(monkeypatch):
+    from tools.process_registry import process_registry
+
+    stop = threading.Event()
+    retry_calls = []
+
+    class NoEventsQueue:
+        def __init__(self):
+            self.calls = 0
+
+        def get(self, timeout):
+            self.calls += 1
+            if self.calls >= 2:
+                stop.set()
+            raise RuntimeError("no completion events")
+
+        def empty(self):
+            return True
+
+    def retry_slot(session):
+        retry_calls.append(session)
+        stop.set()
+        return True
+
+    monkeypatch.setattr(process_registry, "completion_queue", NoEventsQueue())
+    monkeypatch.setattr(server, "_retry_tui_light_slot_registration", retry_slot)
+
+    server._notification_poller_loop(stop, "slot-retry", {})
+
+    assert len(retry_calls) == 1
+
+
 def test_session_create_rejects_at_active_session_limit(monkeypatch, tmp_path):
     home = tmp_path / ".hermes"
     home.mkdir()
@@ -1934,13 +1981,12 @@ def test_session_close_commits_memory_and_fires_finalize_hook(monkeypatch):
         server._sessions.pop("sid", None)
 
 
-def test_finalize_session_releases_agent_lights_slot(monkeypatch):
-    """TUI session teardown should clear its Agent Lights slot immediately.
+def test_finalize_session_defers_agent_lights_cleanup_to_process_exit(monkeypatch):
+    """A logical TUI close must not erase a still-live process's light slot.
 
-    Orphaned menu-bar circles can survive when a TUI backend process stays
-    alive after the visible Terminal tab is gone. Process exit still has an
-    atexit cleanup, but the session-finalize chokepoint should also release the
-    slot so every orderly TUI close path removes its own light state.
+    The backend's atexit handler owns process cleanup.  Session finalization can
+    occur while the Terminal/TUI process remains alive or reconnects, so clearing
+    here incorrectly hides an open session from Agent Lights.
     """
 
     calls = []
@@ -1957,7 +2003,7 @@ def test_finalize_session_releases_agent_lights_slot(monkeypatch):
 
     server._finalize_session(session)
 
-    assert calls == ["clear"]
+    assert calls == []
 
 
 def test_ws_orphan_reap_closes_worker_when_session_stays_detached(monkeypatch):
@@ -7325,12 +7371,15 @@ def test_browser_manage_connect_default_local_retries_after_launch(monkeypatch):
     monkeypatch.setattr(urllib.request, "urlopen", _opener)
     with patch.dict(sys.modules, {"tools.browser_tool": fake}):
         with patch(
-            "hermes_cli.browser_connect.try_launch_chrome_debug", return_value=True
-        ):
+            "hermes_cli.browser_connect.launch_chrome_debug",
+            return_value=ChromeDebugLaunch(launched=True),
+        ) as launch:
             resp = server.handle_request(
                 {"id": "1", "method": "browser.manage", "params": {"action": "connect"}}
             )
 
+    launch.assert_called_once()
+    assert launch.call_args.args[0] == 9222
     assert resp["result"]["connected"] is True
     assert resp["result"]["url"] == "http://127.0.0.1:9222"
     assert resp["result"]["messages"] == [
