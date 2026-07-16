@@ -1,20 +1,25 @@
 # Next Time
 
-Updated: 2026-07-08
+Updated: 2026-07-16
 Project: hermes-agent live local fork
 Prepared by: Hermes
 
 ## Current state
 - Live checkout: `/Users/matt/.hermes/hermes-agent`.
-- Branch: `main`, tracking `fork/main`.
-- Matt fork remote (`fork`) is the normal push target.
-- Nous upstream remote (`origin`) remains intake-only unless Matt explicitly asks for an upstream push/PR.
-- Current live/fork HEAD after wrap-up: `c12d53dfa5aded95b7f71631f05dd78b19b33c6e`.
-- Fork `main` was pushed and verified at the same SHA.
-- Backup/review branch also pushed: `fork/matt/live-custom-smoked-20260708-e83e38c` at `e83e38c06b590eb95678cc5248b309c76eb14b4b`.
-- Working tree was clean before this handoff-doc update.
+- Branch: `main`, tracking Matt's `fork/main` production branch.
+- Matt fork remote (`fork`) is the normal push target; Nous upstream (`origin`) is intake-only unless Matt explicitly asks otherwise.
+- Latest functional change: `0b301a6a699dd7c506ac4bd56983e52f3dca83b7` — `fix(agent-lights): retain lifecycle state during slot retries`.
+- The change preserves Agent Lights lifecycle state across concurrent updates, identifies profile-owned slots correctly, and retries allocation when a slot becomes available.
+- Targeted verification passed: `429` tests across Agent Lights and TUI gateway/resume coverage.
+- This source change is not runtime-active until a gateway/TUI process is explicitly restarted and smoke-tested.
 
-## What changed in the 2026-07-08 wrap-up
+## What changed in the 2026-07-16 Agent Lights/TUI update
+- Serialized Agent Lights slot-status writes so the newest lifecycle event wins during concurrent notification polling.
+- Propagated `HERMES_HOME` and `HERMES_PROFILE` to TUI launches, preserving Default/Tate/Aurelius slot ownership.
+- Retained TUI slots through session teardown and retry registration every 30 seconds when capacity was initially full.
+- Added focused regression coverage for profile ownership, lifecycle preservation, retries, and TUI resume behavior.
+
+## Prior 2026-07-08 wrap-up
 - Applied PR #2's Desktop onboarding/model-preservation fix into the live checkout via cherry-pick:
   - `c77e334f0 fix(desktop): preserve working model during onboarding (#2)`
 - Merged latest fetched Nous upstream into live local `main`:
@@ -49,11 +54,8 @@ Prepared by: Hermes
 - No gateway/Tate/Aurelius restart was performed during this wrap-up.
 
 ## Upstream note
-- After the smoke, Nous `origin/main` advanced again.
-- At final wrap-up, live/fork were synced with each other but still differed from current Nous:
-  - `HEAD...fork/main`: `0 0`
-  - `HEAD...origin/main`: `107 11`
-- Do not treat this as an error; the latest 11 Nous commits were not merged or smoked in this session.
+- Nous `origin/main` is intake-only. Re-fetch and re-measure divergence before proposing any future upstream sync.
+- Do not treat upstream divergence as an error; preserve the local fork's protected behavior and use a reviewable sync branch if Matt requests an update.
 
 ## Active/runtime notes
 - Desktop app was left running from the newly packaged live build.
@@ -66,10 +68,11 @@ Prepared by: Hermes
 - Do not initiate xAI/Grok OAuth or xAI model setup unless Matt explicitly requests it.
 
 ## Next likely actions
-1. If Matt wants the newest Nous work too, start a new controlled upstream sync for the latest 11 commits, with fetch/scope review and focused tests before any push.
+1. If Matt wants newer Nous work, start a controlled upstream-sync review with a fresh fetch, scope review, and focused tests before any push.
 2. If Matt wants runtime activation, ask before restarting gateways/profiles; then restart and run cheap one-shot checks per profile.
-3. Optional later cleanup: review/prune older sync worktrees under `/Users/matt/.hermes/worktrees/` once Matt is comfortable they are no longer needed.
-4. Continue using `fork/main` as the live local-fork branch unless Matt explicitly chooses a different branch policy.
+3. Do new Hermes implementation work in the dev worktree or a short-lived feature worktree before promoting it to `main`.
+4. Optional later cleanup: review/prune older sync worktrees under `/Users/matt/.hermes/worktrees/` once Matt is comfortable they are no longer needed.
+5. Continue using `fork/main` as the live local-fork branch unless Matt explicitly chooses a different branch policy.
 
 ## Do not touch without approval
 - Do not push to NousResearch/upstream.
