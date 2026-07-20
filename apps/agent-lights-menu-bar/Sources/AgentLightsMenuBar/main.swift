@@ -1,6 +1,7 @@
 import AppKit
 import AgentLightsCore
 import Foundation
+import TerminalScriptingBridge
 
 private final class StatusRowAction: NSObject {
     let status: SlotStatus
@@ -139,46 +140,25 @@ private final class AgentLightsApp: NSObject, NSApplicationDelegate, NSMenuDeleg
         return SlotStatus.orderedByTerminalTTY(statuses, ttyForPid: ttyByPid, terminalTTYOrder: terminalOrder)
     }
 
+    private func terminalProcessIdentifier() -> pid_t? {
+        NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.Terminal").first?.processIdentifier
+    }
+
+    private func terminalTabSnapshot() -> String {
+        guard let processIdentifier = terminalProcessIdentifier() else { return "" }
+        // PID-targeted Apple events fail harmlessly if Terminal exits; unlike a
+        // bundle-targeted `tell application "Terminal"`, they cannot relaunch it.
+        return AgentLightsTerminalTabSnapshot(processIdentifier) as String? ?? ""
+    }
+
     private func terminalTTYOrder() -> [String] {
         let now = Date()
         if let cache = terminalTTYOrderCache, now.timeIntervalSince(cache.loadedAt) < 2.0 {
             return cache.ttys
         }
-        let script = """
-        set output to ""
-        tell application "Terminal"
-            repeat with w in windows
-                repeat with t in tabs of w
-                    try
-                        set output to output & (tty of t) & linefeed
-                    end try
-                end repeat
-            end repeat
-        end tell
-        return output
-        """
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-        process.arguments = ["-e", script]
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = Pipe()
-        do {
-            try process.run()
-            process.waitUntilExit()
-        } catch {
-            terminalTTYOrderCache = (loadedAt: now, ttys: [])
-            return []
-        }
-        guard process.terminationStatus == 0 else {
-            terminalTTYOrderCache = (loadedAt: now, ttys: [])
-            return []
-        }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        let output = String(data: data, encoding: .utf8) ?? ""
-        let ttys = output
+        let ttys = terminalTabSnapshot()
             .split(whereSeparator: \.isNewline)
-            .map(String.init)
+            .compactMap { $0.split(separator: "\t", maxSplits: 1, omittingEmptySubsequences: false).first.map(String.init) }
             .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
         terminalTTYOrderCache = (loadedAt: now, ttys: ttys)
         return ttys
@@ -203,42 +183,7 @@ private final class AgentLightsApp: NSObject, NSApplicationDelegate, NSMenuDeleg
         if let cache = terminalCustomTitlesCache, now.timeIntervalSince(cache.loadedAt) < 2.0 {
             return cache.titlesByTTY
         }
-        let script = """
-        set output to ""
-        set delimiter to ASCII character 9
-        tell application "Terminal"
-            repeat with w in windows
-                repeat with t in tabs of w
-                    try
-                        set tabCustomTitle to custom title of t
-                        set displaysCustom to title displays custom title of t
-                        set windowTitle to name of w
-                        set output to output & (tty of t) & delimiter & displaysCustom & delimiter & tabCustomTitle & delimiter & windowTitle & linefeed
-                    end try
-                end repeat
-            end repeat
-        end tell
-        return output
-        """
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-        process.arguments = ["-e", script]
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = Pipe()
-        do {
-            try process.run()
-            process.waitUntilExit()
-        } catch {
-            terminalCustomTitlesCache = (loadedAt: now, titlesByTTY: [:])
-            return [:]
-        }
-        guard process.terminationStatus == 0 else {
-            terminalCustomTitlesCache = (loadedAt: now, titlesByTTY: [:])
-            return [:]
-        }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        let output = String(data: data, encoding: .utf8) ?? ""
+        let output = terminalTabSnapshot()
         var titlesByTTY: [String: String] = [:]
         for line in output.split(whereSeparator: \.isNewline).map(String.init) {
             let parts = line.split(separator: "\t", maxSplits: 3, omittingEmptySubsequences: false)

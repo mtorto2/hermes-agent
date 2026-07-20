@@ -10,9 +10,13 @@ let package = Package(
     ],
     targets: [
         .target(name: "AgentLightsCore"),
+        .target(
+            name: "TerminalScriptingBridge",
+            linkerSettings: [.linkedFramework("ScriptingBridge")]
+        ),
         .executableTarget(
             name: "AgentLightsMenuBar",
-            dependencies: ["AgentLightsCore"],
+            dependencies: ["AgentLightsCore", "TerminalScriptingBridge"],
             linkerSettings: [.linkedFramework("AppKit")]
         ),
         .testTarget(name: "AgentLightsCoreTests", dependencies: ["AgentLightsCore"]),
