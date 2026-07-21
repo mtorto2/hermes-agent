@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
+import type { StatusBarSegments } from '../components/appChrome.js'
 import { busyIndicatorWidth, statusBarSegments, statusRuleWidths } from '../components/appChrome.js'
 
 describe('statusRuleWidths', () => {
@@ -69,7 +70,7 @@ describe('statusBarSegments', () => {
       voice: true,
       bg: true,
       subagents: true
-    })
+    } satisfies StatusBarSegments)
   })
 
   it('collapses the context bar to a token count on narrow terminals', () => {
