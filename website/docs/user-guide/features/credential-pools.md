@@ -76,6 +76,25 @@ anthropic (3 credentials):
 
 The `←` marks the currently selected credential.
 
+### Gate billable API-key fallback
+
+When a provider has both a subscription/OAuth credential and an API key, an
+OAuth quota or entitlement failure normally rotates to the next healthy entry.
+To fail closed instead of silently spending API credits, opt in per provider:
+
+```yaml
+credential_pool_api_key_fallback_approval:
+  anthropic: true
+```
+
+With the gate enabled, Hermes asks for a one-request approval before an active
+CLI or gateway conversation rotates to an API key. If there is no interactive
+approval surface (for example a background or cron run), the fallback is
+blocked. A fresh runtime that would select the API key directly is likewise
+blocked with an explicit error; re-authenticate OAuth or make an explicit,
+operator-approved API invocation instead. Existing installs keep their current
+rotation behavior until this setting is enabled.
+
 ## Interactive Management
 
 Run `hermes auth` with no subcommand for an interactive wizard:

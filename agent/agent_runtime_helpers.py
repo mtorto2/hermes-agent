@@ -36,7 +36,11 @@ from hermes_cli.timeouts import get_provider_request_timeout
 from agent.prompt_builder import format_steer_marker
 from agent.tool_dispatch_helpers import _trajectory_normalize_msg, make_tool_result_message
 from agent.trajectory import convert_scratchpad_to_think
-from agent.credential_pool import STATUS_EXHAUSTED
+from agent.credential_pool import (
+    AUTH_TYPE_API_KEY,
+    STATUS_EXHAUSTED,
+    api_key_fallback_requires_approval,
+)
 from agent.error_classifier import FailoverReason
 from agent.turn_context import drop_stale_api_content
 from utils import base_url_host_matches, base_url_hostname, env_var_enabled, atomic_json_write
@@ -56,6 +60,46 @@ def _ra():
     """Lazy ``run_agent`` reference for test-patch routing."""
     import run_agent
     return run_agent
+
+
+def _approve_api_key_fallback(agent, entry: Any, *, status_code: Optional[int]) -> bool:
+    """Ask before a pool rotation would spend through a billable API key.
+
+    The approval utility owns the live surface: prompt_toolkit in the local TUI
+    and a pending approval message in a gateway conversation. It fails closed
+    when neither exists, so a background or cron run cannot silently consume
+    API credits after an OAuth entitlement failure.
+    """
+    provider = str(getattr(agent, "provider", "") or "").strip().lower()
+    if (
+        getattr(entry, "auth_type", None) != AUTH_TYPE_API_KEY
+        or not api_key_fallback_requires_approval(provider)
+    ):
+        return True
+
+    try:
+        from tools.approval import request_elicitation_consent
+
+        decision = request_elicitation_consent(
+            message=f"{provider} API-key fallback",
+            description=(
+                f"The {provider} OAuth credential could not serve this request "
+                f"(HTTP {status_code or 'unknown'}). Continuing would use the "
+                "configured API key and may consume billable API credits. "
+                "Approve this one fallback request?"
+            ),
+            surface="credential-api-key-fallback",
+        )
+    except Exception as exc:  # Payment gates must fail closed.
+        logger.error("Could not request %s API-key fallback approval: %s", provider, exc)
+        return False
+
+    if decision == "accept":
+        logger.info("%s API-key fallback explicitly approved for this request", provider)
+        return True
+
+    logger.warning("%s API-key fallback blocked: no explicit approval", provider)
+    return False
 
 
 AGENT_RUNTIME_POST_HOOK_TOOL_NAMES = frozenset(
@@ -960,7 +1004,9 @@ def recover_with_credential_pool(
             # that actually failed instead of quarantining a different account.
             api_key_hint=getattr(agent, "api_key", None),
         )
-        if next_entry is not None:
+        if next_entry is not None and _approve_api_key_fallback(
+            agent, next_entry, status_code=rotate_status
+        ):
             _ra().logger.info(
                 "Credential %s (billing) — rotated to pool entry %s",
                 rotate_status,
@@ -984,7 +1030,9 @@ def recover_with_credential_pool(
             )
             rotate_status = status_code if status_code is not None else 429
             next_entry = pool.mark_exhausted_and_rotate(status_code=rotate_status, error_context=error_context)
-            if next_entry is not None:
+            if next_entry is not None and _approve_api_key_fallback(
+                agent, next_entry, status_code=rotate_status
+            ):
                 _ra().logger.info(
                     "Credential %s (rate limit, pre-exhausted) — rotated to pool entry %s",
                     rotate_status,
@@ -1008,7 +1056,9 @@ def recover_with_credential_pool(
             return False, True
         rotate_status = status_code if status_code is not None else 429
         next_entry = pool.mark_exhausted_and_rotate(status_code=rotate_status, error_context=error_context)
-        if next_entry is not None:
+        if next_entry is not None and _approve_api_key_fallback(
+            agent, next_entry, status_code=rotate_status
+        ):
             _ra().logger.info(
                 "Credential %s (rate limit) — rotated to pool entry %s",
                 rotate_status,
@@ -1108,7 +1158,9 @@ def recover_with_credential_pool(
         # The failed entry is already marked exhausted by try_refresh_current().
         rotate_status = status_code if status_code is not None else 401
         next_entry = pool.mark_exhausted_and_rotate(status_code=rotate_status, error_context=error_context)
-        if next_entry is not None:
+        if next_entry is not None and _approve_api_key_fallback(
+            agent, next_entry, status_code=rotate_status
+        ):
             _ra().logger.info(
                 "Credential %s (auth refresh failed) — rotated to pool entry %s",
                 rotate_status,

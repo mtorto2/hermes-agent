@@ -12,8 +12,10 @@ logger = logging.getLogger(__name__)
 
 from hermes_cli import auth as auth_mod
 from agent.credential_pool import (
+    AUTH_TYPE_API_KEY,
     CredentialPool,
     PooledCredential,
+    api_key_fallback_requires_approval,
     credential_pool_matches_provider,
     get_custom_provider_pool_key,
     load_pool,
@@ -1778,6 +1780,15 @@ def resolve_runtime_provider(
                 ),
             )
         ):
+            if (
+                getattr(entry, "auth_type", None) == AUTH_TYPE_API_KEY
+                and api_key_fallback_requires_approval(provider)
+            ):
+                raise AuthError(
+                    f"{provider} API-key fallback is blocked pending explicit approval. "
+                    "Re-authenticate OAuth or make an explicit, operator-approved "
+                    "API invocation; Hermes will not spend API credits automatically."
+                )
             return _resolve_runtime_from_pool_entry(
                 provider=provider,
                 entry=entry,

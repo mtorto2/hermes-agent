@@ -60,6 +60,27 @@ def _load_config_safe() -> Optional[dict]:
         return None
 
 
+def api_key_fallback_requires_approval(provider: str) -> bool:
+    """Return whether automatic rotation onto an API key is gated for *provider*.
+
+    An API key can remain available for an explicitly configured app or one-off
+    invocation while Hermes refuses to spend from it as an automatic fallback
+    after a subscription/OAuth credential is exhausted. The setting is opt-in:
+
+    ``credential_pool_api_key_fallback_approval:\n  anthropic: true``
+
+    Callers must fail closed when the setting is enabled but no live approval
+    surface is available.
+    """
+    config = _load_config_safe()
+    if not isinstance(config, dict):
+        return False
+    policies = config.get("credential_pool_api_key_fallback_approval")
+    if not isinstance(policies, dict):
+        return False
+    return bool(policies.get(str(provider or "").strip().lower(), False))
+
+
 # --- Status and type constants ---
 
 STATUS_OK = "ok"
