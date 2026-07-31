@@ -1,93 +1,81 @@
 # Next Time
 
-Updated: 2026-07-16
+Updated: 2026-07-31
 Project: hermes-agent live local fork
 Prepared by: Hermes
 
 ## Current state
+
 - Live checkout: `/Users/matt/.hermes/hermes-agent`.
-- Branch: `main`, tracking Matt's `fork/main` production branch.
-- Matt fork remote (`fork`) is the normal push target; Nous upstream (`origin`) is intake-only unless Matt explicitly asks otherwise.
-- Latest functional change: `0b301a6a699dd7c506ac4bd56983e52f3dca83b7` — `fix(agent-lights): retain lifecycle state during slot retries`.
-- The change preserves Agent Lights lifecycle state across concurrent updates, identifies profile-owned slots correctly, and retries allocation when a slot becomes available.
-- Targeted verification passed: `429` tests across Agent Lights and TUI gateway/resume coverage.
-- This source change is not runtime-active until a gateway/TUI process is explicitly restarted and smoke-tested.
+- Branch: `main`; normal publish target remains Matt's `fork/main`. Nous `origin` is intake-only unless Matt explicitly approves an upstream contribution.
+- Current local HEAD: `e20e93bd7` — `test(ui-tui): stabilize Ink Vitest resolution`.
+- The July 31 integration is anchored by `89360b793` — `Merge origin/main preserving local Hermes workflows`.
+- Live working tree was verified clean after restoring a generated-only `package-lock.json` reordering.
+- Default, Tate/business, and Aurelius/personal gateways were restarted on July 31 and each has a fresh Telegram connection/running marker. Tate/business holds the singleton Kanban dispatcher lock; Default and Aurelius correctly do not.
+- The current TUI was relaunched after the update. Agent Lights is also running.
 
-## What changed in the 2026-07-16 Agent Lights/TUI update
-- Serialized Agent Lights slot-status writes so the newest lifecycle event wins during concurrent notification polling.
-- Propagated `HERMES_HOME` and `HERMES_PROFILE` to TUI launches, preserving Default/Tate/Aurelius slot ownership.
-- Retained TUI slots through session teardown and retry registration every 30 seconds when capacity was initially full.
-- Added focused regression coverage for profile ownership, lifecycle preservation, retries, and TUI resume behavior.
+## What changed in the July 31 update
 
-## Prior 2026-07-08 wrap-up
-- Applied PR #2's Desktop onboarding/model-preservation fix into the live checkout via cherry-pick:
-  - `c77e334f0 fix(desktop): preserve working model during onboarding (#2)`
-- Merged latest fetched Nous upstream into live local `main`:
-  - `e83e38c06 Merge latest Nous upstream into live local main`
-- Created safety refs before the upstream merge:
-  - branch: `backup/pre-nous-local-merge-20260708-144605`
-  - tag: `backup/pre-nous-local-merge-20260708-144605-tag`
-- Because `fork/main` had the squash commit `19f2354f3` while live had equivalent cherry-pick `c77e334f0`, created a tree-identical ancestry merge so `fork/main` could fast-forward without force:
-  - `c12d53dfa Merge remote-tracking branch 'fork/main'`
-  - tree before/after that merge was identical.
-- Removed the temporary registered PR worktree `/private/tmp/hermes-pr1-narrow` and pruned stale worktree metadata.
+- Integrated the reviewed Nous intake while preserving Matt-local profile isolation, Codex OAuth routing, Telegram voice/TTS, Agent Lights, Kanban visibility, Apple Calendar safety, input compactor behavior, local slash commands, and profile-specific gateways.
+- Hardened the approval/TUI/gateway regression suite after investigating order-sensitive test failures.
+- Added the follow-up UI test-harness correction in `e20e93bd7`:
+  - Vitest resolves `@hermes/ink` to in-tree source instead of a potentially stale local build artifact.
+  - Vitest enforces `NODE_ENV=test` even when the interactive shell exports production mode.
 
-## Verification from 2026-07-08
-- Desktop focused verification passed:
-  - `npm run typecheck --workspace apps/desktop`
-  - `npm run test:ui --workspace apps/desktop -- src/store/onboarding.test.ts` (`15 passed`)
-  - `npm run build --workspace apps/desktop`
-- Upstream-focused Python verification passed:
-  - `.venv/bin/python -m pytest tests/agent/test_compression_small_ctx_threshold_floor.py tests/agent/test_context_compressor.py tests/run_agent/test_infinite_compaction_loop.py -q -o 'addopts='` (`180 passed`)
-  - `.venv/bin/python -m pytest tests/gateway/test_session_hygiene.py -q -o 'addopts='` (`26 passed`)
-- CLI/runtime smoke passed:
-  - imports: `cli`, `run_agent`, `hermes_cli.main`, `gateway.run`, `agent.context_compressor`
-  - `hermes chat -Q --toolsets safe -q 'Smoke test. Reply exactly: OK'` returned `OK`
-- Desktop packaged and launched from:
-  - `/Users/matt/.hermes/hermes-agent/apps/desktop/release/mac-arm64/Hermes.app`
-  - package build stamp commit: `e83e38c06b590eb95678cc5248b309c76eb14b4b`
-  - System Events saw one `Hermes` process after launch.
-- Config safety check after Desktop launch stayed intact:
-  - `model.provider: openai-codex`
-  - `model.default: gpt-5.5`
-  - `model.base_url: ''`
-- No gateway/Tate/Aurelius restart was performed during this wrap-up.
+## Verification completed
 
-## Upstream note
-- Nous `origin/main` is intake-only. Re-fetch and re-measure divergence before proposing any future upstream sync.
-- Do not treat upstream divergence as an error; preserve the local fork's protected behavior and use a reviewable sync branch if Matt requests an update.
+- Full UI suite: `1,463 passed, 4 skipped`.
+- UI typecheck passed.
+- All three launchd gateway definitions match the current live Hermes install.
+- Fresh post-restart logs confirmed Telegram connection and gateway-running markers for Default, Tate/business, and Aurelius/personal.
+- Live Git working tree was clean after the July 31 worktree cleanup.
 
-## Active/runtime notes
-- Desktop app was left running from the newly packaged live build.
-- Gateways were not restarted; any already-running gateway/profile processes may still be using their previous loaded code until explicitly restarted.
-- Do not restart gateways, Tate, Aurelius, dashboard, or other running processes without explicit approval.
+## Upstream / fork posture
+
+- The fetched `origin/main` currently has three newer commits not integrated locally:
+  1. `5835201de` — queued paste payload atomicity fix; overlaps TUI/CLI queue behavior and should be reviewed in an isolated worktree before intake.
+  2. `daa1befaf` — JavaScript formatting-only cleanup.
+  3. `afc54ca80` — DeepSeek V4 Flash catalog entry.
+- Do not run a generic updater or merge these directly into live `main`; the queued-paste change overlaps recently hardened local paths.
+- Current `main` is ahead of the fetched `fork/main` by 3,067 commits. This is a publishing/history review item, not a runtime failure. Do not blindly push or force-push; reconcile the fork relationship deliberately in an isolated review.
+- No push to Matt's fork or Nous upstream was performed in the July 31 rollout.
+
+## Worktree housekeeping
+
+- Removed six clean historical Hermes sync worktree checkouts from June 23 through July 21, reclaiming 8.06 GiB.
+- Preserved their lightweight Git branches as rollback/history references.
+- Retained the July 31 baseline/audit worktree and the July 31 sync worktree, along with the live checkout and Dropbox DEV checkout.
 
 ## Known preserved invariants
-- Preserve Matt-local features: profile separation, Telegram voice/TTS, Codex OAuth route, Agent Lights/WiZ cues, Kanban worker visibility, Apple Calendar, input compactor, local slash commands such as `/nah`, and profile-specific gateways.
-- Active model route should remain Codex OAuth: `openai-codex / gpt-5.5`.
-- Do not initiate xAI/Grok OAuth or xAI model setup unless Matt explicitly requests it.
+
+- Preserve Default / Tate / Aurelius profile separation and lane identity.
+- Keep normal model routing on Codex OAuth; do not silently introduce API-key or xAI/Grok routing.
+- Preserve Telegram STT/TTS, no-duplicate final delivery, Agent Lights lifecycle/slot behavior, Kanban visibility, Apple Calendar safeguards, and local slash commands such as `/nah` and `/repos`.
+- Keep Nous upstream as update intake only; Matt's fork/local instance is the normal write target.
 
 ## Next likely actions
-1. If Matt wants newer Nous work, start a controlled upstream-sync review with a fresh fetch, scope review, and focused tests before any push.
-2. If Matt wants runtime activation, ask before restarting gateways/profiles; then restart and run cheap one-shot checks per profile.
-3. Do new Hermes implementation work in the dev worktree or a short-lived feature worktree before promoting it to `main`.
-4. Optional later cleanup: review/prune older sync worktrees under `/Users/matt/.hermes/worktrees/` once Matt is comfortable they are no longer needed.
-5. Continue using `fork/main` as the live local-fork branch unless Matt explicitly chooses a different branch policy.
+
+1. If queued paste behavior matters, review `5835201de` in a new isolated worktree, run focused queue/TUI tests, and ask before promotion or restart.
+2. Separately audit the large local-main versus `fork/main` publishing divergence before any push.
+3. Do new Hermes implementation work in `/Users/matt/Dropbox/CLIENTS/SAVANT SOFTWARE SYSTEMS/DEV/hermes-agent-dev` or a short-lived feature worktree; keep the live checkout on `main`.
+4. Prune the two retained July 31 worktrees only after Matt is comfortable they are no longer useful as audit/rollback surfaces.
 
 ## Do not touch without approval
+
 - Do not push to NousResearch/upstream.
-- Do not force-push `fork/main`.
-- Do not initiate xAI/Grok OAuth or xAI model setup unless Matt explicitly requests it.
-- Do not restart gateway, Tate, Aurelius, dashboard, or production-like services without explicit approval.
+- Do not force-push or blindly push `fork/main`.
+- Do not merge/rebase upstream commits directly into live `main`.
+- Do not restart gateways, Tate, Aurelius, dashboard, or production-like services without explicit approval.
 - Do not edit global config, credentials, secrets, or profile runtime state without explicit approval.
-- Do not overwrite dirty work from another active Hermes/VS Code/terminal lane.
+- Do not initiate xAI/Grok OAuth or model setup unless Matt explicitly requests it.
 
 ## Source-of-truth docs to read next
+
 - `NEXT_TIME.md` first.
 - `AGENTS.md`.
 - Relevant repo-local docs (`CONTEXT.md`, `docs/agents/`, `docs/adr/`, `docs/product-brief.md` where present).
-- Relevant Hermes skills/reference docs for the requested slice.
 
 ## Sensitive information check
+
 - [x] No API keys, passwords, tokens, cookies, raw credentials, or personal/private data are included.
-- [x] Secrets are referenced only by env var name, vault item, or approved credential path.
+- [x] Secrets are referenced only by provider/policy name or approved credential path.
