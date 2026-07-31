@@ -1,6 +1,7 @@
 import {
   forceRedraw,
   type ScrollBoxHandle,
+  setDimFallbackColor,
   useApp,
   useHasSelection,
   useSelection,
@@ -15,13 +16,11 @@ import { MAX_HISTORY, WHEEL_SCROLL_STEP } from '../config/limits.js'
 import { RESIZE_COALESCE_MS } from '../config/timing.js'
 import { hasLeadGap, prevRenderedMsg } from '../domain/blockLayout.js'
 import { SECTION_NAMES, sectionMode } from '../domain/details.js'
-import { attachedImageNotice, imageTokenMeta } from '../domain/messages.js'
-import { composeTabTitle, fmtCwdBranch, fmtProjectCwdBranch, shortCwd } from '../domain/paths.js'
+import { fmtProjectCwdBranch } from '../domain/paths.js'
 import { sessionScopedModelArg } from '../domain/slash.js'
 import { type GatewayClient } from '../gatewayClient.js'
 import type {
   ClarifyRespondResponse,
-  ClipboardPasteResponse,
   ConfigSetResponse,
   GatewayEvent,
   SessionActiveListResponse,
@@ -39,19 +38,21 @@ import { asRpcResult, rpcErrorMessage } from '../lib/rpc.js'
 import { terminalParityHints } from '../lib/terminalParity.js'
 import { buildToolTrailLine, formatAbandonedClarify, sameToolTrailGroup, toolTrailLabel } from '../lib/text.js'
 import { estimatedMsgHeight, messageHeightKey } from '../lib/virtualHeights.js'
+import { onUserWidgets } from '../sdk/userWidgets.js'
 import type { Msg, PanelSection, SlashCatalog } from '../types.js'
 
 import { createGatewayEventHandler } from './createGatewayEventHandler.js'
 import { createSlashHandler } from './createSlashHandler.js'
 import { planGatewayRecovery } from './gatewayRecovery.js'
 import { getInputSelection } from './inputSelectionStore.js'
-import { type GatewayRpc, type TranscriptRow } from './interfaces.js'
+import { type GatewayRpc, type StateSetter, type TranscriptRow } from './interfaces.js'
 import { $overlayState, patchOverlayState } from './overlayStore.js'
 import { $goodVibesTick } from './petFlashStore.js'
 import { scrollWithSelectionBy } from './scroll.js'
 import { turnController } from './turnController.js'
 import { patchTurnState, useTurnSelector } from './turnStore.js'
 import { $uiState, getUiState, patchUiState } from './uiStore.js'
+import { useBatteryPoll } from './useBatteryPoll.js'
 import { useComposerState } from './useComposerState.js'
 import { useConfigSync } from './useConfigSync.js'
 import { useInputHandlers } from './useInputHandlers.js'
@@ -221,7 +222,7 @@ export function useMainApp(gw: GatewayClient) {
   const colsRef = useRef(cols)
   const scrollRef = useRef<null | ScrollBoxHandle>(null)
   const onEventRef = useRef<(ev: GatewayEvent) => void>(() => {})
-  const clipboardPasteRef = useRef<(quiet?: boolean) => Promise<void> | void>(() => {})
+  const sysRef = useRef<(text: string) => void>(() => {})
   const submitRef = useRef<(value: string) => void>(() => {})
   const terminalHintsShownRef = useRef(new Set<string>())
   const historyItemsRef = useRef(historyItems)
@@ -243,6 +244,14 @@ export function useMainApp(gw: GatewayClient) {
   useEffect(() => {
     selection.setSelectionBgColor(ui.theme.color.selectionBg)
   }, [selection, ui.theme.color.selectionBg])
+
+  // Terminals that ignore SGR 2 (Apple_Terminal) get a literal color for
+  // `dim` instead. Feed it the theme's muted tone so dimmed spans stay in
+  // the palette — a hardcoded gray renders as a foreign foreground next to
+  // themed text on the same line.
+  useEffect(() => {
+    setDimFallbackColor(ui.theme.color.muted)
+  }, [ui.theme.color.muted])
 
   // macOS Terminal.app does not forward Cmd+C to fullscreen TUIs that enable
   // mouse tracking, so the only reliable native-feeling path is iTerm-style
@@ -286,11 +295,8 @@ export function useMainApp(gw: GatewayClient) {
 
   const composer = useComposerState({
     gw,
-    onClipboardPaste: quiet => clipboardPasteRef.current(quiet),
-    onImageAttached: info => {
-      sys(attachedImageNotice(info))
-    },
-    submitRef
+    submitRef,
+    sys: text => sysRef.current(text)
   })
 
   const { actions: composerActions, refs: composerRefs, state: composerState } = composer
@@ -435,6 +441,26 @@ export function useMainApp(gw: GatewayClient) {
 
   const sys = useCallback((text: string) => appendMessage({ role: 'system', text }), [appendMessage])
 
+  // Hot-loaded user widgets announce themselves — a silently-registered
+  // widget is indistinguishable from a failed one. Errors surface too.
+  useEffect(
+    () =>
+      onUserWidgets(({ added, errors, removed }) => {
+        for (const id of added) {
+          sys(`widget /${id} is live — type /${id} to open`)
+        }
+
+        for (const id of removed) {
+          sys(`widget /${id} removed (file deleted)`)
+        }
+
+        for (const err of errors) {
+          sys(`widget ${err.file} failed to load: ${err.message}`)
+        }
+      }),
+    [sys]
+  )
+
   const page = useCallback(
     (text: string, title?: string) => patchOverlayState({ pager: { lines: text.split('\n'), offset: 0, title } }),
     []
@@ -538,6 +564,7 @@ export function useMainApp(gw: GatewayClient) {
   }, [ui.busy, turnStartedAt])
 
   useConfigSync({ gw, setBellOnComplete, setVoiceEnabled, setVoiceRecordKey, sid: ui.sid })
+  useBatteryPoll(gw)
 
   useEffect(() => {
     if (!ui.sid) {
@@ -586,8 +613,9 @@ export function useMainApp(gw: GatewayClient) {
     }
   }, [gw, ui.sid])
 
-  // Tab title: `⚠` waiting on approval/sudo/secret/clarify, `⏳` busy, `✓` idle.
-  // Format: `<marker> <session name> · <model> · <cwd>` — name/cwd omitted when absent.
+  // TUI-owned terminal title: `⚠` waiting on approval/sudo/secret/clarify,
+  // `⏳` busy, `✓` idle. Terminal.app and Agent Lights slots intentionally
+  // receive no OSC title writes, preserving human-owned terminal/tab titles.
   const model = ui.info?.model?.replace(/^.*\//, '') ?? ''
 
   const marker = overlay.approval || overlay.sudo || overlay.secret || overlay.clarify ? '⚠' : ui.busy ? '⏳' : '✓'
@@ -684,27 +712,7 @@ export function useMainApp(gw: GatewayClient) {
     [appendMessage, overlay.clarify, rpc]
   )
 
-  const paste = useCallback(
-    (quiet = false) =>
-      rpc<ClipboardPasteResponse>('clipboard.paste', { session_id: getUiState().sid }).then(r => {
-        if (!r) {
-          return
-        }
-
-        if (r.attached) {
-          const meta = imageTokenMeta(r)
-
-          return sys(`📎 Image #${r.count} attached from clipboard${meta ? ` · ${meta}` : ''}`)
-        }
-
-        if (!quiet) {
-          sys(r.message || 'No image found in clipboard')
-        }
-      }),
-    [rpc, sys]
-  )
-
-  clipboardPasteRef.current = paste
+  sysRef.current = sys
 
   const { dispatchSubmission, send, sendQueued, submit } = useSubmission({
     appendMessage,
@@ -864,10 +872,11 @@ export function useMainApp(gw: GatewayClient) {
     () =>
       createSlashHandler({
         composer: {
+          attachClipboardImage: composerActions.attachClipboardImage,
+          attachImagePath: composerActions.attachImagePath,
           enqueue: composerActions.enqueue,
           hasSelection,
           openEditor: composerActions.openEditor,
-          paste,
           queueRef: composerRefs.queueRef,
           selection,
           setInput: composerActions.setInput
@@ -906,7 +915,6 @@ export function useMainApp(gw: GatewayClient) {
       maybeWarn,
       page,
       panel,
-      paste,
       selection,
       send,
       session,
@@ -1044,16 +1052,21 @@ export function useMainApp(gw: GatewayClient) {
           state.streamSegments.some(segment => {
             const hasThinking = Boolean(segment.thinking?.trim())
             const hasTrailTools = Boolean(segment.tools?.length)
+            // A MoA reference segment (segment.isMoaReference) is the
+            // user-facing mixture-of-agents process the user opted into, not
+            // private model reasoning — it must keep the live progress area
+            // (and therefore StreamingAssistant) up even when the thinking
+            // panel is hidden, matching shouldShowThinkingTrail's settled-
+            // transcript override in messageLine.tsx (#64657/#64701).
+            const thinkingVisible = thinkingPanelVisible || Boolean(segment.isMoaReference)
 
             if (segment.kind === 'trail' && !segment.text) {
-              return (
-                (thinkingPanelVisible && hasThinking) || ((toolsPanelVisible || activityPanelVisible) && hasTrailTools)
-              )
+              return (thinkingVisible && hasThinking) || ((toolsPanelVisible || activityPanelVisible) && hasTrailTools)
             }
 
             return (
               Boolean(segment.text?.trim()) ||
-              (thinkingPanelVisible && hasThinking) ||
+              (thinkingVisible && hasThinking) ||
               ((toolsPanelVisible || activityPanelVisible) && hasTrailTools)
             )
           }) ||
@@ -1105,6 +1118,24 @@ export function useMainApp(gw: GatewayClient) {
     ]
   )
 
+  /**
+   * Every keystroke lands here, so this is where attached payloads are
+   * reconciled against the tokens still in the text — deleting an
+   * `[[ Image N ]]` is how the user unattaches it.
+   */
+  const updateInput = useCallback<StateSetter<string>>(
+    next => {
+      composerActions.setInput(prev => {
+        const value = typeof next === 'function' ? next(prev) : next
+
+        composerActions.syncTokens(value)
+
+        return value
+      })
+    },
+    [composerActions]
+  )
+
   const appComposer = useMemo(
     () => ({
       cols,
@@ -1118,10 +1149,10 @@ export function useMainApp(gw: GatewayClient) {
       queueEditIdx: composerState.queueEditIdx,
       queuedDisplay: composerState.queuedDisplay,
       submit,
-      updateInput: composerActions.setInput,
+      updateInput,
       voiceRecordKey
     }),
-    [cols, composerActions, composerState, empty, pagerPageSize, submit, voiceRecordKey]
+    [cols, composerActions, composerState, empty, pagerPageSize, submit, updateInput, voiceRecordKey]
   )
 
   // Pass current progress through unfrozen — streaming update throttling

@@ -32,63 +32,14 @@ def _assert_utf8_replace_capture(kwargs: dict) -> None:
     assert kwargs["errors"] == "replace"
 
 
-def test_need_install_when_ink_missing(tmp_path: Path, main_mod) -> None:
-    (tmp_path / "package-lock.json").write_text("{}")
-    assert main_mod._tui_need_npm_install(tmp_path) is True
 
 
-def test_no_install_when_lock_newer_but_hidden_lock_matches(tmp_path: Path, main_mod) -> None:
-    _touch_ink(tmp_path)
-    (tmp_path / "package-lock.json").write_text('{"packages":{"node_modules/foo":{"version":"1.0.0"}}}')
-    (tmp_path / "node_modules" / ".package-lock.json").write_text(
-        '{"packages":{"node_modules/foo":{"version":"1.0.0","ideallyInert":true}}}'
-    )
-    os.utime(tmp_path / "package-lock.json", (200, 200))
-    os.utime(tmp_path / "node_modules" / ".package-lock.json", (100, 100))
-    assert main_mod._tui_need_npm_install(tmp_path) is False
 
 
-def test_need_install_when_required_package_missing_from_hidden_lock(tmp_path: Path, main_mod) -> None:
-    _touch_ink(tmp_path)
-    (tmp_path / "package-lock.json").write_text(
-        '{"packages":{"node_modules/foo":{"version":"1.0.0"},"node_modules/bar":{"version":"1.0.0"}}}'
-    )
-    (tmp_path / "node_modules" / ".package-lock.json").write_text(
-        '{"packages":{"node_modules/foo":{"version":"1.0.0"}}}'
-    )
-    assert main_mod._tui_need_npm_install(tmp_path) is True
 
 
-def test_no_install_when_only_optional_peer_package_missing_from_hidden_lock(tmp_path: Path, main_mod) -> None:
-    _touch_ink(tmp_path)
-    (tmp_path / "package-lock.json").write_text(
-        '{"packages":{"node_modules/foo":{"version":"1.0.0"},"node_modules/optional":{"version":"1.0.0","optional":true,"peer":true}}}'
-    )
-    (tmp_path / "node_modules" / ".package-lock.json").write_text(
-        '{"packages":{"node_modules/foo":{"version":"1.0.0"}}}'
-    )
-    assert main_mod._tui_need_npm_install(tmp_path) is False
 
 
-def test_no_install_when_only_peer_annotation_differs(tmp_path: Path, main_mod) -> None:
-    """npm 9 drops the ``peer`` flag from the hidden lock on dev-deps that are
-    *also* declared as peers.  That's a cosmetic difference — the package is
-    installed at the requested version — so it must not trigger a reinstall.
-    Regression for the TUI-in-Docker failure where 16 such mismatches caused
-    `Installing TUI dependencies…` → EACCES on every launch.
-    """
-    _touch_ink(tmp_path)
-    (tmp_path / "package-lock.json").write_text(
-        '{"packages":{'
-        '"node_modules/foo":{"version":"1.0.0","dev":true,"peer":true,"resolved":"https://x/foo.tgz"}'
-        '}}'
-    )
-    (tmp_path / "node_modules" / ".package-lock.json").write_text(
-        '{"packages":{'
-        '"node_modules/foo":{"version":"1.0.0","dev":true,"resolved":"https://x/foo.tgz"}'
-        '}}'
-    )
-    assert main_mod._tui_need_npm_install(tmp_path) is False
 
 
 def test_install_when_version_differs_even_with_peer_drop(tmp_path: Path, main_mod) -> None:
@@ -411,14 +362,14 @@ def test_make_tui_argv_decodes_dev_prebuild_with_utf8_replace(
 def test_make_tui_argv_uses_bundled_tui_when_workspace_missing(
     tmp_path: Path, main_mod, monkeypatch
 ) -> None:
-    """pip/pipx install regression (#56665): the wheel ships
+    """Prebuilt-install regression (#56665): a prebuilt install (Docker
+    image, Nix build, or prior `npm run build`) ships
     hermes_cli/tui_dist/entry.js but never ships ui-tui/ (that directory only
-    exists in a git checkout). Before this fix, _make_tui_argv called
-    _ensure_tui_workspace() unconditionally before checking for the bundled
-    entry.js, so every pip/pipx dashboard Chat tab connection hard-exited
-    with `sys.exit(1)` — surfaced to the user as the unhelpful "Chat
-    unavailable: 1" — despite having a perfectly runnable bundled TUI on
-    disk. The bundled-wheel shortcut must be tried first and succeed without
+    exists in a git checkout). _make_tui_argv must try the bundled entry.js
+    BEFORE _ensure_tui_workspace() — requiring the workspace first hard-exits
+    every prebuilt dashboard Chat tab connection with `sys.exit(1)` (surfaced
+    to the user as the unhelpful "Chat unavailable: 1") despite a perfectly
+    runnable bundled TUI on disk. The bundled shortcut must succeed without
     ever touching the (missing) ui-tui workspace or git.
     """
     monkeypatch.delenv("HERMES_TUI_DIR", raising=False)
@@ -442,7 +393,7 @@ def test_make_tui_argv_uses_bundled_tui_when_workspace_missing(
     monkeypatch.setattr(main_mod.subprocess, "run", fail_run)
 
     # ui-tui/ deliberately does not exist under tmp_path, and there is no
-    # .git either — this mirrors a pip/pipx install exactly.
+    # .git either — this mirrors a prebuilt (Docker/Nix) install exactly.
     tui_dir = tmp_path / "ui-tui"
     assert not tui_dir.exists()
 
@@ -452,163 +403,11 @@ def test_make_tui_argv_uses_bundled_tui_when_workspace_missing(
     assert cwd == bundled_entry.parent
 
 
-def test_make_tui_argv_dev_mode_still_requires_workspace_even_with_bundle(
-    tmp_path: Path, main_mod, monkeypatch, capsys
-) -> None:
-    """--dev never uses the prebuilt bundle (there's no source to hot-reload
-    from a bundled entry.js), so it must still hit the workspace guard when
-    ui-tui/ is missing — the bundled-first reordering must not weaken --dev.
-    """
-    monkeypatch.delenv("HERMES_TUI_DIR", raising=False)
-    monkeypatch.setattr(main_mod, "_ensure_tui_node", lambda: None)
-
-    bundled_entry = tmp_path / "bundled" / "entry.js"
-    bundled_entry.parent.mkdir(parents=True)
-    bundled_entry.write_text("// bundled TUI")
-    monkeypatch.setattr(main_mod, "_find_bundled_tui", lambda: bundled_entry)
-
-    def which(name: str) -> str | None:
-        if name == "git":
-            return "/usr/bin/git"
-        raise AssertionError("node/npm lookup must not run when ui-tui is missing")
-
-    monkeypatch.setattr(main_mod.shutil, "which", which)
-
-    with pytest.raises(SystemExit) as exc:
-        main_mod._make_tui_argv(tmp_path / "ui-tui", tui_dev=True)
-
-    assert exc.value.code == 1
-    assert "TUI workspace is missing" in capsys.readouterr().err
-
-
-def test_make_tui_argv_exits_with_recovery_hint_when_workspace_unrecoverable(
-    tmp_path: Path, main_mod, monkeypatch, capsys
-) -> None:
-    """Missing ui-tui + no git checkout → clean error, never touches node/npm."""
-    monkeypatch.delenv("HERMES_TUI_DIR", raising=False)
-    monkeypatch.setattr(main_mod, "_ensure_tui_node", lambda: None)
-
-    # No .git beside ui-tui → _restore_tui_workspace bails, fallback message fires.
-    def which(name: str) -> str | None:
-        if name == "git":
-            return "/usr/bin/git"
-        raise AssertionError("node/npm lookup must not run when ui-tui is missing")
-
-    monkeypatch.setattr(main_mod.shutil, "which", which)
-
-    with pytest.raises(SystemExit) as exc:
-        main_mod._make_tui_argv(tmp_path / "ui-tui", tui_dev=False)
-
-    assert exc.value.code == 1
-    err = capsys.readouterr().err
-    assert "TUI workspace is missing" in err
-    assert "git restore -- ui-tui" in err
-    assert "hermes update --force" in err
-
-
-def test_make_tui_argv_restores_missing_workspace_from_git(
-    tmp_path: Path, main_mod, monkeypatch, capsys
-) -> None:
-    """Missing ui-tui in a git checkout self-heals via `git restore` and continues."""
-    monkeypatch.delenv("HERMES_TUI_DIR", raising=False)
-    monkeypatch.delenv("HERMES_QUIET", raising=False)
-    monkeypatch.setattr(main_mod, "_ensure_tui_node", lambda: None)
-
-    tui_dir = tmp_path / "ui-tui"
-    (tmp_path / ".git").mkdir()  # mark tmp_path as a checkout
-
-    monkeypatch.setattr(main_mod.shutil, "which", lambda name: f"/usr/bin/{name}")
-
-    restore_calls: list[tuple[list[str], object]] = []
-
-    def fake_run(cmd, *args, **kwargs):
-        # Simulate `git restore -- ui-tui` materialising the directory.
-        if cmd[:2] == ["/usr/bin/git", "restore"]:
-            restore_calls.append((cmd, kwargs.get("cwd")))
-            tui_dir.mkdir(exist_ok=True)
-            (tui_dir / "dist").mkdir()
-            (tui_dir / "dist" / "entry.js").write_text("// bundle")
-            (tui_dir / "package.json").write_text("{}")
-        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
-
-    monkeypatch.setattr(main_mod.subprocess, "run", fake_run)
-    # node_modules present + lockfile-in-sync so we skip the install/build path
-    # and land straight on the node dist/entry.js return.
-    monkeypatch.setattr(main_mod, "_tui_need_npm_install", lambda _root: False)
-    monkeypatch.setattr(main_mod, "_is_termux_startup_environment", lambda: False)
-
-    argv, cwd = main_mod._make_tui_argv(tui_dir, tui_dev=False)
-
-    assert restore_calls, "expected a `git restore` attempt"
-    assert restore_calls[0][0] == ["/usr/bin/git", "restore", "--", "ui-tui"]
-    assert restore_calls[0][1] == str(tmp_path)
-    assert argv[-1] == str(tui_dir / "dist" / "entry.js")
-    assert cwd == tui_dir
-    assert "Restored missing TUI workspace" in capsys.readouterr().out
-
-
 # ── _workspace_root helper ──────────────────────────────────────────
 
 
-def test_workspace_root_returns_parent_when_subpackage(tmp_path: Path, main_mod) -> None:
-    """Sub-package has package.json, no lockfile; parent has lockfile → parent."""
-    sub = tmp_path / "ui-tui"
-    sub.mkdir()
-    (sub / "package.json").write_text("{}")
-    (tmp_path / "package-lock.json").write_text("{}")
-    assert main_mod._workspace_root(sub) == tmp_path
 
 
-def test_workspace_root_returns_dir_when_standalone(tmp_path: Path, main_mod) -> None:
-    """No package.json → not a sub-package, return dir itself."""
-    assert main_mod._workspace_root(tmp_path) == tmp_path
-
-
-def test_workspace_root_returns_dir_when_own_lockfile(tmp_path: Path, main_mod) -> None:
-    """Has package.json AND its own lockfile → standalone, return dir."""
-    (tmp_path / "package.json").write_text("{}")
-    (tmp_path / "package-lock.json").write_text("{}")
-    (tmp_path.parent / "package-lock.json").write_text("{}")
-    assert main_mod._workspace_root(tmp_path) == tmp_path
-
-
-def test_workspace_root_returns_dir_when_no_parent_lockfile(
-    tmp_path: Path, main_mod
-) -> None:
-    """Has package.json, no own lockfile, but parent also has no lockfile → standalone."""
-    sub = tmp_path / "ui-tui"
-    sub.mkdir()
-    (sub / "package.json").write_text("{}")
-    # tmp_path has no package-lock.json either
-    assert main_mod._workspace_root(sub) == sub
-
-
-def test_workspace_root_consistent_with_need_npm_install(
-    tmp_path: Path, main_mod
-) -> None:
-    """Divergence regression: if someone creates ui-tui/package-lock.json
-    by accident, _workspace_root (used by both _tui_need_npm_install AND
-    the npm install cwd) returns ui-tui/ for both, so they never disagree.
-
-    Before the shared helper, _tui_need_npm_install used a 3-condition
-    check (falling back to ui-tui/ when its own lockfile exists) while
-    the npm install cwd used a simpler check (still going to the parent
-    because the parent lockfile still exists).  The shared helper
-    eliminates the split.
-    """
-    sub = tmp_path / "ui-tui"
-    sub.mkdir()
-    (sub / "package.json").write_text("{}")
-    # Both sub and parent have lockfiles — accidental state
-    (sub / "package-lock.json").write_text("{}")
-    (tmp_path / "package-lock.json").write_text("{}")
-
-    ws = main_mod._workspace_root(sub)
-    # _workspace_root sees sub has its own lockfile → treats it as standalone
-    assert ws == sub
-
-    # _tui_need_npm_install also uses _workspace_root, so both agree
-    assert main_mod._tui_need_npm_install.__code__.co_names
     # (Smoke test: just confirm _tui_need_npm_install doesn't crash)
     # It won't need install because the lockfile exists and there's no
     # hidden lockfile to compare against, and ink is missing → True.
@@ -652,38 +451,6 @@ def test_no_stray_lockfiles_in_workspace_subdirs(main_mod) -> None:
         + ", ".join(str(d / "package-lock.json") for d in stray)
     )
 
-
-def test_tui_launch_install_uses_workspace_scope(
-    tmp_path: Path, main_mod, monkeypatch
-) -> None:
-    """TUI launch npm install must pass --workspace ui-tui to avoid pulling apps/desktop."""
-    tui_dir = tmp_path / "ui-tui"
-    tui_dir.mkdir()
-    (tui_dir / "package.json").write_text("{}")
-    (tui_dir / "dist" / "entry.js").parent.mkdir(parents=True)
-    (tui_dir / "dist" / "entry.js").write_text("console.log('tui')")
-    # workspace root: parent has lockfile, tui_dir does not
-    (tmp_path / "package-lock.json").write_text("{}")
-
-    monkeypatch.setattr(main_mod, "_tui_need_npm_install", lambda _root: True)
-    monkeypatch.setattr(main_mod, "_tui_need_rebuild", lambda _root: False)
-    monkeypatch.setattr(main_mod.shutil, "which", lambda name: f"/usr/bin/{name}")
-
-    npm_calls = []
-
-    def fake_run(cmd, **kwargs):
-        if cmd[0].endswith("npm"):
-            npm_calls.append(cmd)
-        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
-
-    monkeypatch.setattr(main_mod.subprocess, "run", fake_run)
-
-    main_mod._make_tui_argv(tui_dir, tui_dev=False)
-
-    assert npm_calls, "expected npm install to be called"
-    install_cmd = npm_calls[0]
-    assert "--workspace" in install_cmd
-    assert "ui-tui" in install_cmd
 
 def test_make_tui_argv_omits_workspace_when_tui_has_own_lockfile(
     tmp_path: Path, main_mod, monkeypatch

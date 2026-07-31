@@ -2,15 +2,20 @@ import { atom, computed } from 'nanostores'
 
 import { MOUSE_TRACKING } from '../config/env.js'
 import { ZERO } from '../domain/usage.js'
+import { bootTheme } from '../lib/themeBoot.js'
 import { DEFAULT_THEME, fromSkin } from '../theme.js'
 
 import { DEFAULT_INDICATOR_STYLE, type UiState } from './interfaces.js'
 
+// The profile launcher supplies an exact serialized skin. It must win over a
+// prior terminal boot cache so profiles cannot briefly inherit another
+// profile's brand. The cache remains the flash-free fallback for ordinary
+// launches without an explicit skin.
 const initialTheme = () => {
   const raw = process.env.HERMES_TUI_INITIAL_SKIN
 
   if (!raw) {
-    return DEFAULT_THEME
+    return bootTheme ?? DEFAULT_THEME
   }
 
   try {
@@ -32,20 +37,23 @@ const initialTheme = () => {
       skin.help_header ?? ''
     )
   } catch {
-    return DEFAULT_THEME
+    return bootTheme ?? DEFAULT_THEME
   }
 }
 
 const buildUiState = (): UiState => {
   const theme = initialTheme()
 
-  return ({
+  return {
+    battery: false,
+    batteryStatus: null,
     bgTasks: new Set(),
     busy: false,
     busyInputMode: 'queue',
     compact: false,
     detailsMode: 'collapsed',
     detailsModeCommandOverride: false,
+    focusView: false,
     indicatorStyle: DEFAULT_INDICATOR_STYLE,
     info: null,
     liveSessionCount: 0,
@@ -63,7 +71,7 @@ const buildUiState = (): UiState => {
     streaming: true,
     theme,
     usage: ZERO
-  })
+  }
 }
 
 export const $uiState = atom<UiState>(buildUiState())
