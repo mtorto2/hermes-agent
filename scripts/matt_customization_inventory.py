@@ -45,7 +45,13 @@ FEATURE_HINTS = {
 
 def run_git(args: list[str]) -> str:
     try:
-        return subprocess.check_output(["git", *args], text=True, stderr=subprocess.STDOUT)
+        return subprocess.check_output(
+            ["git", *args],
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            stderr=subprocess.STDOUT,
+        )
     except subprocess.CalledProcessError as exc:
         print(exc.output, file=sys.stderr)
         raise SystemExit(exc.returncode) from exc

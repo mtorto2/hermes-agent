@@ -371,6 +371,14 @@ class TestFailureAttribution:
 
     def _make_pool(self, tmp_path, monkeypatch, entries):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+        # This fixture specifies the whole pool explicitly. Do not augment it
+        # from an authenticated local Claude Code installation, whose presence
+        # is host-specific and would turn the one-entry regression case into a
+        # multi-entry pool.
+        monkeypatch.setattr(
+            "agent.credential_pool._seed_from_singletons",
+            lambda provider, pool_entries: (False, set()),
+        )
         hermes_home = tmp_path / "hermes"
         hermes_home.mkdir(parents=True, exist_ok=True)
         (hermes_home / "auth.json").write_text(

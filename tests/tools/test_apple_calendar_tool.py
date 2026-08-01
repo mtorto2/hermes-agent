@@ -7,9 +7,10 @@ def test_apple_calendar_lists_events_with_calendar_and_day_filters(monkeypatch):
 
     captured = {}
 
-    def fake_run(cmd, *, check, capture_output, text, timeout, stdin):
+    def fake_run(cmd, *, check, capture_output, text, timeout, stdin, **kwargs):
         captured["cmd"] = cmd
         captured["stdin"] = stdin
+        captured["kwargs"] = kwargs
         return subprocess.CompletedProcess(
             cmd,
             0,
@@ -39,6 +40,7 @@ def test_apple_calendar_lists_events_with_calendar_and_day_filters(monkeypatch):
         "Gigs",
     ]
     assert captured["stdin"] is subprocess.DEVNULL
+    assert captured["kwargs"] == {"encoding": "utf-8", "errors": "replace"}
 
 
 def test_apple_calendar_refuses_create_without_confirmation(monkeypatch):
@@ -78,9 +80,10 @@ def test_apple_calendar_create_builds_safe_confirmed_command(monkeypatch):
 
     captured = {}
 
-    def fake_run(cmd, *, check, capture_output, text, timeout, stdin):
+    def fake_run(cmd, *, check, capture_output, text, timeout, stdin, **kwargs):
         captured["cmd"] = cmd
         captured["stdin"] = stdin
+        captured["kwargs"] = kwargs
         return subprocess.CompletedProcess(cmd, 0, stdout='{"status":"created"}', stderr="")
 
     monkeypatch.setattr(apple_calendar_tool, "_ensure_bridge_script", lambda: "/tmp/apple_calendar.swift")
@@ -118,3 +121,4 @@ def test_apple_calendar_create_builds_safe_confirmed_command(monkeypatch):
         "created by Hermes",
     ]
     assert captured["stdin"] is subprocess.DEVNULL
+    assert captured["kwargs"] == {"encoding": "utf-8", "errors": "replace"}

@@ -5060,7 +5060,33 @@ class BasePlatformAdapter(ABC):
         """Run a lifecycle hook without letting failures break message flow."""
         event = args[0] if args else None
         outcome = args[1] if len(args) > 1 and isinstance(args[1], ProcessingOutcome) else None
-        await self._emit_processing_light_cue(hook_name, event, outcome)
+        if hook_name == "on_processing_start":
+            # A LAN/UI indicator is best-effort. Do not yield before the
+            # handler starts: a slow or unavailable light backend must never
+            # delay inbound message dispatch.
+            task = asyncio.create_task(self._emit_processing_light_cue(hook_name, event, outcome))
+            pending = getattr(self, "_processing_light_start_tasks", None)
+            if pending is None:
+                pending = {}
+                self._processing_light_start_tasks = pending
+            pending[id(event)] = task
+
+            def _discard_start_task(done: asyncio.Task, key: int = id(event)) -> None:
+                if pending.get(key) is done:
+                    pending.pop(key, None)
+
+            task.add_done_callback(_discard_start_task)
+        else:
+            # A start cue is intentionally non-blocking, but a completion cue
+            # must not overtake it when thread-pool scheduling is contended.
+            pending = getattr(self, "_processing_light_start_tasks", {})
+            start_task = pending.pop(id(event), None)
+            if start_task is not None:
+                try:
+                    await asyncio.shield(start_task)
+                except Exception:
+                    pass
+            await self._emit_processing_light_cue(hook_name, event, outcome)
         hook = getattr(self, hook_name, None)
         if not callable(hook):
             return

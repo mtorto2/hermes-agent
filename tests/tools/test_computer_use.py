@@ -782,7 +782,7 @@ class TestLazyMcpInstall:
         from tools.computer_use import cua_backend
         from tools.lazy_deps import FeatureUnavailable
         unavailable = FeatureUnavailable(
-            "tool.computer_use", ("mcp==1.26.0",), "lazy installs disabled"
+            "tool.computer_use", ("mcp==1.28.1",), "lazy installs disabled"
         )
         with patch.object(cua_backend, "_maybe_nudge_update"), \
              patch("tools.lazy_deps.ensure", side_effect=unavailable), \
@@ -1221,7 +1221,11 @@ class TestCaptureAppFilterNoMatch:
         assert backend._active_pid is None
         assert backend._active_window_id is None
 
-    def test_linux_default_capture_skips_gnome_shell_helper(self):
+    def test_linux_default_capture_skips_gnome_shell_helper(self, monkeypatch):
+        from tools.computer_use import cua_backend
+
+        monkeypatch.setattr(cua_backend.sys, "platform", "linux")
+        monkeypatch.setattr(cua_backend, "_linux_x11_active_window_id", lambda: None)
         windows = [
             {"app_name": "", "pid": 100, "window_id": 1,
              "is_on_screen": None, "title": "@!1921,0;BDHF", "z_index": 0},

@@ -127,11 +127,12 @@ async def test_shared_processing_lifecycle_emits_light_cue_events(monkeypatch):
     )
     emitted = []
     adapter._get_light_cue_service().emit = MagicMock(side_effect=lambda event: emitted.append(event) or True)
+    event = _event()
 
-    await adapter._run_processing_hook("on_processing_start", _event())
-    await adapter._run_processing_hook("on_processing_complete", _event(), ProcessingOutcome.SUCCESS)
-    await adapter._run_processing_hook("on_processing_complete", _event(), ProcessingOutcome.FAILURE)
-    await adapter._run_processing_hook("on_processing_complete", _event(), ProcessingOutcome.CANCELLED)
+    await adapter._run_processing_hook("on_processing_start", event)
+    await adapter._run_processing_hook("on_processing_complete", event, ProcessingOutcome.SUCCESS)
+    await adapter._run_processing_hook("on_processing_complete", event, ProcessingOutcome.FAILURE)
+    await adapter._run_processing_hook("on_processing_complete", event, ProcessingOutcome.CANCELLED)
 
     assert emitted == [
         LightCueEvent.WORKING,

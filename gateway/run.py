@@ -130,6 +130,28 @@ _TELEGRAM_NOISY_STATUS_RE = re.compile(
 )
 
 
+def _record_hygiene_cooldown(gateway, session_id: str, cooldown_seconds: float) -> None:
+    """Persist a session-hygiene compression-failure cooldown to the state DB.
+
+    Uses the same ``compression_failure_cooldown_until`` column and
+    ``record_compression_failure_cooldown`` method that the in-conversation
+    compression path (``agent/context_compressor.py``) already uses, so the
+    cooldown survives gateway restarts (#74136).
+    """
+    import time as _time
+    session_db = getattr(gateway, "_session_db", None)
+    if session_db is None:
+        return
+    session_db = getattr(session_db, "_db", session_db)
+    recorder = getattr(session_db, "record_compression_failure_cooldown", None)
+    if recorder is None:
+        return
+    try:
+        recorder(session_id, _time.time() + cooldown_seconds)
+    except Exception as exc:
+        logger.debug("session hygiene cooldown persist failed: %s", exc)
+
+
 def _status_template_to_regex(template: str) -> str:
     """Compile a compression status template constant into a regex source.
 
@@ -1972,6 +1994,7 @@ if _config_path.exists():
                 "docker_volumes": "TERMINAL_DOCKER_VOLUMES",
                 "docker_env": "TERMINAL_DOCKER_ENV",
                 "docker_extra_args": "TERMINAL_DOCKER_EXTRA_ARGS",
+                "docker_shm_size": "TERMINAL_DOCKER_SHM_SIZE",
                 "docker_mount_cwd_to_workspace": "TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE",
                 "docker_network": "TERMINAL_DOCKER_NETWORK",
                 "docker_run_as_host_user": "TERMINAL_DOCKER_RUN_AS_HOST_USER",
@@ -5459,8 +5482,17 @@ class TurnRunner:
                         title,
                     )
                 elif self._runner._is_discord_auto_thread_lane(ctx.source) or (
-                    self._runner._relay_auto_thread_info(ctx.source) is not None
+                    self._runner._is_relay_discord_channel_lane(ctx.source)
                 ):
+                    # Relay note: the second predicate is shape-only (relay
+                    # Discord channel event). Whether the connector actually
+                    # auto-threaded our reply is only knowable AFTER delivery
+                    # (send-result feedback), which on the non-streaming lane
+                    # happens after this registration runs — so the callback
+                    # must be registered eagerly and the rename lane performs
+                    # the cache lookup at fire time (staging repro 2026-07-31:
+                    # gating registration on the cache read meant it never
+                    # registered and no thread_rename op was ever sent).
                     maybe_auto_title_kwargs["title_callback"] = lambda title: self._runner._schedule_discord_semantic_thread_rename(
                         ctx.source,
                         effective_session_id,
@@ -11119,9 +11151,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Start background session expiry watcher to finalize expired sessions
         self._spawn_supervised(self._session_expiry_watcher, "session_expiry_watcher")
 
-        # Start background kanban notifier — delivers `completed`, `blocked`,
-        # `spawn_auto_blocked`, and `crashed` events to gateway subscribers
-        # so human-in-the-loop workflows hear back without polling.
+        # Start background kanban notifier — each gateway delivers events for
+        # subscriptions owned by the profiles whose adapters it hosts, even
+        # when another gateway owns the single dispatcher.
         self._spawn_supervised(self._kanban_notifier_watcher, "kanban_notifier_watcher")
 
         # Start background kanban dispatcher — spawns workers for ready
@@ -13635,7 +13667,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     channel_prompt=event.channel_prompt,
                     channel_context=event.channel_context,
                 )
-                adapter._pending_messages[quick_key] = queued_event
+                self._enqueue_fifo(quick_key, queued_event, adapter)
             return "Agent still starting — /steer queued for the next turn."
         if running_agent and hasattr(running_agent, "steer"):
             try:
@@ -13658,7 +13690,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 channel_prompt=event.channel_prompt,
                 channel_context=event.channel_context,
             )
-            adapter._pending_messages[quick_key] = queued_event
+            self._enqueue_fifo(quick_key, queued_event, adapter)
         return "No active agent — /steer queued for the next turn."
 
     async def _busy_goal_command(self, event: MessageEvent, quick_key: str, source):
@@ -16183,20 +16215,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
 
                 if _needs_compress:
-                    _cooldowns = getattr(self, "_hygiene_compression_failure_cooldowns", None)
-                    if _cooldowns is None:
-                        _cooldowns = {}
-                        self._hygiene_compression_failure_cooldowns = _cooldowns
-                    _cooldown_key = session_entry.session_id
-                    _cooldown_until = float(_cooldowns.get(_cooldown_key) or 0.0)
-                    if _cooldown_until > time.time():
-                        logger.info(
-                            "Session hygiene: skipping compression for %s; "
-                            "previous failure cooldown active for %.1fs",
-                            _cooldown_key,
-                            max(0.0, _cooldown_until - time.time()),
-                        )
-                        _needs_compress = False
+                    # Use the persistent DB-backed cooldown (same as the
+                    # in-conversation compression path in context_compressor.py)
+                    # so the cooldown survives gateway restarts. The in-memory
+                    # dict was reset on every restart, re-triggering the same
+                    # failing compression and wedging session storage (#74136).
+                    _session_db = getattr(self, "_session_db", None)
+                    if _session_db is not None:
+                        _session_db = getattr(_session_db, "_db", _session_db)
+                        _getter = getattr(_session_db, "get_compression_failure_cooldown", None)
+                        if _getter is not None:
+                            try:
+                                _cooldown_state = _getter(session_entry.session_id)
+                            except Exception:
+                                _cooldown_state = None
+                            if _cooldown_state and _cooldown_state.get("remaining_seconds", 0) > 0:
+                                logger.info(
+                                    "Session hygiene: skipping compression for %s; "
+                                    "previous failure cooldown active for %.1fs",
+                                    session_entry.session_id,
+                                    _cooldown_state["remaining_seconds"],
+                                )
+                                _needs_compress = False
 
                 if _needs_compress:
                     logger.info(
@@ -16367,9 +16407,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                             )
                                             _hyg_cleanup_deferred = True
                                             if _hyg_failure_cooldown_seconds >= 0:
-                                                self._hygiene_compression_failure_cooldowns[
-                                                    session_entry.session_id
-                                                ] = time.time() + _hyg_failure_cooldown_seconds
+                                                _record_hygiene_cooldown(
+                                                    self, session_entry.session_id,
+                                                    _hyg_failure_cooldown_seconds,
+                                                )
                                             logger.warning(
                                                 "Session hygiene compression for session %s "
                                                 "made no progress for %.1fs "
@@ -16533,9 +16574,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     _comp = getattr(_hyg_agent, "context_compressor", None)
                                     if _comp is not None and getattr(_comp, "_last_compress_aborted", False):
                                         if _hyg_failure_cooldown_seconds >= 0:
-                                            self._hygiene_compression_failure_cooldowns[
-                                                session_entry.session_id
-                                            ] = time.time() + _hyg_failure_cooldown_seconds
+                                            _record_hygiene_cooldown(
+                                                self, session_entry.session_id,
+                                                _hyg_failure_cooldown_seconds,
+                                            )
                                         _err = getattr(_comp, "_last_summary_error", None) or "unknown error"
                                         # Force-redact: provider exception text
                                         # may contain credentials; this message
@@ -17807,8 +17849,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         platform.value if hasattr(platform, "value") else str(platform or "")
                     ).lower()
                     chat_id = str(getattr(source, "chat_id", "") or "")
+                    chat_type = str(getattr(source, "chat_type", "") or "") or None
                     thread_id = str(getattr(source, "thread_id", "") or "")
                     user_id = str(getattr(source, "user_id", "") or "") or None
+                    delivery_metadata = self._thread_metadata_for_source(
+                        source, self._reply_anchor_for_event(event)
+                    ) or None
+                    if isinstance(delivery_metadata, dict):
+                        chat_type = str(getattr(source, "chat_type", "") or "")
+                        if chat_type:
+                            delivery_metadata.setdefault("chat_type", chat_type)
                     if platform_str and chat_id:
                         def _sub():
                             from hermes_cli import kanban_db as _kb
@@ -17817,10 +17867,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 _kb.add_notify_sub(
                                     conn, task_id=task_id,
                                     platform=platform_str, chat_id=chat_id,
+                                    chat_type=chat_type,
                                     thread_id=thread_id or None,
                                     user_id=user_id,
                                     notifier_profile=getattr(self, "_kanban_notifier_profile", None) or self._active_profile_name(),
-                                )
+                                    delivery_metadata=delivery_metadata,
+                                    )
                             finally:
                                 conn.close()
                         await asyncio.to_thread(_sub)
@@ -17909,7 +17961,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     async def _handle_status_command(self, event: MessageEvent) -> str:
         """Handle /status command."""
         source = event.source
-        session_entry = self.session_store.get_or_create_session(source)
+        session_entry = await self.async_session_store.get_or_create_session(source)
 
         connected_platforms = [p.value for p in self.adapters.keys()]
 
@@ -17942,11 +17994,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         db_total_tokens = 0
         if self._session_db:
             try:
-                title = self._session_db.get_session_title(session_entry.session_id)
+                title = await self._session_db.get_session_title(session_entry.session_id)
             except Exception:
                 title = None
             try:
-                row = self._session_db.get_session(session_entry.session_id)
+                row = await self._session_db.get_session(session_entry.session_id)
                 if row:
                     session_row = dict(row)
                     db_total_tokens = (
@@ -18161,7 +18213,61 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             ]
         )
 
-        if not agent_rows and not running_processes and not background_tasks:
+        # Background (async) delegations — delegate_task(background=true).
+        # Live per-child activity comes from the registry's progress sampler.
+        delegations: list[dict] = []
+        try:
+            from tools.async_delegation import list_async_delegations
+            delegations = [
+                d for d in list_async_delegations()
+                if d.get("status") in ("running", "stalling", "finalizing")
+            ]
+        except Exception:
+            delegations = []
+        if delegations:
+            lines.extend(
+                [
+                    "",
+                    t(
+                        "gateway.agents.background_delegations",
+                        count=len(delegations),
+                    ),
+                ]
+            )
+            for d in delegations[:12]:
+                goal = " ".join(str(d.get("goal") or "").split())
+                if len(goal) > 70:
+                    goal = goal[:67] + "..."
+                status = d.get("status", "?")
+                row = f"- `{d.get('delegation_id', '?')}` · {status}"
+                if status == "stalling":
+                    quiet = d.get("stalled_after_quiet_seconds")
+                    if quiet is not None:
+                        row += f" · no progress {quiet:.0f}s"
+                elif d.get("seconds_since_progress", 0) >= 60:
+                    row += f" · quiet {d['seconds_since_progress']:.0f}s"
+                if goal:
+                    row += f" · {goal}"
+                lines.append(row)
+                for i, child in enumerate(d.get("children_activity") or []):
+                    if not isinstance(child, dict):
+                        continue
+                    tool = child.get("current_tool")
+                    doing = f"`{tool}`" if tool else "between turns"
+                    part = (
+                        f"  - child {i + 1}: "
+                        f"{child.get('api_calls', '?')} api calls · {doing}"
+                    )
+                    idle = child.get("seconds_since_activity")
+                    if idle is not None:
+                        part += f" · active {idle:.0f}s ago"
+                    lines.append(part)
+            if len(delegations) > 12:
+                lines.append(
+                    t("gateway.agents.more", count=len(delegations) - 12)
+                )
+
+        if not agent_rows and not running_processes and not background_tasks and not delegations:
             lines.append("")
             lines.append(t("gateway.agents.none"))
 
@@ -18377,7 +18483,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             config = {}
             personalities = {}
 
-        if not personalities:
+        if not personalities and args not in {"none", "default", "neutral"}:
             return t("gateway.personality.none_configured", path=display_hermes_home())
 
         if not args:
@@ -18403,6 +18509,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return str(value)
 
         if args in {"none", "default", "neutral"}:
+            # Apply the requested overlay change to this live gateway even if
+            # persistence fails (for example a transient filesystem error).
+            # The caller asked to remove an ephemeral prompt now; reporting a
+            # save failure must not keep it active for the next message.
+            self._ephemeral_system_prompt = ""
             try:
                 if "agent" not in config or not isinstance(config.get("agent"), dict):
                     config["agent"] = {}
@@ -18415,7 +18526,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 atomic_yaml_write(config_path, config)
             except Exception as e:
                 return t("gateway.personality.save_failed", error=str(e))
-            self._ephemeral_system_prompt = ""
             return t("gateway.personality.cleared")
         elif args in personalities:
             new_prompt = _resolve_prompt(personalities[args])
@@ -18445,8 +18555,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     async def _handle_retry_command(self, event: MessageEvent) -> str:
         """Handle /retry command - re-send the last user message."""
         source = event.source
-        session_entry = self.session_store.get_or_create_session(source)
-        history = self.session_store.load_transcript(session_entry.session_id)
+        session_entry = await self.async_session_store.get_or_create_session(source)
+        history = await self.async_session_store.load_transcript(session_entry.session_id)
         
         # Find the last user message
         last_user_msg = None
@@ -18462,7 +18572,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         
         # Truncate history to before the last user message and persist
         truncated = history[:last_user_idx]
-        self.session_store.rewrite_transcript(session_entry.session_id, truncated)
+        await self.async_session_store.rewrite_transcript(session_entry.session_id, truncated)
         # Reset stored token count — transcript was truncated
         session_entry.last_prompt_tokens = 0
         
@@ -19525,6 +19635,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             and bool(getattr(source, "auto_thread_initial_name", None))
         )
 
+    def _is_relay_discord_channel_lane(self, source: SessionSource) -> bool:
+        """Shape-only check: a relay-delivered Discord CHANNEL event whose
+        reply the connector MAY auto-thread (title-turn registration gate).
+
+        Deliberately does NOT consult the send-result cache: at registration
+        time (before delivery) the feedback can't exist yet. The rename lane
+        polls the cache at fire time instead."""
+        return (
+            source.platform == Platform.DISCORD
+            and bool(source.chat_id)
+            and not source.thread_id
+            and source.chat_type in ("group", "channel")
+            and getattr(source, "delivered_via_upstream_relay", False) is True
+        )
+
     def _relay_auto_thread_info(
         self, source: SessionSource
     ) -> Optional[Tuple[str, str]]:
@@ -19594,7 +19719,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if relay_info is None and not await asyncio.to_thread(
             self._is_discord_auto_thread_lane, source
         ):
-            return
+            # Relay title turn with no feedback captured at schedule time:
+            # the auto-title thread races the delivery that produces the
+            # connector's send-result feedback (thread_id + initial name).
+            # Poll the adapter cache briefly before giving up — delivery is
+            # typically milliseconds-to-seconds behind the title.
+            if not self._is_relay_discord_channel_lane(source):
+                return
+            for _ in range(20):  # up to ~10s
+                relay_info = self._relay_auto_thread_info(source)
+                if relay_info is not None:
+                    break
+                await asyncio.sleep(0.5)
+            if relay_info is None:
+                # True miss: the connector did not auto-thread this reply
+                # (policy off, DM, already-threaded, or send failed).
+                return
         adapter = self._adapter_for_source(source) if getattr(self, "adapters", None) else None
         if adapter is None:
             return
@@ -19602,17 +19742,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if rename_thread is None:
             return
         target_thread_id = relay_info[0] if relay_info else str(source.thread_id)
+        # Relay lane (relay_info present): ask the CONNECTOR to enforce the
+        # no-clobber guard from its own created-name memory — the gateway
+        # can't reliably reproduce the thread's initial name byte-for-byte
+        # (normalization drift silently declined every rename before this).
+        # Native-marker lane keeps the legacy string guard.
+        use_connector_guard = relay_info is not None
         guard_name = (
-            relay_info[1]
-            if relay_info
+            None
+            if use_connector_guard
             else getattr(source, "auto_thread_initial_name", None)
         )
         thread_name = self._sanitize_discord_thread_title(title)
+        logger.info(
+            "discord auto-thread rename: thread=%s lane=%s new_title=%r",
+            target_thread_id,
+            "relay" if use_connector_guard else "native",
+            thread_name,
+        )
         try:
-            await rename_thread(
+            renamed = await rename_thread(
                 target_thread_id,
                 thread_name,
+                prefer_connector_created=use_connector_guard,
                 only_if_current_name=guard_name,
+            )
+            logger.info(
+                "discord auto-thread rename result: thread=%s applied=%s",
+                target_thread_id,
+                bool(renamed),
             )
         except Exception:
             logger.debug("Failed to rename Discord auto-thread for generated session title", exc_info=True)
@@ -19630,9 +19788,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not self._is_discord_auto_thread_lane(source):
             # Relay title turn: the source is the PARENT channel event (the
             # thread didn't exist at ingest, so no auto-thread markers). The
-            # connector's send-result feedback tells us where the reply landed.
+            # connector's send-result feedback tells us where the reply
+            # landed — but the auto-title thread races the delivery that
+            # produces it, so a cache miss HERE is not a verdict. Schedule
+            # whenever the SHAPE matches; the async rename lane polls the
+            # cache (with a bounded wait) and no-ops on a true miss.
             relay_info = self._relay_auto_thread_info(source)
-            if relay_info is None:
+            if relay_info is None and not self._is_relay_discord_channel_lane(
+                source
+            ):
                 return
         try:
             loop = asyncio.get_running_loop()
@@ -20162,30 +20326,54 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         async def _on_confirm(choice: str):
             if choice == "cancel":
                 return f"🟡 /{command} cancelled. Conversation unchanged."
+            persisted = False
             if choice == "always":
                 try:
                     from cli import save_config_value
-                    save_config_value("approvals.destructive_slash_confirm", False)
-                    logger.info(
-                        "User opted out of destructive slash confirm (session=%s)",
-                        session_key,
+                    # save_config_value swallows its own errors and reports the
+                    # outcome in the return value, so the try block alone says
+                    # nothing about whether the write landed.
+                    persisted = bool(
+                        save_config_value("approvals.destructive_slash_confirm", False)
                     )
+                    if persisted:
+                        logger.info(
+                            "User opted out of destructive slash confirm (session=%s)",
+                            session_key,
+                        )
+                    else:
+                        logger.warning(
+                            "Could not persist destructive_slash_confirm=false "
+                            "(session=%s); config.yaml is not writable",
+                            session_key,
+                        )
                 except Exception as exc:
                     logger.warning(
                         "Failed to persist destructive_slash_confirm=false: %s", exc,
                     )
             result = await execute()
             if choice == "always":
-                note = (
-                    "\n\nℹ️ Future /clear, /new, /reset, and /undo will run "
-                    "without confirmation. Re-enable via "
-                    "`approvals.destructive_slash_confirm: true` in config.yaml."
-                )
+                if persisted:
+                    note = (
+                        "\n\nℹ️ Future /clear, /new, /reset, and /undo will run "
+                        "without confirmation. Re-enable via "
+                        "`approvals.destructive_slash_confirm: true` in config.yaml."
+                    )
+                else:
+                    # The user did approve this run, so the action still goes
+                    # ahead, but the preference did not stick and the prompt
+                    # will be back next time. Say so rather than promising an
+                    # opt-out that was never written.
+                    note = (
+                        "\n\n⚠️ Could not save that preference (config.yaml is not "
+                        "writable), so /clear, /new, /reset, and /undo will ask "
+                        "again next time. To silence it permanently, set "
+                        "`approvals.destructive_slash_confirm: false` in config.yaml."
+                    )
                 if isinstance(result, str):
                     return result + note
-                # EphemeralReply or other — leave untouched; the opt-out note
-                # would otherwise mangle structured replies.  The persist itself
-                # already happened above; user gets the same UX next time.
+                # EphemeralReply or other: leave untouched, since the note would
+                # mangle structured replies.
                 return result
             return result
 

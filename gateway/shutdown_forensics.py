@@ -254,15 +254,25 @@ def spawn_async_diagnostic(
         # would also reap us anyway, but defense in depth).  Without
         # start_new_session, a SIGKILL on our cgroup takes the diag down
         # before it can flush.
+        # GNU ``timeout`` is not shipped by macOS. Keep the bounded diagnostic
+        # contract on every supported POSIX host with a bash watchdog instead.
+        timeout = max(1.0, float(timeout_seconds))
+        timed_script = (
+            f"({script}) & child=$!; "
+            f"(sleep {timeout:.3f}; kill \"$child\" 2>/dev/null) & watchdog=$!; "
+            "wait \"$child\"; status=$?; "
+            "kill \"$watchdog\" 2>/dev/null; wait \"$watchdog\" 2>/dev/null; "
+            "exit \"$status\""
+        )
         proc = subprocess.Popen(
-            ["timeout", f"{timeout_seconds:.0f}", "bash", "-c", script],
+            ["bash", "-c", timed_script],
             stdout=fd,
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,
             start_new_session=True,
             close_fds=True,
         )
-    except (FileNotFoundError, OSError):
+    except (FileNotFoundError, OSError, ValueError):
         try:
             os.close(fd)
         except OSError:

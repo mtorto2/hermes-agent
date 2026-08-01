@@ -1417,8 +1417,11 @@ def _sysctl_value(name: str) -> str:
     try:
         return subprocess.check_output(
             ["/usr/sbin/sysctl", "-n", name],
+            stdin=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=2,
         ).strip()
     except Exception:

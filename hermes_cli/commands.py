@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from utils import is_truthy_value
+from hermes_constants import INDICATOR_STYLES
 
 logger = logging.getLogger(__name__)
 
@@ -230,8 +231,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("skin", "Show or change the display skin/theme", "Configuration",
                cli_only=True, args_hint="[name]"),
     CommandDef("indicator", "Pick the TUI busy-indicator style", "Configuration",
-               cli_only=True, args_hint="[kaomoji|emoji|unicode|ascii]",
-               subcommands=("kaomoji", "emoji", "unicode", "ascii")),
+               cli_only=True, args_hint=f"[{'|'.join(INDICATOR_STYLES)}]",
+               subcommands=INDICATOR_STYLES),
     CommandDef("voice", "Toggle voice mode", "Configuration",
                args_hint="[on|off|tts|status]", subcommands=("on", "off", "tts", "status")),
     CommandDef("wake", "Toggle the 'Hey Hermes' wake word listener", "Configuration",
@@ -1262,7 +1263,9 @@ _SLACK_PRIORITY_ALIASES = ("btw", "bg")
 #     /hermes update on Slack. Demoted to free the native slot /approvals now
 #     claims — without this entry /approvals tips the registry past the 50-cap
 #     and silently clamps /update off, breaking Telegram parity.
-_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "repos", "init", "version", "diff", "update"})
+#   - platform: setup/maintenance command; reached via /hermes platform so the
+#     native list stays at Slack's 50-command cap without silently losing it.
+_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "repos", "init", "version", "diff", "update", "platform"})
 
 
 def _sanitize_slack_name(raw: str) -> str:

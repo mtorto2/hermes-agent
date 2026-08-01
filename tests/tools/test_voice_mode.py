@@ -689,10 +689,15 @@ class TestCleanupTempRecordings:
 # ============================================================================
 
 class TestPlayBeep:
-    def test_beep_calls_sounddevice_play(self, mock_sd):
+    def test_beep_calls_sounddevice_play(self, mock_sd, monkeypatch):
         np = pytest.importorskip("numpy")
 
         from tools.voice_mode import play_beep
+
+        # This test exercises the sounddevice path. macOS deliberately routes
+        # output through afplay to avoid a CoreAudio TCC prompt, so make the
+        # target path explicit instead of relying on the host platform.
+        monkeypatch.setattr("tools.voice_mode._sounddevice_output_allowed", lambda: True)
 
         # play_beep uses polling (get_stream) + sd.stop() instead of sd.wait()
         mock_stream = MagicMock()
@@ -1408,6 +1413,7 @@ class TestWSL2PowerShellFallback:
             return m
 
         with patch("tools.voice_mode._is_wsl2_env", return_value=True), \
+             patch("tools.voice_mode.platform.system", return_value="Linux"), \
              patch("tools.voice_mode._import_audio", side_effect=ImportError), \
              patch("tools.voice_mode.shutil.which",
                    side_effect=lambda x: f"/bin/{x}" if x in ("powershell.exe", "ffmpeg", "ffplay", "sh") else (x if x.startswith("/") else None)), \
@@ -1438,6 +1444,8 @@ class TestWSL2PowerShellFallback:
         """Two concurrent calls must use different temp WAV filenames."""
         from unittest.mock import patch, MagicMock
         from tools import voice_mode as vm
+
+        monkeypatch.setattr(vm.platform, "system", lambda: "Linux")
 
         filenames = []
 

@@ -189,7 +189,15 @@ def _parse_devices(devices_value: Any, hosts_value: Any) -> list[WiZCueDevice]:
 def interface_broadcast_addresses() -> set[str]:
     broadcasts = {"255.255.255.255"}
     try:
-        output = subprocess.check_output(["ifconfig"], text=True, stderr=subprocess.DEVNULL, timeout=1.0)
+        output = subprocess.check_output(
+            ["ifconfig"],
+            stdin=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=1.0,
+        )
     except Exception:
         return broadcasts
 

@@ -226,7 +226,16 @@ def _run_bridge(args: list[str]) -> str:
     swift = shutil.which("swift") or "/usr/bin/swift"
     cmd = [swift, _ensure_bridge_script(), *args]
     try:
-        proc = subprocess.run(cmd, check=False, capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
+        proc = subprocess.run(
+            cmd,
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=60,
+            stdin=subprocess.DEVNULL,
+        )
     except subprocess.TimeoutExpired:
         return _json_error("Apple Calendar operation timed out")
     except Exception as exc:  # pragma: no cover - defensive wrapper

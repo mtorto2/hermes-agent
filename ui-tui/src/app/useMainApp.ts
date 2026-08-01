@@ -16,7 +16,7 @@ import { MAX_HISTORY, WHEEL_SCROLL_STEP } from '../config/limits.js'
 import { RESIZE_COALESCE_MS } from '../config/timing.js'
 import { hasLeadGap, prevRenderedMsg } from '../domain/blockLayout.js'
 import { SECTION_NAMES, sectionMode } from '../domain/details.js'
-import { fmtProjectCwdBranch } from '../domain/paths.js'
+import { composeTabTitle, fmtProjectCwdBranch, shortCwd } from '../domain/paths.js'
 import { sessionScopedModelArg } from '../domain/slash.js'
 import { type GatewayClient } from '../gatewayClient.js'
 import type {
@@ -31,11 +31,11 @@ import { useGitBranch } from '../hooks/useGitBranch.js'
 import { useVirtualHistory } from '../hooks/useVirtualHistory.js'
 import { composerPromptWidth } from '../lib/inputMetrics.js'
 import { appendTranscriptMessage } from '../lib/messages.js'
-import { buildHermesTerminalTitle, shouldUseHermesTerminalTitle } from '../lib/terminalTitle.js'
 import { DEFAULT_VOICE_RECORD_KEY, isMac, type ParsedVoiceRecordKey } from '../lib/platform.js'
 import { createResizeCoalescer } from '../lib/resizeCoalescer.js'
 import { asRpcResult, rpcErrorMessage } from '../lib/rpc.js'
 import { terminalParityHints } from '../lib/terminalParity.js'
+import { shouldUseHermesTerminalTitle } from '../lib/terminalTitle.js'
 import { buildToolTrailLine, formatAbandonedClarify, sameToolTrailGroup, toolTrailLabel } from '../lib/text.js'
 import { estimatedMsgHeight, messageHeightKey } from '../lib/virtualHeights.js'
 import { onUserWidgets } from '../sdk/userWidgets.js'
@@ -613,9 +613,10 @@ export function useMainApp(gw: GatewayClient) {
     }
   }, [gw, ui.sid])
 
-  // TUI-owned terminal title: `⚠` waiting on approval/sudo/secret/clarify,
-  // `⏳` busy, `✓` idle. Terminal.app and Agent Lights slots intentionally
-  // receive no OSC title writes, preserving human-owned terminal/tab titles.
+  // Tab title: `⚠` waiting on approval/sudo/secret/clarify, `⏳` busy, `✓` idle.
+  // Format: `<marker> <session name> · <model> · <cwd>` — name/cwd omitted when absent.
+  // Terminal.app and Agent Lights slots intentionally receive no OSC title
+  // writes, preserving human-owned terminal/tab titles.
   const model = ui.info?.model?.replace(/^.*\//, '') ?? ''
 
   const marker = overlay.approval || overlay.sudo || overlay.secret || overlay.clarify ? '⚠' : ui.busy ? '⏳' : '✓'
@@ -626,12 +627,12 @@ export function useMainApp(gw: GatewayClient) {
 
   useTerminalTitle(
     shouldUseHermesTerminalTitle(tabSlot)
-      ? buildHermesTerminalTitle({
-          cwd: tabCwd,
-          marker,
-          model,
-          slot: tabSlot,
-        })
+      ? model
+        ? {
+            tab: composeTabTitle(marker, ui.sessionTitle, '', ''),
+            window: composeTabTitle(marker, ui.sessionTitle, model, tabCwd ? shortCwd(tabCwd, 24) : ''),
+          }
+        : 'Hermes'
       : null
   )
 
