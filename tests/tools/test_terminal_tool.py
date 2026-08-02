@@ -1,5 +1,8 @@
 """Regression tests for sudo detection and sudo password handling."""
 
+import pytest
+
+from agent import secret_scope as ss
 import tools.terminal_tool as terminal_tool
 
 
@@ -75,6 +78,16 @@ def test_explicit_empty_sudo_password_tries_empty_without_prompt(monkeypatch):
 
     assert transformed == "sudo -S -p '' true"
     assert sudo_stdin == "\n"
+
+
+def test_unscoped_multiplex_does_not_borrow_sudo_password(monkeypatch):
+    monkeypatch.setenv("SUDO_PASSWORD", "other-profile-password")
+    ss.set_multiplex_active(True)
+    try:
+        with pytest.raises(ss.UnscopedSecretError):
+            terminal_tool._transform_sudo_command("sudo true")
+    finally:
+        ss.set_multiplex_active(False)
 
 
 def test_validate_workdir_blocks_shell_metacharacters_in_windows_paths():

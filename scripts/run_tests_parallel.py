@@ -44,6 +44,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, Future
@@ -305,72 +306,85 @@ def _run_one_file_once(
     file_timeout: float,
 ) -> Tuple[Path, int, str, dict[str, int], float]:
     """Single attempt of a per-file pytest subprocess (see _run_one_file)."""
-    cmd = [sys.executable, "-m", "pytest", str(file), *pytest_args]
-    
-    subproc_start = time.monotonic()
-    # launch the pytest process
-    proc = subprocess.Popen(
-        cmd,
-        cwd=repo_root,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True, encoding="utf-8", errors="replace",
-        env=os.environ,
-        # POSIX: place the child at the head of its own process group so
-        # _kill_tree can SIGKILL the group atomically.
-        # Windows: this maps to CREATE_NEW_PROCESS_GROUP in CPython 3.12+;
-        # _kill_tree handles the Windows path via taskkill /F /T.
-        start_new_session=True,
-    )
+    with tempfile.TemporaryDirectory(prefix="hermes-pytest-") as pytest_base:
+        # pytest maintains a global ``pytest-current`` symlink when it chooses
+        # its default temporary root. Per-file subprocesses race over that
+        # symlink under parallel execution, so each attempt owns an isolated
+        # base that is removed after the child exits.
+        cmd = [
+            sys.executable,
+            "-m",
+            "pytest",
+            str(file),
+            "--basetemp",
+            pytest_base,
+            *pytest_args,
+        ]
 
-    # Capture the pgid NOW, before the leader can exit and be reaped. Once
-    # the leader is reaped, os.getpgid(proc.pid) raises ProcessLookupError
-    # even though grandchildren in that group are still alive — defeating
-    # the whole cleanup. None on Windows where the pgid concept doesn't apply.
-    pgid: int | None = None
-    if sys.platform != "win32":
-        try:
-            pgid = os.getpgid(proc.pid)
-        except (ProcessLookupError, PermissionError):
-            pgid = None
-
-    try:
-        output, _ = proc.communicate(timeout=file_timeout)
-        rc = proc.returncode
-    except subprocess.TimeoutExpired:
-        _kill_tree(proc, pgid=pgid)
-        try:
-            output, _ = proc.communicate(timeout=10)
-        except subprocess.TimeoutExpired:
-            output = "(file timeout exceeded; output unavailable)"
-        rc = 124  # de facto convention for "killed by timeout".
-        output = (
-            f"({file_timeout:.0f}s exceeded; "
-            f"process tree SIGKILL'd)\n{output}"
+        subproc_start = time.monotonic()
+        # launch the pytest process
+        proc = subprocess.Popen(
+            cmd,
+            cwd=repo_root,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True, encoding="utf-8", errors="replace",
+            env=os.environ,
+            # POSIX: place the child at the head of its own process group so
+            # _kill_tree can SIGKILL the group atomically.
+            # Windows: this maps to CREATE_NEW_PROCESS_GROUP in CPython 3.12+;
+            # _kill_tree handles the Windows path via taskkill /F /T.
+            start_new_session=True,
         )
-    except BaseException:
-        # KeyboardInterrupt / runner crash — make sure no zombie
-        # grandchildren outlive us.
-        _kill_tree(proc, pgid=pgid)
-        raise
-    else:
-        # Happy path: pytest exited on its own. Kill the group anyway in
-        # case it left grandchildren behind; already-dead is a no-op.
-        _kill_tree(proc, pgid=pgid)
 
-        output +=  "\n"
+        # Capture the pgid NOW, before the leader can exit and be reaped. Once
+        # the leader is reaped, os.getpgid(proc.pid) raises ProcessLookupError
+        # even though grandchildren in the group remain alive — defeating the
+        # whole cleanup. None on Windows where the pgid concept doesn't apply.
+        pgid: int | None = None
+        if sys.platform != "win32":
+            try:
+                pgid = os.getpgid(proc.pid)
+            except (ProcessLookupError, PermissionError):
+                pgid = None
 
-    if rc == 5:
-        # No tests collected in THIS file — legitimate per-file: a
-        # platform-gated or fully-marker-filtered file (e.g. a win32-only
-        # suite on Linux) collects nothing and must not fail the suite.
-        # Tolerated here; the RUN-level guard in main() still fails when
-        # NOTHING was collected across every file, so a broken invocation
-        # (venv without pytest, -k that matches nothing) can't report green.
-        rc = 0
-    summary = _parse_pytest_summary(output)
-    subproc_wall = time.monotonic() - subproc_start
-    return file, rc, output, summary, subproc_wall
+        try:
+            output, _ = proc.communicate(timeout=file_timeout)
+            rc = proc.returncode
+        except subprocess.TimeoutExpired:
+            _kill_tree(proc, pgid=pgid)
+            try:
+                output, _ = proc.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                output = "(file timeout exceeded; output unavailable)"
+            rc = 124  # de facto convention for "killed by timeout".
+            output = (
+                f"({file_timeout:.0f}s exceeded; "
+                f"process tree SIGKILL'd)\n{output}"
+            )
+        except BaseException:
+            # KeyboardInterrupt / runner crash — make sure no zombie
+            # grandchildren outlive us.
+            _kill_tree(proc, pgid=pgid)
+            raise
+        else:
+            # Happy path: pytest exited on its own. Kill the group anyway in
+            # case it left grandchildren behind; already-dead is a no-op.
+            _kill_tree(proc, pgid=pgid)
+
+            output += "\n"
+
+        if rc == 5:
+            # No tests collected in THIS file — legitimate per-file: a
+            # platform-gated or fully-marker-filtered file (e.g. a win32-only
+            # suite on Linux) collects nothing and must not fail the suite.
+            # Tolerated here; the RUN-level guard in main() still fails when
+            # NOTHING was collected across every file, so a broken invocation
+            # (venv without pytest, -k that matches nothing) can't report green.
+            rc = 0
+        summary = _parse_pytest_summary(output)
+        subproc_wall = time.monotonic() - subproc_start
+        return file, rc, output, summary, subproc_wall
 
 
 def _parse_pytest_summary(output: str) -> dict[str, int]:

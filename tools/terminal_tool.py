@@ -997,18 +997,16 @@ def _transform_sudo_command(command: str | None) -> tuple[str | None, str | None
     if sudo_count == 0:
         return command, None
 
-    # Scope-aware read (Slack pattern): under multiplex the process env may
-    # hold another profile's SUDO_PASSWORD, so honor the installed scope's
-    # verdict; unscoped callers keep the legacy os.environ read.
+    # Scope-aware read: under multiplex the process env may hold another
+    # profile's SUDO_PASSWORD, so honor the installed scope's verdict.
+    # get_secret() itself retains the legacy os.environ read for unscoped
+    # single-profile callers, while rejecting unscoped multiplexed reads.
     try:
-        from agent.secret_scope import UnscopedSecretError, get_secret
-
-        try:
-            _configured_password = get_secret("SUDO_PASSWORD")
-        except UnscopedSecretError:
-            _configured_password = os.environ.get("SUDO_PASSWORD")
+        from agent.secret_scope import get_secret
     except Exception:
         _configured_password = os.environ.get("SUDO_PASSWORD")
+    else:
+        _configured_password = get_secret("SUDO_PASSWORD")
     has_configured_password = _configured_password is not None
     sudo_password = (
         _configured_password

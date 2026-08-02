@@ -233,6 +233,48 @@ def _run_runner(probe_dir: Path, *extra: str) -> subprocess.CompletedProcess:
     )
 
 
+def test_parallel_workers_use_runner_owned_pytest_temp_bases(tmp_path: Path) -> None:
+    """Parallel pytest children must not race over pytest's global tmp root.
+
+    Each probe receives ``tmp_path`` from its own runner-owned ``--basetemp``.
+    The assertion runs inside both child pytest processes, proving the
+    invocation contract under parallel execution rather than inspecting the
+    runner source.
+    """
+    probe_dir = tmp_path / "probe"
+    probe_dir.mkdir()
+    probe_source = (
+        "def test_runner_owned_tmp_path(tmp_path):\n"
+        "    assert tmp_path.parent.name.startswith('hermes-pytest-')\n"
+    )
+    (probe_dir / "test_temp_a.py").write_text(probe_source, encoding="utf-8")
+    (probe_dir / "test_temp_b.py").write_text(probe_source, encoding="utf-8")
+
+    repo_root = Path(__file__).resolve().parent.parent
+    runner = repo_root / "scripts" / "run_tests_parallel.py"
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(runner),
+            "--paths",
+            str(probe_dir),
+            "-j",
+            "2",
+            "--file-retries",
+            "0",
+            "--file-timeout",
+            "30",
+        ],
+        cwd=repo_root,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=60,
+    )
+
+    assert proc.returncode == 0, proc.stdout
+
+
 
 
 def test_bare_value_flag_keeps_its_value(tmp_path: Path) -> None:

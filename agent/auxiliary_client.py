@@ -1139,21 +1139,18 @@ def _scoped_key_env(name: str) -> str:
     Auxiliary-client resolution runs both inside agent turns (secret scope
     installed — its verdict is authoritative under multiplex, so a scoped
     miss must NOT borrow another profile's process-env key) and on unscoped
-    startup/CLI probe paths, which keep the legacy ``os.environ`` read via
-    the ``UnscopedSecretError`` fallback (Slack pattern, #59739).
+    single-profile startup/CLI probe paths. ``get_secret()`` preserves the
+    legacy ``os.environ`` read when multiplexing is inactive; an unscoped
+    multiplexed read must propagate ``UnscopedSecretError`` rather than
+    borrowing another profile's process-env key.
     """
     if not name:
         return ""
     try:
-        from agent.secret_scope import UnscopedSecretError, get_secret
-
-        try:
-            return (get_secret(name) or "").strip()
-        except UnscopedSecretError:
-            pass
+        from agent.secret_scope import get_secret
     except Exception:
-        pass
-    return (os.getenv(name) or "").strip()
+        return (os.getenv(name) or "").strip()
+    return (get_secret(name) or "").strip()
 
 
 # ── Codex Responses → chat.completions adapter ─────────────────────────────
