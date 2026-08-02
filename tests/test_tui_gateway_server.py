@@ -942,12 +942,27 @@ class _BrokenStdout:
         return None
 
 
-def test_write_json_serializes_concurrent_writes(monkeypatch):
+def test_write_json_serializes_concurrent_writes():
     out = _ChunkyStdout()
-    monkeypatch.setattr(server, "_real_stdout", out)
+    probe = "write-json-concurrency-probe"
+    transport = server.StdioTransport(lambda: out, threading.Lock())
+
+    def write_probe_frame(frame):
+        # Background TUI threads use the process-global stdio fallback. Bind a
+        # private transport in each worker so this test exercises write_json's
+        # real context routing and serialization without observing unrelated
+        # in-flight daemon output.
+        token = server.bind_transport(transport)
+        try:
+            server.write_json(frame)
+        finally:
+            server.reset_transport(token)
 
     threads = [
-        threading.Thread(target=server.write_json, args=({"seq": i, "text": "x" * 24},))
+        threading.Thread(
+            target=write_probe_frame,
+            args=({"seq": i, "text": "x" * 24, "probe": probe},),
+        )
         for i in range(8)
     ]
 
@@ -957,10 +972,13 @@ def test_write_json_serializes_concurrent_writes(monkeypatch):
     for t in threads:
         t.join()
 
-    lines = "".join(out.parts).splitlines()
+    frames = [json.loads(line) for line in "".join(out.parts).splitlines()]
+    probe_frames = [frame for frame in frames if frame.get("probe") == probe]
 
-    assert len(lines) == 8
-    assert {json.loads(line)["seq"] for line in lines} == set(range(8))
+    # Every line must be valid JSON (so a torn write fails), and this test's
+    # eight concurrent writes must stay complete and distinct.
+    assert len(probe_frames) == 8
+    assert {frame["seq"] for frame in probe_frames} == set(range(8))
 
 
 def test_write_json_returns_false_on_broken_pipe(monkeypatch):
@@ -9219,6 +9237,58 @@ def test_prompt_submit_can_truncate_before_user_ordinal(monkeypatch):
         assert stub_db.replaced == [("session-key", original_history[:2])]
     finally:
         server._sessions.pop("sid", None)
+
+
+def test_prompt_submit_refuses_turn_when_truncate_persist_fails(monkeypatch):
+    """If replace_messages fails during edit/regenerate truncate, do not run the turn.
+
+    Memory-first + fail-open left session['history'] short while state.db kept
+    the old tail. The agent flush then appends the new exchange on top of the
+    'undone' turns — durable zombie history. Write first; on failure leave
+    memory and DB unchanged and return 5008.
+    """
+    original_history = [
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "content": "first reply"},
+        {"role": "user", "content": "second"},
+        {"role": "assistant", "content": "second reply"},
+    ]
+    sess = _session(history=list(original_history))
+    server._sessions["trunc-fail-sid"] = sess
+
+    class _FailDb:
+        def replace_messages(self, session_id, messages):
+            raise OSError("disk full")
+
+    monkeypatch.setattr(server, "_get_db", lambda: _FailDb())
+    monkeypatch.setattr(
+        server, "_start_inflight_turn", lambda *a, **k: pytest.fail("must not start a turn")
+    )
+    monkeypatch.setattr(
+        server, "_start_agent_build", lambda *a, **k: pytest.fail("must not start a turn")
+    )
+
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "prompt.submit",
+                "params": {
+                    "session_id": "trunc-fail-sid",
+                    "text": "edited second",
+                    "truncate_before_user_ordinal": 1,
+                },
+            }
+        )
+        assert "error" in resp
+        assert resp["error"]["code"] == 5008
+        assert "truncat" in resp["error"]["message"].lower() or "persist" in resp["error"]["message"].lower()
+        # Memory left intact — same list contents as before the refused cut.
+        assert sess["history"] == original_history
+        assert sess["history_version"] == 0
+        assert sess.get("running") is not True
+    finally:
+        server._sessions.pop("trunc-fail-sid", None)
 
 
 # ---------------------------------------------------------------------------

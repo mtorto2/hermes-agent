@@ -3474,29 +3474,39 @@ def _normalize_managed_eol(git_cmd, repo_root):
             return None
         return {p for p in out.stdout.split("\0") if p}
 
-    def _eol_only():
-        all_dirty = _dirty()
-        # `--name-only --ignore-cr-at-eol` still reports an EOL-only file on
-        # current Git, even though its textual diff is empty. `--numstat`
-        # correctly omits it, so use that semantic set to distinguish CRLF
-        # churn from a user's real edit before restoring only the former.
-        semantic = subprocess.run(
-            probe + ["diff", "--numstat", "-z", "--ignore-cr-at-eol"],
+    def _real_dirty():
+        # Files with a *content* change once CRLF differences are ignored.
+        # NOTE: ``diff --name-only --ignore-cr-at-eol`` still LISTS CR-only
+        # files (the name list is computed from blob/stat differences before
+        # the CR filter is applied), so it cannot be used to isolate real
+        # edits. ``--numstat`` does honor the filter: a CR-only file produces
+        # no numstat record, while a genuinely-edited file does. Parse the
+        # paths out of NUL-delimited numstat records instead, preserving tabs
+        # in a filename.
+        out = subprocess.run(
+            probe + ["-c", "core.quotepath=false",
+                     "diff", "--numstat", "-z", "--ignore-cr-at-eol"],
             cwd=repo_root,
             capture_output=True,
             text=True, encoding="utf-8", errors="replace",
         )
-        if all_dirty is None or semantic.returncode != 0:
+        if out.returncode != 0:
             return None
-        real_dirty: set[str] = set()
-        for record in semantic.stdout.split("\0"):
+        paths = set()
+        for record in out.stdout.split("\0"):
             if not record:
                 continue
-            # With -z, a normal numstat record is additions<TAB>deletions<TAB>
-            # path<NUL>. Split only twice so literal tabs in a filename survive.
-            fields = record.split("\t", 2)
-            if len(fields) == 3 and fields[2]:
-                real_dirty.add(fields[2])
+            # Format: "<added>\t<deleted>\t<path><NUL>". Rename detection is
+            # off in plain diff, so there is exactly one path field per record.
+            parts = record.split("\t", 2)
+            if len(parts) == 3 and parts[2]:
+                paths.add(parts[2])
+        return paths
+
+    def _eol_only():
+        all_dirty, real_dirty = _dirty(), _real_dirty()
+        if all_dirty is None or real_dirty is None:
+            return None
         return all_dirty - real_dirty
 
     try:

@@ -64,13 +64,22 @@ def _managed_repo(tmp_path: Path, files: dict[str, bytes]) -> Path:
 
 def _dirty(repo: Path) -> set[str]:
     out = subprocess.run(
-        ["git", "-c", "core.autocrlf=false", "diff", "--name-only"],
+        [
+            "git",
+            "-c",
+            "core.autocrlf=false",
+            "-c",
+            "core.quotepath=false",
+            "diff",
+            "-z",
+            "--name-only",
+        ],
         cwd=repo,
         capture_output=True,
         text=True,
         check=True,
     )
-    return {line for line in out.stdout.splitlines() if line}
+    return {path for path in out.stdout.split("\0") if path}
 
 
 def _autocrlf(repo: Path) -> str:
@@ -124,6 +133,19 @@ def test_real_edits_survive_even_when_line_endings_also_flipped(tmp_path: Path) 
 
     assert _dirty(repo) == {"both.py"}
     assert (repo / "both.py").read_bytes() == b"z = 3\r\nz += 1\r\n"
+    assert _autocrlf(repo) == "false"
+
+
+def test_real_edits_to_tabbed_paths_survive(tmp_path: Path) -> None:
+    """NUL-delimited numstat parsing must not split a tab in a filename."""
+    tabbed_name = "both\twith-tab.py"
+    repo = _managed_repo(tmp_path, {"churn.py": b"y = 2\n", tabbed_name: b"z = 3\n"})
+    (repo / tabbed_name).write_bytes(b"z = 3\r\nz += 1\r\n")
+
+    _normalize_managed_eol(GIT_CMD, repo)
+
+    assert _dirty(repo) == {tabbed_name}
+    assert (repo / tabbed_name).read_bytes() == b"z = 3\r\nz += 1\r\n"
     assert _autocrlf(repo) == "false"
 
 

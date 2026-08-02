@@ -115,25 +115,26 @@ class TestAtomicSnapshotWrite:
         assert f"> '{snap}'" not in wrapped
         assert f"> {snap}\n" not in wrapped
 
-    def test_temp_path_uses_bashpid_not_dollardollar(self):
-        """The temp name MUST use ``$BASHPID`` (the real subshell PID), not
-        ``$$``.  In ``&``-launched concurrent subshells ``$$`` stays the parent
-        shell's PID, so two writers would pick the same temp name, clobber each
-        other mid-write, and mv would publish a torn file — the corruption is
-        only narrowed, not closed.  This is the bug shared by every prior PR in
-        the #38249 cluster."""
+    def test_temp_path_uses_same_directory_mktemp_template(self):
+        """The temp name must come from ``mktemp`` beside the snapshot.
+
+        ``$BASHPID`` is unavailable in macOS's bundled bash 3.2, where it
+        expands to an empty string and makes concurrent writers share one temp
+        file. A same-directory mktemp template retains atomic ``mv`` semantics
+        while allocating one file per writer on every supported Bash version.
+        """
         env = _TestableEnv()
         env._snapshot_ready = True
         wrapped = env._wrap_command("echo hi", "/tmp")
-        assert "$BASHPID" in wrapped
-        # The bare $$ temp form must be gone.
-        assert ".tmp.$$" not in wrapped
+        assert "mktemp" in wrapped
+        assert ".tmp.XXXXXX" in wrapped
+        assert "$BASHPID" not in wrapped
 
 
-    def test_init_session_bootstrap_also_atomic_and_bashpid(self):
+    def test_init_session_bootstrap_also_atomic_and_uses_mktemp(self):
         """The init_session bootstrap (first snapshot write) is the same shared
         file a concurrent command could source — it must be atomic and use
-        ``$BASHPID`` too."""
+        the same safe mktemp allocation strategy too."""
         env = _TestableEnv()
         captured = {}
 
@@ -147,9 +148,8 @@ class TestAtomicSnapshotWrite:
         except Exception:
             pass
         boot = captured.get("cmd", "")
-        assert ".tmp." in boot and "mv -f " in boot, boot
-        assert "$BASHPID" in boot
-        assert ".tmp.$$" not in boot
+        assert ".tmp.XXXXXX" in boot and "mktemp" in boot and "mv -f " in boot, boot
+        assert "$BASHPID" not in boot
 
 
     def test_init_session_bootstrap_uses_private_umask(self):
@@ -178,8 +178,9 @@ class TestAtomicSnapshotConcurrencyBehavioral:
     the emitted script's guarantee holds under real concurrency: N concurrent
     writers + readers, and the snapshot is ALWAYS a complete, parseable env
     dump — never truncated mid-line with a ``declare -x`` / ``export`` fragment
-    that would corrupt PATH.  Crucially it uses ``$BASHPID`` (per-subshell
-    unique), which is what closes the race; ``$$`` would still tear here.
+    that would corrupt PATH. Crucially it allocates a same-directory
+    ``mktemp`` file per writer, so macOS bash 3.2 and newer Bash versions do
+    not share a temporary snapshot file.
     """
 
     def _run(self, script):
@@ -194,13 +195,15 @@ class TestAtomicSnapshotConcurrencyBehavioral:
         import shlex
         snap = str(tmp_path / "hermes-snap-x.sh")
         _q = shlex.quote
-        _snap_tmp = _q(snap + ".tmp.") + "$BASHPID"
+        _snap_template = _q(snap + ".tmp.XXXXXX")
         # One writer iteration = the exact atomic sequence _wrap_command emits.
         writer = (
             "for i in $(seq 1 80); do "
             "export BIG_$i=$(head -c 600 /dev/zero | tr '\\0' x); "
-            f"{{ export -p > {_snap_tmp} && mv -f {_snap_tmp} {_q(snap)}; }} "
-            f"2>/dev/null || rm -f {_snap_tmp} 2>/dev/null || true; "
+            f"_snap_tmp=$(mktemp {_snap_template} 2>/dev/null) || _snap_tmp=; "
+            "if [ -n \"$_snap_tmp\" ]; then "
+            f"{{ export -p > \"$_snap_tmp\" && mv -f \"$_snap_tmp\" {_q(snap)}; }} "
+            "2>/dev/null || rm -f \"$_snap_tmp\" 2>/dev/null || true; fi; "
             "done"
         )
         # Reader: repeatedly source the snapshot and check PATH never absorbs
@@ -222,6 +225,197 @@ class TestAtomicSnapshotConcurrencyBehavioral:
         final = self._run(f"source {_q(snap)} >/dev/null 2>&1 && echo OK || echo BROKEN")
         assert "OK" in final.stdout, f"final snapshot not sourceable: {final.stdout} {final.stderr}"
 
+    def test_local_environment_concurrent_snapshot_updates_preserve_path(self, tmp_path):
+        """Exercise the actual spawn/source/update path, not only its shell fixture."""
+        import threading
+
+        from tools.environments.local import LocalEnvironment
+
+        env = LocalEnvironment(cwd=str(tmp_path), timeout=30)
+        env.init_session()
+        assert env._snapshot_ready
+        failures = []
+        failures_lock = threading.Lock()
+        try:
+            for batch in range(3):
+                start = threading.Barrier(4)
+                threads = []
+
+                def worker(index):
+                    start.wait()
+                    result = env.execute(
+                        f"export SNAPSHOT_PROBE_{batch}_{index}=value; true"
+                    )
+                    if result["returncode"] != 0:
+                        with failures_lock:
+                            failures.append(result)
+
+                for index in range(4):
+                    thread = threading.Thread(target=worker, args=(index,))
+                    thread.start()
+                    threads.append(thread)
+                for thread in threads:
+                    thread.join()
+
+            assert not failures, failures
+            final = env.execute("command -v tr >/dev/null && printf SNAPSHOT_OK")
+            assert final["returncode"] == 0
+            assert "SNAPSHOT_OK" in final["output"]
+        finally:
+            env.cleanup()
+
+    def test_readonly_legacy_temp_name_does_not_break_successful_command(self, tmp_path):
+        """Snapshot bookkeeping must not collide with user shell variables."""
+        from tools.environments.local import LocalEnvironment
+
+        env = LocalEnvironment(cwd=str(tmp_path), timeout=30)
+        env.init_session()
+        assert env._snapshot_ready
+        try:
+            result = env.execute("readonly __hermes_snapshot_tmp; printf COMMAND_OK")
+
+            assert result["returncode"] == 0, result
+            assert "COMMAND_OK" in result["output"]
+            assert "readonly variable" not in result["output"]
+        finally:
+            env.cleanup()
+
+    def test_snapshot_update_falls_back_when_mktemp_fails(self, tmp_path):
+        """A missing mktemp command must not silently drop session exports."""
+        from tools.environments.local import LocalEnvironment
+
+        env = LocalEnvironment(cwd=str(tmp_path), timeout=30)
+        env.init_session()
+        assert env._snapshot_ready
+        try:
+            update = env.execute(
+                "mktemp() { return 1; }; "
+                "export SNAPSHOT_FALLBACK_MARKER=present; printf UPDATE_OK"
+            )
+            assert update["returncode"] == 0, update
+            assert "UPDATE_OK" in update["output"]
+
+            persisted = env.execute(
+                'test "${SNAPSHOT_FALLBACK_MARKER-}" = present && printf PERSISTED'
+            )
+            assert persisted["returncode"] == 0, persisted
+            assert "PERSISTED" in persisted["output"]
+        finally:
+            env.cleanup()
+
+    def test_fallback_ignores_debug_trap_that_marks_snapshot_helpers_readonly(self, tmp_path):
+        """User DEBUG hooks cannot interrupt fallback snapshot bookkeeping."""
+        from tools.environments.local import LocalEnvironment
+
+        env = LocalEnvironment(cwd=str(tmp_path), timeout=30)
+        env.init_session()
+        assert env._snapshot_ready
+        try:
+            update = env.execute(
+                "trap 'for name in $(compgen -v __hermes_snapshot_); "
+                "do readonly \"$name\"; done' DEBUG; "
+                "mktemp() { return 1; }; "
+                "export SNAPSHOT_DEBUG_TRAP_MARKER=present; printf UPDATE_OK"
+            )
+            assert update["returncode"] == 0, update
+            assert "readonly variable" not in update["output"]
+
+            persisted = env.execute(
+                'test "${SNAPSHOT_DEBUG_TRAP_MARKER-}" = present && printf PERSISTED'
+            )
+            assert persisted["returncode"] == 0, persisted
+            assert "PERSISTED" in persisted["output"]
+        finally:
+            env.cleanup()
+
+    def test_fallback_ignores_functrace_debug_output(self, tmp_path):
+        """Inherited DEBUG output cannot be captured as a temp-file path."""
+        from tools.environments.local import LocalEnvironment
+
+        env = LocalEnvironment(cwd=str(tmp_path), timeout=30)
+        env.init_session()
+        assert env._snapshot_ready
+        try:
+            update = env.execute(
+                "set -T; trap 'printf DEBUG_TRAP_OUTPUT' DEBUG; "
+                "mktemp() { return 1; }; "
+                "export SNAPSHOT_FUNCTRACE_MARKER=present; printf UPDATE_OK"
+            )
+            assert update["returncode"] == 0, update
+
+            persisted = env.execute(
+                'test "${SNAPSHOT_FUNCTRACE_MARKER-}" = present && printf PERSISTED'
+            )
+            assert persisted["returncode"] == 0, persisted
+            assert "PERSISTED" in persisted["output"]
+        finally:
+            env.cleanup()
+
+    def test_bootstrap_ignores_login_debug_output(self, tmp_path):
+        """Login-shell DEBUG output cannot corrupt the initial snapshot path."""
+        import subprocess
+        from pathlib import Path
+
+        class LoginDebugEnv(BaseEnvironment):
+            def __init__(self, temp_dir):
+                self._temp_dir = str(temp_dir)
+                super().__init__(cwd=str(temp_dir), timeout=10)
+
+            def get_temp_dir(self):
+                return self._temp_dir
+
+            def _run_bash(self, cmd_string, *, login=False, timeout=120, stdin_data=None):
+                prefix = "set -T; trap 'printf LOGIN_DEBUG_OUTPUT' DEBUG\n" if login else ""
+                return subprocess.Popen(
+                    ["/bin/bash", "-c", prefix + cmd_string],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    stdin=subprocess.DEVNULL,
+                    text=True,
+                    cwd=self.cwd,
+                )
+
+            def cleanup(self):
+                pass
+
+        env = LoginDebugEnv(tmp_path)
+        env.init_session()
+
+        snapshot = Path(env._snapshot_path)
+        assert env._snapshot_ready
+        assert snapshot.is_file()
+        assert "declare -x" in snapshot.read_text()
+
+    def test_bootstrap_falls_back_to_stateless_when_temp_allocation_fails(self, tmp_path):
+        """A missing snapshot directory must not be reported as snapshot-ready."""
+        import subprocess
+
+        class MissingTempDirEnv(BaseEnvironment):
+            def __init__(self, temp_dir):
+                self._temp_dir = str(temp_dir)
+                super().__init__(cwd=str(temp_dir.parent), timeout=10)
+
+            def get_temp_dir(self):
+                return self._temp_dir
+
+            def _run_bash(self, cmd_string, *, login=False, timeout=120, stdin_data=None):
+                return subprocess.Popen(
+                    ["/bin/bash", "-c", cmd_string],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    stdin=subprocess.DEVNULL,
+                    text=True,
+                    cwd=self.cwd,
+                )
+
+            def cleanup(self):
+                pass
+
+        env = MissingTempDirEnv(tmp_path / "missing-snapshot-dir")
+        env.init_session()
+
+        assert not env._snapshot_ready
+
     def test_failed_export_does_not_destroy_good_snapshot(self, tmp_path):
         """If ``export -p`` fails, the ``&&``-chained mv must NOT clobber the
         existing good snapshot."""
@@ -235,7 +429,7 @@ class TestAtomicSnapshotConcurrencyBehavioral:
         self._run(f"echo 'export GOOD=1' > {_q(snap)}")  # seed good snapshot
         # Redirect export into an unwritable dir so the export side fails; mv
         # must then NOT run (&&) and not clobber snap.
-        bad_tmp = _q("/nonexistent-dir/snap.tmp.") + "$BASHPID"
+        bad_tmp = _q("/nonexistent-dir/snap.tmp")
         script = (
             f"{{ export -p > {bad_tmp} && mv -f {bad_tmp} {_q(snap)}; }} "
             f"2>/dev/null || rm -f {bad_tmp} 2>/dev/null || true"

@@ -471,9 +471,18 @@ class LSPClient:
                     pass
         finally:
             self._state = "stopped"
-            await self._cleanup_process()
+            await self._cleanup_process(wait_for_exit=True)
 
-    async def _cleanup_process(self) -> None:
+    async def _cleanup_process(self, *, wait_for_exit: bool = False) -> None:
+        proc = self._proc
+        if wait_for_exit and proc is not None and proc.returncode is None:
+            # Keep both output drains alive while a protocol-compliant server
+            # processes ``exit``. Otherwise a full pipe can block its exit and
+            # force an unnecessary SIGTERM.
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=SHUTDOWN_GRACE)
+            except asyncio.TimeoutError:
+                pass
         if self._reader_task is not None and not self._reader_task.done():
             self._reader_task.cancel()
             try:
@@ -486,7 +495,6 @@ class LSPClient:
                 await self._stderr_task
             except (asyncio.CancelledError, Exception):  # noqa: BLE001
                 pass
-        proc = self._proc
         self._proc = None
         if proc is None:
             return

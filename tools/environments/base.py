@@ -10,6 +10,7 @@ import codecs
 import json
 import logging
 import os
+import re
 import select
 import shlex
 import subprocess
@@ -19,7 +20,7 @@ import uuid
 from abc import ABC, abstractmethod
 from collections import deque
 from pathlib import Path
-from typing import IO, Callable, Protocol
+from typing import IO, Callable, Iterable, Protocol
 
 from hermes_constants import get_hermes_home
 from hermes_cli._subprocess_compat import windows_hide_flags
@@ -149,7 +150,14 @@ def set_activity_callback(cb: Callable[[str], None] | None) -> None:
     _activity_callback_local.callback = cb
 
 
-def _get_activity_callback() -> Callable[[str], None] | None:
+def get_activity_callback() -> Callable[[str], None] | None:
+    """Return the thread-local activity callback (see ``set_activity_callback``).
+
+    Public accessor for callers outside this module that need to capture the
+    calling thread's callback before handing work to another thread (the
+    callback is thread-local, so a freshly spawned thread cannot read it
+    back) — e.g. the manual cron-run heartbeat (#76502).
+    """
     return getattr(_activity_callback_local, "callback", None)
 
 
@@ -171,7 +179,7 @@ def touch_activity_if_due(
         return
     state["last_touch"] = now
     try:
-        cb = _get_activity_callback()
+        cb = get_activity_callback()
         if cb:
             elapsed = int(now - state["start"])
             cb(f"{label} ({elapsed}s elapsed)")
@@ -403,11 +411,17 @@ def _cwd_marker(session_id: str) -> str:
 _SNAPSHOT_EXCLUDED_ENV_REGEX = (
     "^declare -x (HERMES_SESSION_|HERMES_UI_SESSION_ID|HERMES_CRON_AUTO_DELIVER_)"
 )
+_SHELL_ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_CLEAR_DEBUG_TRAP = "{ builtin trap - DEBUG; } >/dev/null 2>&1"
 
 
-def _export_dump_excluding_session_vars(tmp_path: str) -> str:
+def _export_dump_excluding_session_vars(
+    tmp_path: str,
+    excluded_names: Iterable[str] = (),
+) -> str:
     """Return a shell snippet that dumps ``export -p`` to *tmp_path* minus the
-    per-session bridged vars (see ``_SNAPSHOT_EXCLUDED_ENV_REGEX``).
+    per-session bridged vars (see ``_SNAPSHOT_EXCLUDED_ENV_REGEX``) and any
+    additional names supplied by the caller.
 
     Unset the bridged vars in a subshell *before* ``export -p``. A line-based
     ``grep -vE`` filter is unsafe: bash 3.2 prints a value containing a newline
@@ -419,19 +433,25 @@ def _export_dump_excluding_session_vars(tmp_path: str) -> str:
     lines. ``|| true`` keeps the success contract for callers that chain on it.
 
     The dump MUST be wrapped in a brace group with the redirection applied to
-    the group. *tmp_path* typically embeds ``$BASHPID`` for concurrency-safe
-    temp names; a redirection attached to a pipeline segment would expand
-    ``$BASHPID`` inside that segment's subshell (a different PID than the
-    parent that expands the follow-up ``mv``), silently orphaning the dump.
-    The brace-group redirect is expanded in the current shell, keeping both
-    expansions consistent.
+    the group. This keeps the complete unset-and-dump sequence directed into
+    the already-allocated temporary file rather than exposing a pipeline
+    segment to partial output.
     """
     # ${!PREFIX*} is bash 3.2+ name-prefix expansion; empty matches are fine
     # because ``unset`` with only missing names is ignored under 2>/dev/null.
+    # Quote caller-provided names so malformed configuration can never become
+    # shell syntax. Valid environment names remain unquoted by shlex.quote().
+    safe_names = {
+        name for name in excluded_names
+        if isinstance(name, str) and name
+    }
+    extra_unset = " ".join(shlex.quote(name) for name in sorted(safe_names))
+    if extra_unset:
+        extra_unset = f" {extra_unset}"
     return (
         "{ ( "
         "unset ${!HERMES_SESSION_*} ${!HERMES_CRON_AUTO_DELIVER_*} "
-        "HERMES_UI_SESSION_ID 2>/dev/null; "
+        f"HERMES_UI_SESSION_ID{extra_unset} 2>/dev/null; "
         "export -p; "
         ") || true; } "
         f"> {tmp_path}"
@@ -457,6 +477,11 @@ class BaseEnvironment(ABC):
     # Snapshot creation timeout (override for slow cold-starts).
     _snapshot_timeout: int = 30
 
+    # Local and Docker override this because they resolve allowlisted values
+    # through the active profile scope. Other backends keep their existing
+    # snapshot semantics until they implement the same resolver contract.
+    _profile_scoped_passthrough: bool = False
+
     def get_temp_dir(self) -> str:
         """Return the backend temp directory used for session artifacts.
 
@@ -477,6 +502,7 @@ class BaseEnvironment(ABC):
         self._cwd_file = f"{temp_dir}/hermes-cwd-{self._session_id}.txt"
         self._cwd_marker = _cwd_marker(self._session_id)
         self._snapshot_ready = False
+        self._snapshot_passthrough_names: set[str] = set()
         # When True, login bash is unusable (e.g. broken Git-for-Windows
         # ``Directory \\drivers\\etc`` startup) so execute() must not fall
         # back to ``bash -l`` per command — use non-login ``bash -c`` instead.
@@ -510,6 +536,40 @@ class BaseEnvironment(ABC):
     # Session snapshot (init_session)
     # ------------------------------------------------------------------
 
+    def _additional_profile_scoped_passthrough_names(self) -> Iterable[str]:
+        """Return backend-specific names that must not persist in snapshots."""
+        return ()
+
+    def _snapshot_excluded_passthrough_names(self) -> tuple[str, ...]:
+        """Return profile-scoped names that must not persist in the snapshot.
+
+        The set is monotonic for the environment lifetime. A skill/config
+        allowlist can be cleared after a value was captured; retaining the
+        exclusion prevents that old value from becoming visible to a later
+        profile through the shared snapshot.
+        """
+        if not self._profile_scoped_passthrough:
+            return ()
+        try:
+            from agent.secret_scope import is_multiplex_active
+            if is_multiplex_active():
+                from tools.env_passthrough import get_all_passthrough
+                names = (
+                    *get_all_passthrough(),
+                    *self._additional_profile_scoped_passthrough_names(),
+                )
+                self._snapshot_passthrough_names.update(
+                    name
+                    for name in names
+                    if isinstance(name, str) and _SHELL_ENV_NAME_RE.fullmatch(name)
+                )
+        except Exception:
+            logger.debug(
+                "Could not refresh profile-scoped snapshot exclusions",
+                exc_info=True,
+            )
+        return tuple(sorted(self._snapshot_passthrough_names))
+
     def init_session(self):
         """Capture login shell environment into a snapshot file.
 
@@ -542,19 +602,21 @@ class BaseEnvironment(ABC):
         # source() either sees the old complete snapshot or the new complete
         # one — never a partial/truncated file.
         #
-        # The temp name MUST be unique per concurrent writer.  ``$$`` is the
-        # bash PID, but in ``&``-launched subshells (how concurrent terminal
-        # calls run) ``$$`` stays the *parent* shell's PID — so two concurrent
-        # writers would pick the SAME temp name, clobber each other's temp
-        # mid-write, and mv would then publish a torn file (the corruption is
-        # only narrowed, not closed).  ``$BASHPID`` is the actual subshell PID
-        # and is genuinely unique per writer, which closes the race.  The
-        # static path is shell-quoted (Windows/Git-Bash drive letters, spaces)
-        # with ``$BASHPID`` left outside the quotes so it still expands.
-        _snap_tmp = self._quote_shell_path(self._snapshot_path + ".tmp.") + "$BASHPID"
+        # Allocate a unique temp file beside the snapshot, preserving the
+        # same-filesystem guarantee required for atomic ``mv``. Do not use
+        # ``$BASHPID``: macOS's bundled bash 3.2 leaves it unset, silently
+        # making every concurrent writer share one ``.tmp.`` file.
+        snapshot_temp_allocation, _snap_tmp, snapshot_temp_vars = self._snapshot_temp_allocation()
+        snapshot_excluded = (
+            *self._snapshot_excluded_passthrough_names(),
+            *snapshot_temp_vars,
+        )
         bootstrap = (
             f"umask 077\n"
-            f"{_export_dump_excluding_session_vars(_snap_tmp)}\n"
+            f"{_CLEAR_DEBUG_TRAP}\n"
+            f"{snapshot_temp_allocation}"
+            f"if [ -z {_snap_tmp} ]; then exit 1; fi\n"
+            f"{_export_dump_excluding_session_vars(_snap_tmp, snapshot_excluded)}\n"
             # Dump function definitions, filtering out private (``_``-prefixed)
             # helpers — mainly bash-completion internals (``_git``, ``_make``…)
             # — by NAME, not by line.  A naive ``declare -f | grep -vE '^_[^_]'``
@@ -651,6 +713,41 @@ class BaseEnvironment(ABC):
         """
         return shlex.quote(path)
 
+    def _snapshot_temp_allocation(self) -> tuple[str, str, tuple[str, ...]]:
+        """Return a safe same-directory snapshot-temp allocation snippet.
+
+        ``mktemp`` is preferred, but some remote Bash hosts do not provide it.
+        The fallback uses Bash's ``noclobber`` redirection to atomically create
+        a randomized sibling file.  Per-invocation helper names prevent a user
+        command from colliding with or making a fixed bookkeeping variable
+        readonly before the snapshot is updated.
+        """
+        suffix = uuid.uuid4().hex
+        tmp_var = f"__hermes_snapshot_tmp_{suffix}"
+        candidate_var = f"__hermes_snapshot_candidate_{suffix}"
+        attempts_var = f"__hermes_snapshot_attempts_{suffix}"
+        template = self._quote_shell_path(self._snapshot_path + ".tmp.XXXXXX")
+        snapshot_prefix = self._quote_shell_path(self._snapshot_path)
+        allocation = (
+            f"{tmp_var}=$(\n"
+            f"  mktemp {template} 2>/dev/null || (\n"
+            f"    {attempts_var}=0\n"
+            f"    while [ \"${attempts_var}\" -lt 32 ]; do\n"
+            f"      {candidate_var}={snapshot_prefix}.tmp.$RANDOM.$RANDOM\n"
+            f"      if (set -C; : > \"${candidate_var}\") 2>/dev/null; then\n"
+            f"        printf '%s' \"${candidate_var}\"\n"
+            f"        break\n"
+            f"      fi\n"
+            f"      {attempts_var}=$(({attempts_var} + 1))\n"
+            f"    done\n"
+            f"  )\n"
+            f")\n"
+        )
+        # The fallback variables stay inside command substitution, so they
+        # cannot leak into the next snapshot or be frozen by a user DEBUG trap
+        # between allocation steps.
+        return allocation, f'"${tmp_var}"', (tmp_var,)
+
     def _wrap_command(self, command: str, cwd: str) -> str:
         """Build the full bash script that sources snapshot, cd's, runs command,
         re-dumps env vars, and emits CWD markers."""
@@ -660,15 +757,28 @@ class BaseEnvironment(ABC):
         # rewrites ``C:/...`` to ``/c/...`` so MSYS doesn't mangle it).
         _quoted_snap = self._quote_shell_path(self._snapshot_path)
         # Use atomic file replacement for env snapshot updates (issue #38249).
-        # Assemble into a per-writer-unique temp file, then mv to atomically
-        # replace the snapshot so concurrent source() calls never read a
-        # truncated/half-written file.  ``$BASHPID`` (not ``$$``) is the actual
-        # subshell PID — unique per concurrent ``&``-launched writer — so two
-        # writers never share a temp name and clobber each other before the mv.
-        # Static path shell-quoted (Windows/spaces); ``$BASHPID`` left to expand.
-        _snap_tmp = self._quote_shell_path(self._snapshot_path + ".tmp.") + "$BASHPID"
+        # ``mktemp`` allocates a per-writer file in the snapshot directory, so
+        # ``mv`` remains atomic and works on macOS bash 3.2 as well as newer
+        # Bash versions.
+        snapshot_temp_allocation, _snap_tmp, snapshot_temp_vars = self._snapshot_temp_allocation()
 
         parts = []
+        passthrough_names = self._snapshot_excluded_passthrough_names()
+        snapshot_excluded = (*passthrough_names, *snapshot_temp_vars)
+
+        # A shared snapshot may contain the previous profile's value. Save
+        # the current process environment before sourcing it, then restore the
+        # current profile's value (or unset the name) immediately afterwards.
+        # Values stay in environment memory and never enter the shell command
+        # string, so secrets are not exposed through process arguments/logs.
+        saved_names: list[tuple[str, str, str]] = []
+        for name in passthrough_names:
+            marker = f"_HERMES_RUNTIME_PASSTHROUGH_{name}"
+            present = f"{marker}_PRESENT"
+            value = f"{marker}_VALUE"
+            saved_names.append((name, present, value))
+            parts.append(f"{present}=${{{name}+x}}")
+            parts.append(f"{value}=${{{name}-}}")
 
         # Source snapshot (env vars from previous commands).
         # Redirect stdout to /dev/null: on macOS (bash 3.2 and certain
@@ -680,6 +790,13 @@ class BaseEnvironment(ABC):
             parts.append(
                 f"source {_quoted_snap} >/dev/null 2>&1 || true"
             )
+
+        for name, present, value in saved_names:
+            parts.append(
+                f'if [ "${present}" = x ]; then export {name}="${value}"; '
+                f'else unset {name}; fi'
+            )
+            parts.append(f"unset {present} {value}")
 
         # Preserve bare ``~`` expansion, but rewrite ``~/...`` through
         # ``$HOME`` so suffixes with spaces remain a single shell word.
@@ -698,16 +815,22 @@ class BaseEnvironment(ABC):
         # Chain mv on the export succeeding so a failed/partial dump never
         # replaces a good snapshot; drop the temp on failure so it isn't
         # orphaned (cleaned up wholesale in LocalEnvironment.cleanup too).
-        # NOTE: the redirection must be attached to a brace group — ``_snap_tmp``
-        # embeds ``$BASHPID``, and a redirect on a pipeline segment expands
-        # inside that segment's subshell (a different PID than the parent that
-        # expands the ``mv`` operand), silently orphaning the dump. See
-        # _export_dump_excluding_session_vars.
+        # The redirection stays attached to the brace group so the complete
+        # exclusion-and-dump sequence writes to the mktemp-allocated file.
         if self._snapshot_ready:
+            # A user command may leave a DEBUG trap behind. With ``set -T``
+            # Bash inherits it in command substitution, where any trap stdout
+            # would be captured as part of the allocated temp path. Traps are
+            # not persisted in snapshots, so clear it after the user command
+            # and before Hermes' own bookkeeping. Redirect the clearing command
+            # itself to suppress output from the trap that fires before it.
+            parts.append(_CLEAR_DEBUG_TRAP)
+            parts.append(snapshot_temp_allocation.rstrip())
             parts.append(
-                f"{{ {_export_dump_excluding_session_vars(_snap_tmp)} "
+                f"if [ -n {_snap_tmp} ]; then "
+                f"{{ {_export_dump_excluding_session_vars(_snap_tmp, snapshot_excluded)} "
                 f"&& mv -f {_snap_tmp} {_quoted_snap}; }} "
-                f"2>/dev/null || rm -f {_snap_tmp} 2>/dev/null || true"
+                f"2>/dev/null || rm -f {_snap_tmp} 2>/dev/null || true; fi"
             )
 
         # Emit the CWD stdout marker; all backends (including local, since
@@ -919,7 +1042,7 @@ class BaseEnvironment(ABC):
         _iter_count = 0
         _last_heartbeat = _now
         _last_interrupt_state = False
-        _cb_was_none = _get_activity_callback() is None
+        _cb_was_none = get_activity_callback() is None
         if _DEBUG_INTERRUPT:
             logger.info(
                 "[interrupt-debug] _wait_for_process ENTER tid=%s pid=%s "
@@ -969,7 +1092,7 @@ class BaseEnvironment(ABC):
                 # the activity-callback state (thread-local, can get clobbered
                 # by nested tool calls or executor thread reuse).
                 if _DEBUG_INTERRUPT and time.monotonic() - _last_heartbeat >= 30.0:
-                    _cb_now_none = _get_activity_callback() is None
+                    _cb_now_none = get_activity_callback() is None
                     logger.info(
                         "[interrupt-debug] _wait_for_process HEARTBEAT "
                         "tid=%s pid=%s iter=%d elapsed=%.0fs "

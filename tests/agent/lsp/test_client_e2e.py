@@ -11,6 +11,7 @@ import asyncio
 import os
 import sys
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -70,6 +71,50 @@ async def test_client_receives_published_errors(tmp_path: Path):
         assert "synthetic error" in d["message"]
     finally:
         await client.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_waits_for_graceful_exit_before_signaling(tmp_path: Path, monkeypatch):
+    """Graceful exit keeps output draining and avoids SIGTERM/SIGKILL."""
+
+    reader_task = asyncio.create_task(asyncio.sleep(60))
+    stderr_task = asyncio.create_task(asyncio.sleep(60))
+
+    class GracefulProcess:
+        returncode = None
+
+        async def wait(self):
+            assert not reader_task.done(), "stdout must drain while waiting for graceful exit"
+            assert not stderr_task.done(), "stderr must drain while waiting for graceful exit"
+            self.returncode = 0
+            return 0
+
+        def terminate(self):
+            raise AssertionError("shutdown must wait before signaling a graceful child")
+
+        def kill(self):
+            raise AssertionError("shutdown must not SIGKILL a graceful child")
+
+    async def successful_request(*_args):
+        return None
+
+    async def successful_notification(*_args):
+        return None
+
+    client = _client(tmp_path)
+    client._state = "running"
+    client._proc = cast(asyncio.subprocess.Process, GracefulProcess())
+    client._reader_task = reader_task
+    client._stderr_task = stderr_task
+    monkeypatch.setattr(client, "_send_request", successful_request)
+    monkeypatch.setattr(client, "_send_notification", successful_notification)
+
+    await client.shutdown()
+
+    assert client._state == "stopped"
+    assert client._proc is None
+    assert reader_task.cancelled()
+    assert stderr_task.cancelled()
 
 
 
