@@ -2475,8 +2475,9 @@ class ShellFileOperations(FileOperations):
                         limit: int, offset: int, output_mode: str, context: int) -> SearchResult:
         """Search for content inside files (grep-like)."""
         # Try ripgrep first (fast), fallback to grep (slower but works)
-        uses_ripgrep = self._has_command('rg')
-        if uses_ripgrep:
+        used_rg = False
+        if self._has_command('rg'):
+            used_rg = True
             result = self._search_with_rg(pattern, path, file_glob, limit, offset,
                                           output_mode, context)
         elif self._has_command('grep'):
@@ -2490,8 +2491,9 @@ class ShellFileOperations(FileOperations):
             )
 
         # Zero-match steering: a 0-match result with no guidance is a dead
-        # turn. Probe cheaply for near-misses (wrong casing, unescaped regex
-        # metacharacters) and attach the finding as a warning.
+        # turn. Probe cheaply for near-misses (wrong casing, hidden-only
+        # matches, unescaped regex metacharacters) and attach the finding
+        # as a warning. Runs for BOTH engines.
         if (not result.error and result.total_count == 0
                 and not result.matches and not result.files and not result.counts):
             try:
@@ -2501,10 +2503,9 @@ class ShellFileOperations(FileOperations):
             if hint:
                 result.warning = hint if not result.warning else f"{result.warning} {hint}"
 
-        # ripgrep already enables multiline mode when required, so its
-        # zero-match result must not be replaced with the line-oriented
-        # fallback warning. It still needs the recovery probes above.
-        if uses_ripgrep:
+        # rg auto-enables --multiline for \n patterns, so the line-oriented
+        # explanation only applies to the grep fallback engine.
+        if used_rg:
             return result
         return _maybe_warn_line_oriented_newline_pattern(result, pattern)
     
