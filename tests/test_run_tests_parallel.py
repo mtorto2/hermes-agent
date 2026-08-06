@@ -235,6 +235,37 @@ def _run_runner(probe_dir: Path, *extra: str) -> subprocess.CompletedProcess:
 
 
 
+def test_runner_pins_child_hermes_source_root(tmp_path: Path) -> None:
+    """Per-file children must test the runner's checkout, not a live shell root."""
+    repo_root = Path(__file__).resolve().parent.parent
+    probe = tmp_path / "test_source_root.py"
+    probe.write_text(
+        textwrap.dedent(
+            f"""
+            import os
+            from pathlib import Path
+
+            def test_uses_runner_checkout_as_hermes_source_root():
+                assert Path(os.environ["HERMES_PYTHON_SRC_ROOT"]).resolve() == Path({str(repo_root)!r}).resolve()
+            """
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [sys.executable, str(repo_root / "scripts" / "run_tests_parallel.py"),
+         "--files", str(probe), "-j", "1", "--file-timeout", "30"],
+        cwd=repo_root,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        encoding="utf-8",
+        errors="replace",
+        timeout=60,
+    )
+
+    assert proc.returncode == 0, proc.stdout
+
+
 def test_bare_value_flag_keeps_its_value(tmp_path: Path) -> None:
     """``-k test_alpha`` reaches pytest as a selector, not as a path.
 

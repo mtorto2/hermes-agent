@@ -208,12 +208,14 @@ def test_seed_supervise_skeleton_creates_expected_layout(tmp_path) -> None:
     # Top-level event/ — s6-svlisten1 event subscription dir.
     event = svc_dir / "event"
     assert event.is_dir(), "missing top-level event/"
-    # APFS strips setgid from unprivileged macOS test directories; s6 runs on
-    # Linux where the full 03730 mode is retained. Keep the fixture portable
-    # while preserving the exact container contract.
-    event_mode = 0o1730 if sys.platform == "darwin" else 0o3730
-    assert stat.S_IMODE(event.stat().st_mode) == event_mode, (
-        f"event/ mode = {oct(event.stat().st_mode)}, want {oct(event_mode)}"
+    # APFS may preserve or strip setgid on unprivileged temporary directories;
+    # s6 runs on Linux, where the full 03730 mode is retained. Keep the fixture
+    # portable while preserving the exact container contract.
+    event_modes = {0o1730, 0o3730} if sys.platform == "darwin" else {0o3730}
+    actual_event_mode = stat.S_IMODE(event.stat().st_mode)
+    assert actual_event_mode in event_modes, (
+        f"event/ mode = {oct(event.stat().st_mode)}, want one of "
+        f"{[oct(mode) for mode in sorted(event_modes)]}"
     )
 
     # supervise/ dir.
@@ -224,7 +226,7 @@ def test_seed_supervise_skeleton_creates_expected_layout(tmp_path) -> None:
     # supervise/event/.
     supervise_event = supervise / "event"
     assert supervise_event.is_dir(), "missing supervise/event/"
-    assert stat.S_IMODE(supervise_event.stat().st_mode) == event_mode
+    assert stat.S_IMODE(supervise_event.stat().st_mode) in event_modes
 
     # supervise/control FIFO.
     control = supervise / "control"

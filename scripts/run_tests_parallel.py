@@ -306,7 +306,12 @@ def _run_one_file_once(
 ) -> Tuple[Path, int, str, dict[str, int], float]:
     """Single attempt of a per-file pytest subprocess (see _run_one_file)."""
     cmd = [sys.executable, "-m", "pytest", str(file), *pytest_args]
-    
+    child_env = os.environ.copy()
+    # The interactive gateway/TUI exports this for its live checkout. A
+    # candidate runner must override it so entry-point import hardening tests
+    # the checkout that launched the runner, not a concurrently running one.
+    child_env["HERMES_PYTHON_SRC_ROOT"] = str(repo_root.resolve())
+
     subproc_start = time.monotonic()
     # launch the pytest process
     proc = subprocess.Popen(
@@ -315,7 +320,7 @@ def _run_one_file_once(
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True, encoding="utf-8", errors="replace",
-        env=os.environ,
+        env=child_env,
         # POSIX: place the child at the head of its own process group so
         # _kill_tree can SIGKILL the group atomically.
         # Windows: this maps to CREATE_NEW_PROCESS_GROUP in CPython 3.12+;

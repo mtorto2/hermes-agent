@@ -415,7 +415,7 @@ class TestBlockingApprovalE2E:
 
         # The canonical approval timeout is `approvals.timeout`; the legacy
         # gateway_timeout key is intentionally ignored by the shared resolver.
-        with patch("hermes_cli.config.load_config", return_value={"approvals": {"timeout": 0}}):
+        with patch("tools.approval._get_approval_config", return_value={"timeout": 0}):
             token = set_current_session_key(session_key)
             os.environ["HERMES_GATEWAY_SESSION"] = "1"
             os.environ["HERMES_EXEC_ASK"] = "1"

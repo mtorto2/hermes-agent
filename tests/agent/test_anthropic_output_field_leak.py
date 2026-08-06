@@ -10,10 +10,15 @@ Fix: whitelist input-permitted fields per block type at three points —
 normalize_response capture, _sanitize_replay_block (ordered-blocks replay), and
 _convert_content_part_to_anthropic (content-list replay).
 """
-import sys, os
-sys.path.insert(0, os.path.expanduser("~/.hermes/hermes-agent"))
+import sys
+from pathlib import Path
 
 import pytest
+
+PROJECT_ROOT = str(Path(__file__).resolve().parents[2])
+if PROJECT_ROOT in sys.path:
+    sys.path.remove(PROJECT_ROOT)
+sys.path.insert(0, PROJECT_ROOT)
 from agent.anthropic_adapter import (
     _sanitize_replay_block,
     _convert_content_part_to_anthropic,

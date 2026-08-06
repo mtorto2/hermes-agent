@@ -160,6 +160,42 @@ async def test_gate_on_pending_confirm_registered(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_resolving_confirmation_restores_working_light_cue():
+    """A button/text resolution must clear the human-intervention cue.
+
+    The callback resolves through tools.slash_confirm rather than the original
+    inbound request method, so the wrapper registered by the gateway owns the
+    terminal Agent Lights cue.
+    """
+    from tools import slash_confirm as _slash_confirm_mod
+
+    runner = _make_runner()
+    runner._read_user_config = lambda: {"approvals": {"destructive_slash_confirm": True}}
+    session_key = build_session_key(_make_source())
+    runner._session_key_for_source = lambda source: session_key
+    _slash_confirm_mod.clear(session_key)
+    execute = AsyncMock(return_value="should not run")
+
+    await runner._maybe_confirm_destructive_slash(
+        event=_make_event("/new"),
+        command="new",
+        title="/new",
+        detail="Discards history.",
+        execute=execute,
+    )
+
+    pending = _slash_confirm_mod.get_pending(session_key)
+    assert pending is not None
+    await _slash_confirm_mod.resolve(session_key, pending["confirm_id"], "cancel")
+
+    execute.assert_not_awaited()
+    assert runner.adapters[Platform.TELEGRAM].emit_light_cue_for_chat.await_args_list == [
+        (("c1", LightCueEvent.HUMAN_INTERVENTION), {}),
+        (("c1", LightCueEvent.WORKING), {}),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_resolve_always_persists_opt_out_and_runs_execute(monkeypatch):
     """Resolving with 'always' must (a) flip the config gate to False,
     (b) run execute, and (c) include a one-time opt-out note in the reply."""

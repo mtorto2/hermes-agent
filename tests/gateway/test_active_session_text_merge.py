@@ -108,11 +108,75 @@ def _make_adapter() -> BasePlatformAdapter:
     adapter._auto_tts_enabled_chats = set()
     adapter._auto_tts_disabled_chats = set()
     adapter._typing_paused = set()
+    # Text-queueing tests do not exercise physical notification hardware. Stub
+    # the lifecycle cue at the adapter boundary so no queued LAN executor work
+    # leaks across asyncio test cases.
+    adapter.emit_light_cue_for_chat = AsyncMock(return_value=False)
     return adapter
 
 
 def _debounced_event(adapter: BasePlatformAdapter, session_key: str) -> MessageEvent:
     return adapter._text_debounce[session_key].event
+
+
+@pytest.mark.asyncio
+async def test_non_dm_message_does_not_wait_for_topic_recovery_executor(monkeypatch):
+    """Group messages must not queue behind the shared thread pool.
+
+    Topic recovery only applies to Telegram DM topic mode. Offloading that
+    no-op check for every group message makes ingress wait behind unrelated
+    blocking jobs when the default executor is saturated.
+    """
+    adapter = _make_adapter()
+    # Topic-recovery gating happens before a normal agent turn is spawned.
+    # Keep this ingress test out of the synthetic typing/task lifecycle.
+    adapter._process_message_background = AsyncMock()
+    recovery = MagicMock(return_value=None)
+    adapter.set_topic_recovery_fn(recovery)
+    apply_recovery = MagicMock()
+    adapter._apply_topic_recovery = apply_recovery
+
+    await asyncio.wait_for(
+        adapter.handle_message(_make_event("/status", chat_type="group")),
+        timeout=1.0,
+    )
+    await asyncio.sleep(0)
+
+    apply_recovery.assert_not_called()
+    recovery.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_dm_topic_recovery_stays_offloaded(monkeypatch):
+    """Real Telegram DM topic recovery must still run outside the event loop."""
+    adapter = _make_adapter()
+    # Topic recovery runs before normal agent processing; avoid starting an
+    # unrelated background/typing turn in this focused ingress test.
+    adapter._process_message_background = AsyncMock()
+    recovery = MagicMock(return_value="topic-222")
+    adapter.set_topic_recovery_fn(recovery)
+    offloaded = False
+
+    async def _inline_recovery_to_thread(func, *args, **kwargs):
+        nonlocal offloaded
+        if getattr(func, "__func__", None) is BasePlatformAdapter._apply_topic_recovery:
+            offloaded = True
+            return func(*args, **kwargs)
+        # Agent Lights also uses best-effort background threads. This test owns
+        # the recovery contract only, so do not execute unrelated hardware work.
+        return None
+
+    monkeypatch.setattr(asyncio, "to_thread", _inline_recovery_to_thread)
+    event = _make_event("hello", chat_type="dm", thread_id="1")
+    original_source = event.source
+
+    await adapter.handle_message(event)
+    await asyncio.sleep(0)
+
+    assert offloaded is True
+    assert recovery.call_count == 1
+    assert recovery.call_args.args[0] is original_source
+    assert event.source.thread_id == "topic-222"
 
 
 @pytest.mark.asyncio
