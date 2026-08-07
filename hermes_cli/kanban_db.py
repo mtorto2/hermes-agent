@@ -9052,6 +9052,18 @@ def _dispatch_once_locked(
         if profile_exists is not None and not profile_exists(row["assignee"]):
             result.skipped_nonspawnable.append(row["id"])
             continue
+        if dispatch_allowed is not None:
+            try:
+                if not dispatch_allowed(row["assignee"]):
+                    continue
+            except Exception:
+                # This optional policy must not turn a profile-resolution
+                # problem into a dispatcher outage; preserve legacy dispatch.
+                _log.debug(
+                    "kanban review dispatch admission check failed for %s",
+                    row["assignee"],
+                    exc_info=True,
+                )
         if dry_run:
             result.spawned.append((row["id"], row["assignee"], ""))
             continue

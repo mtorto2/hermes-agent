@@ -83,6 +83,7 @@ PUSH_DEBOUNCE = 0.15
 # The cooperative LSP shutdown/exit handshake needs enough time for a server
 # to flush and exit under scheduler contention. SIGTERM escalation stays
 # tighter once that protocol path has failed.
+SHUTDOWN_REQUEST_TIMEOUT = 2.0
 GRACEFUL_SHUTDOWN_TIMEOUT = 2.0
 SHUTDOWN_GRACE = 1.0  # seconds between SIGTERM and SIGKILL
 
@@ -279,7 +280,7 @@ class LSPClient:
             await self._spawn()
             await self._initialize()
             self._state = "running"
-        except Exception:
+        except (asyncio.CancelledError, Exception):
             self._state = "error"
             await self._cleanup_process()
             raise
@@ -466,11 +467,16 @@ class LSPClient:
         try:
             if self.is_running:
                 try:
-                    await asyncio.wait_for(self._send_request("shutdown", None), timeout=2.0)
+                    await asyncio.wait_for(
+                        self._send_request("shutdown", None),
+                        timeout=SHUTDOWN_REQUEST_TIMEOUT,
+                    )
                 except (asyncio.TimeoutError, LSPRequestError, LSPProtocolError):
                     pass
                 try:
-                    await self._send_notification("exit", None)
+                    # Exit is advisory: the bounded process cleanup below is
+                    # authoritative. Do not let stream backpressure delay it.
+                    await self._send_notification("exit", None, wait_for_drain=False)
                 except Exception:
                     pass
         finally:
@@ -556,12 +562,13 @@ class LSPClient:
                     continue
                 raise
 
-    async def _send_notification(self, method: str, params: Any) -> None:
+    async def _send_notification(self, method: str, params: Any, *, wait_for_drain: bool = True) -> None:
         if self._proc is None or self._proc.stdin is None or self._proc.stdin.is_closing():
             return
         try:
             self._proc.stdin.write(encode_message(make_notification(method, params)))
-            await self._proc.stdin.drain()
+            if wait_for_drain:
+                await self._proc.stdin.drain()
         except (BrokenPipeError, ConnectionResetError, OSError) as e:
             logger.debug("[%s] notify %s failed: %s", self.server_id, method, e)
 

@@ -1405,6 +1405,26 @@ def _is_unusable_container_cwd(cwd: str) -> bool:
     return False
 
 
+def _sanitize_environment_cwd(cwd: str, config: Dict[str, Any]) -> str:
+    """Return *cwd* only when it is usable by the configured backend.
+
+    Session and task CWD records originate on client surfaces such as ACP, so
+    container backends must never receive a host or relative path from them.
+    Fall back to the already-sanitized configured in-container CWD instead.
+    """
+    env_type = config["env_type"]
+    default_cwd = config["cwd"]
+    if env_type in _CONTAINER_BACKENDS and _is_unusable_container_cwd(cwd):
+        if cwd != default_cwd:
+            logger.info(
+                "Ignoring host/relative cwd %r for %s backend "
+                "(won't exist in sandbox). Using %r instead.",
+                cwd, env_type, default_cwd,
+            )
+        return default_cwd
+    return cwd
+
+
 # One-shot guard for the config-fallback bridge below.  Purely an
 # optimization: after the first attempt either TERMINAL_ENV is set (bridge
 # succeeded — merged config always carries terminal.backend) or the import
@@ -1949,10 +1969,11 @@ def ensure_task_env(task_id: Optional[str] = None):
     # A CWD-only override intentionally shares the default sandbox with other
     # sessions, so first creation must still seed it from the raw session's
     # recorded workspace. Otherwise first-use vision ignores ACP/editor CWD.
-    creation_cwd = (
+    creation_cwd = _sanitize_environment_cwd(
         get_session_cwd(task_id)
         or overrides.get("cwd")
-        or config["cwd"]
+        or config["cwd"],
+        config,
     )
     if env_type == "docker":
         image = overrides.get("docker_image") or config["docker_image"]
@@ -2454,26 +2475,14 @@ def terminal_tool(
         else:
             image = ""
 
-        cwd = overrides.get("cwd") or get_session_cwd(task_id) or config["cwd"]
-        # A per-task cwd override (registered by the gateway/TUI for workspace
-        # tracking, or by RL/benchmark envs) wins over config["cwd"] — but
-        # config["cwd"] was already sanitized for container backends in
-        # _get_env_config() while the override is raw. On a container backend a
-        # raw host path (e.g. a Windows desktop session's C:\Users\<user>, or a
-        # POSIX /home/<user>) reaches `docker run -w <host-path>` and the
-        # container fails to start (exit 125). Re-apply the same host/relative
-        # path guard to the *resolved* cwd so the override can't bypass it.
-        # Valid in-container override paths (RL/benchmark sandboxes that set
-        # cwd to /workspace, /root, etc.) are absolute non-host paths and pass
-        # through untouched.
-        if env_type in _CONTAINER_BACKENDS and _is_unusable_container_cwd(cwd):
-            if cwd != config["cwd"]:
-                logger.info(
-                    "Ignoring host/relative cwd override %r for %s backend "
-                    "(won't exist in sandbox). Using %r instead.",
-                    cwd, env_type, config["cwd"],
-                )
-            cwd = config["cwd"]
+        cwd = _sanitize_environment_cwd(
+            overrides.get("cwd") or get_session_cwd(task_id) or config["cwd"],
+            config,
+        )
+        # The resolved CWD may originate from a per-task override, session
+        # record, or config. _sanitize_environment_cwd() keeps valid
+        # in-container paths (for example /workspace or /root) but rejects
+        # host and relative values before they reach `docker run -w`.
         default_timeout = config["timeout"]
 
         # Validate an explicit timeout before it flows into deadline math.

@@ -787,6 +787,26 @@ def test_dispatch_skips_only_assignees_rejected_by_the_admission_predicate(kanba
     assert [task_id for task_id, *_rest in result.spawned] == [default_task]
 
 
+def test_dispatch_skips_review_assignees_rejected_by_the_admission_predicate(kanban_home):
+    """A profile-scoped pause must also leave review work unclaimed."""
+    (kanban_home / "profiles" / "worker").mkdir(parents=True)
+    spawned: list[str] = []
+
+    with kb.connect() as conn:
+        review_task = kb.create_task(conn, title="review", assignee="worker")
+        _set_task_status(conn, review_task, "review")
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda task, *_args: spawned.append(task.id),
+            dispatch_allowed=lambda assignee: assignee != "worker",
+        )
+
+        assert kb.get_task(conn, review_task).status == "review"
+
+    assert spawned == []
+    assert result.spawned == []
+
+
 def test_dispatch_worktree_task_rerun_reuses_existing_linked_worktree_and_branch(kanban_home, tmp_path, monkeypatch):
     repo = tmp_path / "repo"
     _init_git_repo(repo)

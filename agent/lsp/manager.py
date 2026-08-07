@@ -46,6 +46,7 @@ from agent.lsp.client import (
     DIAGNOSTICS_DOCUMENT_WAIT,
     GRACEFUL_SHUTDOWN_TIMEOUT,
     LSPClient,
+    SHUTDOWN_REQUEST_TIMEOUT,
     SHUTDOWN_GRACE,
 )
 from agent.lsp.servers import (
@@ -62,10 +63,13 @@ logger = logging.getLogger("agent.lsp.manager")
 
 DEFAULT_IDLE_TIMEOUT = 600  # seconds; servers idle for >10min get reaped
 MIN_IDLE_TIMEOUT = 30  # floor for config values; must exceed any per-op wait budget
-# A broken client may use one cooperative-exit budget and one post-SIGTERM
-# budget. Leave one second for loop scheduling/cleanup before the manager's
-# outer timeout is allowed to cancel the cleanup coroutine.
-BROKEN_CLIENT_CLEANUP_TIMEOUT = GRACEFUL_SHUTDOWN_TIMEOUT + SHUTDOWN_GRACE + 1.0
+# A broken client may wait for the LSP shutdown reply, then use one
+# cooperative-exit budget and one post-SIGTERM budget. Leave one second for
+# loop scheduling/cleanup before the manager's outer timeout cancels the
+# coroutine before its SIGKILL fallback.
+BROKEN_CLIENT_CLEANUP_TIMEOUT = (
+    SHUTDOWN_REQUEST_TIMEOUT + GRACEFUL_SHUTDOWN_TIMEOUT + SHUTDOWN_GRACE + 1.0
+)
 
 
 class _BackgroundLoop:
@@ -183,6 +187,7 @@ class LSPService:
         self._spawning: Dict[Tuple[str, str], asyncio.Future] = {}
         self._last_used: Dict[Tuple[str, str], float] = {}
         self._state_lock = threading.Lock()
+        self._closing = False
         self._idle_reaper_task: Optional[asyncio.Task] = None
 
         # Delta baseline: file path → snapshot of diagnostics taken
@@ -562,6 +567,8 @@ class LSPService:
         if key in self._broken:
             return None
         with self._state_lock:
+            if self._closing:
+                return None
             client = self._clients.get(key)
             if client is not None and client.is_running:
                 self._last_used[key] = time.time()
@@ -570,7 +577,9 @@ class LSPService:
             spawning = self._spawning.get(key)
         if spawning is not None:
             try:
-                return await spawning
+                # A cancelled waiter must not cancel the shared startup
+                # future; the spawning task owns its child cleanup.
+                return await asyncio.shield(spawning)
             except Exception:  # noqa: BLE001
                 return None
 
@@ -578,6 +587,8 @@ class LSPService:
         loop = asyncio.get_running_loop()
         spawn_future: asyncio.Future = loop.create_future()
         with self._state_lock:
+            if self._closing:
+                return None
             self._spawning[key] = spawn_future
         try:
             ctx = ServerContext(
@@ -614,13 +625,24 @@ class LSPService:
                 spawn_future.set_result(None)
                 return None
             with self._state_lock:
-                self._clients[key] = client
-                self._last_used[key] = time.time()
+                closing = self._closing
+                if not closing:
+                    self._clients[key] = client
+                    self._last_used[key] = time.time()
+            if closing:
+                await client.shutdown()
+                spawn_future.set_result(None)
+                return None
             eventlog.log_active(srv.server_id, per_server_root)
             spawn_future.set_result(client)
             return client
         finally:
             with self._state_lock:
+                if not spawn_future.done():
+                    # Service shutdown awaits this future so a cancelled
+                    # initialize can finish reaping its child before the
+                    # background loop stops.
+                    spawn_future.set_result(None)
                 self._spawning.pop(key, None)
 
     async def _start_idle_reaper(self) -> None:
@@ -681,12 +703,15 @@ class LSPService:
             reaper.cancel()
             await asyncio.gather(reaper, return_exceptions=True)
         with self._state_lock:
+            self._closing = True
             clients = list(self._clients.values())
+            spawning = list(self._spawning.values())
             self._clients.clear()
             self._broken.clear()
             self._last_used.clear()
         await asyncio.gather(
             *(c.shutdown() for c in clients),
+            *(asyncio.shield(future) for future in spawning),
             return_exceptions=True,
         )
 

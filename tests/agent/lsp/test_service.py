@@ -7,12 +7,14 @@ on.
 """
 from __future__ import annotations
 
+import asyncio
 import sys
 import time
 from pathlib import Path
 
 import pytest
 
+from agent.lsp.client import LSPClient
 from agent.lsp.manager import LSPService
 from agent.lsp.servers import (
     SERVERS,
@@ -217,6 +219,175 @@ def test_reaper_survives_sweep_error(mock_pyright):
         assert not svc._idle_reaper_task.done()
     finally:
         svc.shutdown()
+
+
+def test_mark_broken_reaps_backpressured_protocol_unresponsive_client(tmp_path, monkeypatch):
+    """Broken-client cleanup must finish before an immediate service shutdown."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    (repo / "pyproject.toml").write_text("")
+    monkeypatch.chdir(str(repo))
+    restore_mock = _install_mock_server(monkeypatch, "ignore_shutdown", "pyright")
+    next(restore_mock)
+    svc = LSPService(
+        enabled=True,
+        wait_mode="document",
+        wait_timeout=3.0,
+        install_strategy="manual",
+    )
+    proc = None
+    stopped = False
+    try:
+        source = repo / "x.py"
+        source.write_text("print('hi')\n")
+        svc.get_diagnostics_sync(str(source))
+        client = svc._clients[("pyright", str(repo))]
+        proc = client._proc
+        assert proc is not None
+        assert proc.stdin is not None
+        original_drain = proc.stdin.drain
+        drain_calls = 0
+        blocked_drain = asyncio.Event()
+
+        async def _backpressured_exit_drain():
+            nonlocal drain_calls
+            drain_calls += 1
+            if drain_calls == 1:
+                await original_drain()
+                return
+            await blocked_drain.wait()
+
+        monkeypatch.setattr(proc.stdin, "drain", _backpressured_exit_drain)
+        svc._mark_broken_for_file(str(source), RuntimeError("simulated timeout"))
+        svc.shutdown()
+        stopped = True
+
+        assert drain_calls == 1
+        assert proc.returncode is not None
+    finally:
+        if proc is not None and proc.returncode is None:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+        if not stopped:
+            svc.shutdown()
+        try:
+            next(restore_mock)
+        except StopIteration:
+            pass
+
+
+def test_shutdown_does_not_register_late_startup_client(tmp_path, monkeypatch):
+    """A client completing startup during shutdown must be reaped, not registered."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    (repo / "pyproject.toml").write_text("")
+    monkeypatch.chdir(str(repo))
+    restore_mock = _install_mock_server(monkeypatch, "slow", "pyright")
+    next(restore_mock)
+    svc = LSPService(
+        enabled=True,
+        wait_mode="document",
+        wait_timeout=3.0,
+        install_strategy="manual",
+    )
+    proc = None
+    stopped = False
+    try:
+        source = repo / "x.py"
+        source.write_text("print('hi')\n")
+        spawned = []
+        original_spawn = LSPClient._spawn
+
+        async def _capture_spawn(client):
+            await original_spawn(client)
+            spawned.append(client._proc)
+
+        monkeypatch.setattr(LSPClient, "_spawn", _capture_spawn)
+        loop = svc._loop._loop
+        assert loop is not None
+        startup = asyncio.run_coroutine_threadsafe(svc._get_or_spawn(str(source)), loop)
+        deadline = time.monotonic() + 2.0
+        while not spawned and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert len(spawned) == 1
+        proc = spawned[0]
+        assert proc is not None
+
+        svc.shutdown()
+        stopped = True
+
+        assert startup.result(timeout=1.0) is None
+        assert proc.returncode is not None
+    finally:
+        if proc is not None and proc.returncode is None:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+        if not stopped:
+            svc.shutdown()
+        try:
+            next(restore_mock)
+        except StopIteration:
+            pass
+
+
+def test_cancelled_startup_is_reaped_before_immediate_service_shutdown(tmp_path, monkeypatch):
+    """A cancelled initialize must not orphan a not-yet-registered child."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    (repo / "pyproject.toml").write_text("")
+    monkeypatch.chdir(str(repo))
+    restore_mock = _install_mock_server(monkeypatch, "ignore_initialize", "pyright")
+    next(restore_mock)
+    svc = LSPService(
+        enabled=True,
+        wait_mode="document",
+        wait_timeout=3.0,
+        install_strategy="manual",
+    )
+    proc = None
+    stopped = False
+    try:
+        source = repo / "x.py"
+        source.write_text("print('hi')\n")
+        spawned = []
+        original_spawn = LSPClient._spawn
+
+        async def _capture_spawn(client):
+            await original_spawn(client)
+            spawned.append(client)
+
+        monkeypatch.setattr(LSPClient, "_spawn", _capture_spawn)
+        with pytest.raises(TimeoutError):
+            svc._loop.run(svc._get_or_spawn(str(source)), timeout=0.1)
+
+        assert len(spawned) == 1
+        proc = spawned[0]._proc
+        assert proc is not None
+
+        svc._mark_broken_for_file(str(source), TimeoutError("simulated outer timeout"))
+        svc.shutdown()
+        stopped = True
+
+        assert proc.returncode is not None
+    finally:
+        if proc is not None and proc.returncode is None:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+        if not stopped:
+            svc.shutdown()
+        try:
+            next(restore_mock)
+        except StopIteration:
+            pass
 
 
 

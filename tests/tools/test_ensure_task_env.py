@@ -61,6 +61,27 @@ def test_non_local_creation_uses_the_raw_session_cwd(monkeypatch):
         _clear(eff, task_id)
 
 
+def test_container_creation_rejects_host_or_relative_session_cwd(monkeypatch):
+    """Lazy Docker startup must not pass ACP host/relative cwd values to Docker."""
+    monkeypatch.setenv("TERMINAL_ENV", "docker")
+    monkeypatch.setenv("TERMINAL_CWD", "/root")
+    monkeypatch.setattr(tt, "_task_env_overrides", {})
+
+    for session_cwd in ("/Users/matt/project", "relative-project"):
+        task_id = f"acp-{session_cwd}"
+        eff = tt._resolve_container_task_id(task_id)
+        monkeypatch.setattr(tt, "_session_cwd", {})
+        tt.record_session_cwd(task_id, session_cwd)
+        _clear(eff, task_id)
+        fake = SimpleNamespace(execute=lambda *a, **k: {"returncode": 0, "output": ""})
+        try:
+            with patch.object(tt, "_create_environment", return_value=fake) as create:
+                assert tt.ensure_task_env(task_id) is fake
+            assert create.call_args.kwargs["cwd"] == "/root"
+        finally:
+            _clear(eff, task_id)
+
+
 def test_creation_failure_returns_none_and_caches_nothing(monkeypatch):
     """A failed bring-up is best-effort: return None and leave no env cached so
     the caller keeps its fail-closed path."""

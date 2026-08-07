@@ -340,7 +340,11 @@ async def _resolve_container_fallback(
     # env.execute is a blocking backend exec; keep it off the event loop so a
     # multi-MB base64 read doesn't stall every other coroutine.
     qp = shlex.quote(str(p))
-    from tools.terminal_tool import get_session_cwd
+    from tools.terminal_tool import (
+        _get_env_config,
+        _sanitize_environment_cwd,
+        get_session_cwd,
+    )
 
     execute_kwargs = {}
     session_cwd = get_session_cwd(ctx.task_id)
@@ -348,7 +352,7 @@ async def _resolve_container_fallback(
         # A sandbox can be shared by ACP/desktop sessions. Passing the calling
         # session's cwd prevents a relative image from resolving in another
         # session's last terminal directory.
-        execute_kwargs["cwd"] = session_cwd
+        execute_kwargs["cwd"] = _sanitize_environment_cwd(session_cwd, _get_env_config())
     res = await asyncio.to_thread(
         env.execute,
         f"head -c {_MAX_INGEST_BYTES + 1} < {qp} | base64 | tr -d '\\n'",

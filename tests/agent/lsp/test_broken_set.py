@@ -21,7 +21,11 @@ from unittest.mock import patch
 
 import pytest
 
-from agent.lsp.client import SHUTDOWN_GRACE
+from agent.lsp.client import (
+    GRACEFUL_SHUTDOWN_TIMEOUT,
+    SHUTDOWN_GRACE,
+    SHUTDOWN_REQUEST_TIMEOUT,
+)
 from agent.lsp.manager import LSPService
 from agent.lsp.workspace import clear_cache
 
@@ -151,6 +155,40 @@ def test_mark_broken_allows_client_graceful_cleanup_before_cancelling(tmp_path, 
     )
     try:
         svc._clients[("pyright", str(repo))] = _DelayedClient()
+
+        svc._mark_broken_for_file(str(src), RuntimeError("simulated timeout"))
+
+        assert cleanup_finished.is_set()
+    finally:
+        svc.shutdown()
+
+
+def test_mark_broken_allows_shutdown_request_and_both_process_graces(tmp_path, monkeypatch):
+    """The cleanup deadline must reach SIGKILL after an unresponsive shutdown RPC."""
+    repo = _make_git_workspace(tmp_path)
+    monkeypatch.chdir(str(repo))
+    src = repo / "x.py"
+    src.write_text("")
+
+    cleanup_finished = threading.Event()
+
+    class _UnresponsiveShutdownClient:
+        async def shutdown(self):
+            # LSPClient can wait for its shutdown response, then one
+            # graceful-exit wait and one post-SIGTERM wait before SIGKILL.
+            await asyncio.sleep(
+                SHUTDOWN_REQUEST_TIMEOUT + GRACEFUL_SHUTDOWN_TIMEOUT + SHUTDOWN_GRACE + 0.1
+            )
+            cleanup_finished.set()
+
+    svc = LSPService(
+        enabled=True,
+        wait_mode="document",
+        wait_timeout=2.0,
+        install_strategy="manual",
+    )
+    try:
+        svc._clients[("pyright", str(repo))] = _UnresponsiveShutdownClient()
 
         svc._mark_broken_for_file(str(src), RuntimeError("simulated timeout"))
 
