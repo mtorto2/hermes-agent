@@ -160,6 +160,45 @@ async def test_gate_on_pending_confirm_registered(monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("command", ["/new", "/reset"])
+async def test_busy_new_confirmation_defers_interrupt_and_reset(command):
+    """An active-session /new or /reset keeps the current turn until approved."""
+    from gateway.run import _INTERRUPT_REASON_RESET
+    from tools import slash_confirm as _slash_confirm_mod
+
+    runner = _make_runner()
+    runner._read_user_config = lambda: {"approvals": {"destructive_slash_confirm": True}}
+    source = _make_source()
+    session_key = build_session_key(source)
+    runner._session_key_for_source = lambda _source: session_key
+    runner._interrupt_and_clear_session = AsyncMock()
+    runner._handle_reset_command = AsyncMock(return_value="✨ Session reset!")
+    _slash_confirm_mod.clear(session_key)
+
+    event = MessageEvent(text=command, source=source, message_id="m-busy")
+    result = await runner._busy_new_command(event, session_key, source)
+
+    assert isinstance(result, str)
+    assert "Confirm /new" in result
+    runner._interrupt_and_clear_session.assert_not_awaited()
+    runner._handle_reset_command.assert_not_awaited()
+
+    pending = _slash_confirm_mod.get_pending(session_key)
+    assert pending is not None
+    resolved = await _slash_confirm_mod.resolve(session_key, pending["confirm_id"], "once")
+
+    assert resolved == "✨ Session reset!"
+    runner._interrupt_and_clear_session.assert_awaited_once_with(
+        session_key,
+        source,
+        interrupt_reason=_INTERRUPT_REASON_RESET,
+        invalidation_reason="new_command",
+    )
+    runner._handle_reset_command.assert_awaited_once_with(event)
+    _slash_confirm_mod.clear(session_key)
+
+
+@pytest.mark.asyncio
 async def test_resolving_confirmation_restores_working_light_cue():
     """A button/text resolution must clear the human-intervention cue.
 

@@ -276,7 +276,7 @@ def apple_calendar(
         return _run_bridge(cmd)
 
     if action == "create_event":
-        if not confirmed:
+        if confirmed is not True:
             return _json_error("create_event requires confirmed=true after explicit user approval")
         missing = [name for name, value in {"title": title, "start": start, "end": end}.items() if not value]
         if missing:
@@ -289,7 +289,7 @@ def apple_calendar(
         return _run_bridge(cmd)
 
     if action == "delete_event":
-        if not confirmed:
+        if confirmed is not True:
             return _json_error("delete_event requires confirmed=true after explicit user approval")
         if not event_identifier:
             return _json_error("delete_event missing required field: event_identifier")
@@ -309,7 +309,7 @@ def _handle_apple_calendar(args: dict[str, Any], **kwargs: Any) -> str:
         location=args.get("location"),
         notes=args.get("notes"),
         event_identifier=args.get("event_identifier"),
-        confirmed=bool(args.get("confirmed", False)),
+        confirmed=args.get("confirmed") is True,
         task_id=kwargs.get("task_id"),
     )
 

@@ -22,8 +22,10 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import textwrap
 import time
 from pathlib import Path
@@ -261,6 +263,116 @@ def test_runner_pins_child_hermes_source_root(tmp_path: Path) -> None:
         encoding="utf-8",
         errors="replace",
         timeout=60,
+    )
+
+    assert proc.returncode == 0, proc.stdout
+
+
+def test_runner_assigns_unique_temp_roots_to_parallel_children(tmp_path: Path) -> None:
+    """Parallel pytest children must not share pytest's numbered-temp root."""
+    repo_root = Path(__file__).resolve().parent.parent
+    runner = repo_root / "scripts" / "run_tests_parallel.py"
+    inherited_tmpdir = tmp_path / "inherited-tmpdir"
+    inherited_tmpdir.mkdir()
+    result_dir = Path(tempfile.mkdtemp(prefix="hermes-runner-tmp-contract-"))
+    try:
+        observed_tmpdirs = []
+        probes = []
+        for name in ("one", "two"):
+            observed_tmpdir = result_dir / f"{name}-tmpdir.txt"
+            probe = tmp_path / f"test_{name}_tmpdir.py"
+            probe.write_text(
+                textwrap.dedent(
+                    f"""
+                    import os
+                    from pathlib import Path
+
+                    def test_records_child_tmpdir():
+                        Path({str(observed_tmpdir)!r}).write_text(os.environ["TMPDIR"])
+                    """
+                ),
+                encoding="utf-8",
+            )
+            observed_tmpdirs.append(observed_tmpdir)
+            probes.append(probe)
+
+        child_env = os.environ.copy()
+        child_env["TMPDIR"] = str(inherited_tmpdir)
+        proc = subprocess.run(
+            [
+                sys.executable,
+                str(runner),
+                "--files",
+                ":".join(str(probe) for probe in probes),
+                "-j",
+                "2",
+                "--file-timeout",
+                "30",
+            ],
+            cwd=repo_root,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            encoding="utf-8",
+            errors="replace",
+            timeout=60,
+            env=child_env,
+        )
+
+        assert proc.returncode == 0, proc.stdout
+        assert len({path.read_text() for path in observed_tmpdirs}) == 2
+    finally:
+        shutil.rmtree(result_dir)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="AF_UNIX is POSIX-only")
+def test_runner_parallel_children_support_short_unix_socket_paths(tmp_path: Path) -> None:
+    """Per-child scratch roots must leave room for pytest's Unix sockets."""
+    repo_root = Path(__file__).resolve().parent.parent
+    runner = repo_root / "scripts" / "run_tests_parallel.py"
+    probes = []
+    for name in ("one", "two"):
+        probe = tmp_path / f"test_{name}_unix_socket.py"
+        probe.write_text(
+            textwrap.dedent(
+                """
+                import socket
+
+                def test_binds_unix_socket(tmp_path):
+                    socket_path = tmp_path / "pulse" / "native"
+                    socket_path.parent.mkdir()
+                    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                    try:
+                        server.bind(str(socket_path))
+                    finally:
+                        server.close()
+                """
+            ),
+            encoding="utf-8",
+        )
+        probes.append(probe)
+
+    inherited_tmpdir = tmp_path / "inherited-tmpdir"
+    inherited_tmpdir.mkdir()
+    child_env = os.environ.copy()
+    child_env["TMPDIR"] = str(inherited_tmpdir)
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(runner),
+            "--files",
+            ":".join(str(probe) for probe in probes),
+            "-j",
+            "2",
+            "--file-timeout",
+            "30",
+        ],
+        cwd=repo_root,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        encoding="utf-8",
+        errors="replace",
+        timeout=60,
+        env=child_env,
     )
 
     assert proc.returncode == 0, proc.stdout

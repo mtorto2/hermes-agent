@@ -75,6 +75,31 @@ def test_apple_calendar_delete_requires_event_identifier_and_confirmation(monkey
     assert "event_identifier" in result["error"]
 
 
+def test_apple_calendar_handler_refuses_truthy_nonboolean_delete_confirmation(monkeypatch):
+    from tools import apple_calendar_tool
+
+    bridge_calls = []
+    monkeypatch.setattr(
+        apple_calendar_tool,
+        "_run_bridge",
+        lambda args: bridge_calls.append(args) or json.dumps({"success": True}),
+    )
+
+    result = json.loads(
+        apple_calendar_tool._handle_apple_calendar(
+            {
+                "action": "delete_event",
+                "event_identifier": "event-to-keep",
+                "confirmed": "false",
+            }
+        )
+    )
+
+    assert result["success"] is False
+    assert "requires confirmed=true" in result["error"]
+    assert bridge_calls == []
+
+
 def test_apple_calendar_create_builds_safe_confirmed_command(monkeypatch):
     from tools import apple_calendar_tool
 
