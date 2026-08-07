@@ -282,6 +282,25 @@ def _get_active_env(task_id: Optional[str]):
         return None
 
 
+def _ensure_container_env(task_id: Optional[str]) -> None:
+    """Lazily bring up the sandbox (SSH/Docker/…) before an in-sandbox read.
+
+    Unlike the terminal tool, vision never triggered environment creation, so a
+    session whose first action is ``vision_analyze`` on a container-only path
+    under a non-local backend found no active env and failed — until a terminal
+    command happened to create one (issue #62825). Best-effort: any failure just
+    leaves the env absent and the caller hits the existing fail-closed error.
+    """
+    if not task_id:
+        return
+    try:
+        from tools.terminal_tool import ensure_task_env
+
+        ensure_task_env(task_id)
+    except Exception:
+        pass
+
+
 async def _resolve_container_fallback(
     p: Path, ctx: ResolveContext, src: str, permitted: tuple = ("image",)
 ) -> ResolvedImage:
@@ -300,6 +319,11 @@ async def _resolve_container_fallback(
     import asyncio
     import shlex
 
+    # Bring the sandbox up on demand: without this, the first vision_analyze of
+    # a session (before any terminal command) has no active env to read from
+    # under a non-local backend (issue #62825).
+    _ensure_container_env(ctx.task_id)
+
     env = _get_active_env(ctx.task_id)
     if env is None:
         raise SourceNotFound(
@@ -316,9 +340,20 @@ async def _resolve_container_fallback(
     # env.execute is a blocking backend exec; keep it off the event loop so a
     # multi-MB base64 read doesn't stall every other coroutine.
     qp = shlex.quote(str(p))
+    from tools.terminal_tool import get_session_cwd
+
+    execute_kwargs = {}
+    session_cwd = get_session_cwd(ctx.task_id)
+    if session_cwd:
+        # A sandbox can be shared by ACP/desktop sessions. Passing the calling
+        # session's cwd prevents a relative image from resolving in another
+        # session's last terminal directory.
+        execute_kwargs["cwd"] = session_cwd
     res = await asyncio.to_thread(
         env.execute,
-        f"head -c {_MAX_INGEST_BYTES + 1} < {qp} | base64 | tr -d '\\n'")
+        f"head -c {_MAX_INGEST_BYTES + 1} < {qp} | base64 | tr -d '\\n'",
+        **execute_kwargs,
+    )
     if res.get("returncode", 1) != 0:
         raise SourceNotFound(f"could not read '{p}' inside the sandbox", src=src, origin="container")
     try:

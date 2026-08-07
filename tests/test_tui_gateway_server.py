@@ -700,6 +700,14 @@ def test_profile_scoped_agent_build_starts_mcp_discovery_in_profile_home(
     seen = []
     built = threading.Event()
 
+    class _ImmediateThread:
+        def __init__(self, target=None, daemon=None, **_kwargs):
+            self._target = target
+
+        def start(self):
+            if self._target is not None:
+                self._target()
+
     monkeypatch.setattr(
         server,
         "_make_agent",
@@ -714,6 +722,7 @@ def test_profile_scoped_agent_build_starts_mcp_discovery_in_profile_home(
     monkeypatch.setattr(server, "_SlashWorker", lambda *args: None)
     monkeypatch.setattr(server, "_attach_worker", lambda *args: None)
     monkeypatch.setattr(server, "_config_model_target", lambda: ("", ""))
+    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
 
     ready = threading.Event()
     sid = "test-sid"
@@ -726,7 +735,8 @@ def test_profile_scoped_agent_build_starts_mcp_discovery_in_profile_home(
     server._sessions[sid] = session
     try:
         server._start_agent_build(sid, session)
-        assert built.wait(timeout=2)
+        assert built.is_set()
+        assert ready.is_set()
     finally:
         server._sessions.pop(sid, None)
 
@@ -755,6 +765,14 @@ def test_profile_scoped_agent_build_installs_secret_scope(monkeypatch, tmp_path)
     scopes = []
     built = threading.Event()
 
+    class _ImmediateThread:
+        def __init__(self, target=None, daemon=None, **_kwargs):
+            self._target = target
+
+        def start(self):
+            if self._target is not None:
+                self._target()
+
     def _fake_make_agent(*args, **kwargs):
         scope = current_secret_scope()
         scopes.append(dict(scope) if scope else None)
@@ -769,6 +787,7 @@ def test_profile_scoped_agent_build_installs_secret_scope(monkeypatch, tmp_path)
     monkeypatch.setattr(server, "_SlashWorker", lambda *args: None)
     monkeypatch.setattr(server, "_attach_worker", lambda *args: None)
     monkeypatch.setattr(server, "_config_model_target", lambda: ("", ""))
+    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
 
     ready = threading.Event()
     sid = "test-secret-sid"
@@ -781,7 +800,8 @@ def test_profile_scoped_agent_build_installs_secret_scope(monkeypatch, tmp_path)
     server._sessions[sid] = session
     try:
         server._start_agent_build(sid, session)
-        assert built.wait(timeout=2)
+        assert built.is_set()
+        assert ready.is_set()
     finally:
         server._sessions.pop(sid, None)
 
@@ -5157,8 +5177,11 @@ def test_run_prompt_submit_requeues_all_unstarted_notifications_with_real_thread
             turns.append(prompt)
             if "proc_batch_1" in prompt:
                 nested_started.set()
-                if not release_nested.wait(timeout=5):
-                    raise TimeoutError("notification turn was not released")
+                # Keep the turn in flight beyond the queue-observation deadline;
+                # the test's finally releases this synthetic turn after it has
+                # observed the queue, so it must not self-time out under a
+                # CPU-contended full-suite run.
+                release_nested.wait()
             return {"final_response": "", "messages": []}
 
     monkeypatch.setattr(server.threading, "Thread", _recording_thread)

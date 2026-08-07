@@ -14,11 +14,14 @@ This module verifies:
 """
 from __future__ import annotations
 
+import asyncio
+import threading
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
+from agent.lsp.client import SHUTDOWN_GRACE
 from agent.lsp.manager import LSPService
 from agent.lsp.workspace import clear_cache
 
@@ -122,5 +125,35 @@ def test_snapshot_failure_marks_broken_via_outer_timeout(tmp_path, monkeypatch):
         # ``enabled_for`` skips it.
         assert ("pyright", str(repo)) in svc._broken
         assert svc.enabled_for(str(src)) is False
+    finally:
+        svc.shutdown()
+
+
+def test_mark_broken_allows_client_graceful_cleanup_before_cancelling(tmp_path, monkeypatch):
+    """The slow-path cleanup budget must include the client's exit grace."""
+    repo = _make_git_workspace(tmp_path)
+    monkeypatch.chdir(str(repo))
+    src = repo / "x.py"
+    src.write_text("")
+
+    cleanup_finished = threading.Event()
+
+    class _DelayedClient:
+        async def shutdown(self):
+            await asyncio.sleep(SHUTDOWN_GRACE + 0.1)
+            cleanup_finished.set()
+
+    svc = LSPService(
+        enabled=True,
+        wait_mode="document",
+        wait_timeout=2.0,
+        install_strategy="manual",
+    )
+    try:
+        svc._clients[("pyright", str(repo))] = _DelayedClient()
+
+        svc._mark_broken_for_file(str(src), RuntimeError("simulated timeout"))
+
+        assert cleanup_finished.is_set()
     finally:
         svc.shutdown()

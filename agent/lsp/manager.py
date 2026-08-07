@@ -44,7 +44,9 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from agent.lsp import eventlog
 from agent.lsp.client import (
     DIAGNOSTICS_DOCUMENT_WAIT,
+    GRACEFUL_SHUTDOWN_TIMEOUT,
     LSPClient,
+    SHUTDOWN_GRACE,
 )
 from agent.lsp.servers import (
     ServerContext,
@@ -60,6 +62,10 @@ logger = logging.getLogger("agent.lsp.manager")
 
 DEFAULT_IDLE_TIMEOUT = 600  # seconds; servers idle for >10min get reaped
 MIN_IDLE_TIMEOUT = 30  # floor for config values; must exceed any per-op wait budget
+# A broken client may use one cooperative-exit budget and one post-SIGTERM
+# budget. Leave one second for loop scheduling/cleanup before the manager's
+# outer timeout is allowed to cancel the cleanup coroutine.
+BROKEN_CLIENT_CLEANUP_TIMEOUT = GRACEFUL_SHUTDOWN_TIMEOUT + SHUTDOWN_GRACE + 1.0
 
 
 class _BackgroundLoop:
@@ -453,9 +459,11 @@ class LSPService:
             self._last_used.pop(key, None)
         if client is not None:
             try:
-                # Fire-and-forget shutdown — give it a second to cleanup,
-                # but don't block.  We're already on a slow path.
-                self._loop.run(client.shutdown(), timeout=1.0)
+                # A client first gets a cooperative exit grace, then has a
+                # terminate/kill fallback. Keep the outer deadline long
+                # enough to reach both phases; otherwise cancellation can
+                # leave a timed-out child running.
+                self._loop.run(client.shutdown(), timeout=BROKEN_CLIENT_CLEANUP_TIMEOUT)
             except Exception:  # noqa: BLE001
                 pass
 

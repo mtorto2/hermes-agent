@@ -80,6 +80,10 @@ DIAGNOSTICS_DOCUMENT_WAIT = 5.0
 DIAGNOSTICS_FULL_WAIT = 10.0
 DIAGNOSTICS_REQUEST_TIMEOUT = 3.0
 PUSH_DEBOUNCE = 0.15
+# The cooperative LSP shutdown/exit handshake needs enough time for a server
+# to flush and exit under scheduler contention. SIGTERM escalation stays
+# tighter once that protocol path has failed.
+GRACEFUL_SHUTDOWN_TIMEOUT = 2.0
 SHUTDOWN_GRACE = 1.0  # seconds between SIGTERM and SIGKILL
 
 # Retry policy for transient ContentModified errors.
@@ -471,9 +475,18 @@ class LSPClient:
                     pass
         finally:
             self._state = "stopped"
-            await self._cleanup_process()
+            await self._cleanup_process(graceful=True)
 
-    async def _cleanup_process(self) -> None:
+    async def _cleanup_process(self, *, graceful: bool = False) -> None:
+        # A cooperative server exits after the shutdown/exit notifications above.
+        # Let its child watcher reap it before we cancel the stream tasks or send
+        # a fallback signal. This also avoids signalling an already-exited process
+        # during teardown under scheduler contention.
+        if graceful and self._proc is not None and self._proc.returncode is None:
+            try:
+                await asyncio.wait_for(self._proc.wait(), timeout=GRACEFUL_SHUTDOWN_TIMEOUT)
+            except asyncio.TimeoutError:
+                pass
         if self._reader_task is not None and not self._reader_task.done():
             self._reader_task.cancel()
             try:

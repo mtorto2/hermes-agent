@@ -57,6 +57,31 @@ def _resolve_auto_decompose_settings(
     return enabled, per_tick
 
 
+def _kanban_dispatch_allowed(assignee: Optional[str] = None) -> bool:
+    """Return False while the relevant profile's ESTOP is engaged.
+
+    The shared board can dispatch tasks to multiple profiles, so each task is
+    checked against its assignee's home rather than the gateway process's
+    active profile. With no assignee this checks the process profile, used for
+    gateway-owned auto-decompose. In-flight workers are never touched.
+    """
+    try:
+        from agent.estop import check_paused
+    except ImportError:
+        return True
+    home = None
+    component = "kanban"
+    if assignee:
+        try:
+            from hermes_cli.profiles import get_profile_dir
+
+            home = get_profile_dir(assignee)
+            component = f"kanban:{assignee}"
+        except Exception:
+            return True
+    return not check_paused(component, logger, home=home)
+
+
 def _acquire_singleton_lock(lock_path) -> "tuple[Optional[object], str]":
     """Take an exclusive, non-blocking advisory lock for the sole dispatcher.
 
@@ -1095,6 +1120,12 @@ class GatewayKanbanWatchersMixin:
             )
             stale_timeout_seconds = 0
 
+        # kanban.reconcile_orphans (config.yaml, default true): each tick,
+        # requeue 'running' cards whose claim bookkeeping is broken (no
+        # valid claim, dead/gone worker) — the zombie-card reconciliation
+        # pass. Set false to keep orphans frozen for manual forensics.
+        reconcile_orphans = bool(kanban_cfg.get("reconcile_orphans", True))
+
         # Read kanban.default_assignee — fallback profile for tasks
         # created without an explicit assignee (e.g. via the dashboard).
         # When set, the dispatcher applies it to unassigned ready tasks
@@ -1231,6 +1262,8 @@ class GatewayKanbanWatchersMixin:
                     stale_timeout_seconds=stale_timeout_seconds,
                     default_assignee=default_assignee,
                     max_in_progress_per_profile=max_in_progress_per_profile,
+                    reconcile_orphans=reconcile_orphans,
+                    dispatch_allowed=_kanban_dispatch_allowed,
                 )
             except sqlite3.DatabaseError as exc:
                 if _is_corrupt_board_db_error(exc):
@@ -1307,9 +1340,13 @@ class GatewayKanbanWatchersMixin:
                 conn = None
                 try:
                     conn = _kb.connect(board=slug)
-                    if _kb.has_spawnable_ready(conn):
+                    if _kb.has_spawnable_ready(
+                        conn, dispatch_allowed=_kanban_dispatch_allowed
+                    ):
                         return True
-                    if _kb.has_spawnable_review(conn):
+                    if _kb.has_spawnable_review(
+                        conn, dispatch_allowed=_kanban_dispatch_allowed
+                    ):
                         return True
                 except Exception:
                     continue
@@ -1435,12 +1472,15 @@ class GatewayKanbanWatchersMixin:
                 logger.exception("kanban dispatcher: zombie reaper failed")
 
             try:
-                # Re-read the auto-decompose toggle live each tick so a user
-                # flipping kanban.auto_decompose=false to STOP runaway fan-out
-                # takes effect on the next tick, not on gateway restart (#49638).
-                _ad_enabled, _ad_per_tick = _read_auto_decompose_settings()
-                if _ad_enabled:
-                    await asyncio.to_thread(_auto_decompose_tick, _ad_per_tick)
+                # Auto-decompose belongs to this gateway's own profile, while
+                # worker admission is checked per assignee below. A paused
+                # default dispatcher must not silence unpaused specialist work
+                # on the shared board.
+                if _kanban_dispatch_allowed():
+                    _ad_enabled, _ad_per_tick = _read_auto_decompose_settings()
+                    if _ad_enabled:
+                        await asyncio.to_thread(_auto_decompose_tick, _ad_per_tick)
+
                 results = await asyncio.to_thread(_tick_once)
                 any_spawned = False
                 for slug, res in (results or []):
@@ -1459,7 +1499,8 @@ class GatewayKanbanWatchersMixin:
                             res.promoted,
                             len(res.auto_blocked) if hasattr(res.auto_blocked, "__len__") else 0,
                         )
-                # Health telemetry (aggregate across boards)
+                # Health telemetry excludes work paused in its own profile,
+                # while still reporting queues that are genuinely spawnable.
                 ready_pending = await asyncio.to_thread(_ready_nonempty)
                 if ready_pending and not any_spawned:
                     bad_ticks += 1

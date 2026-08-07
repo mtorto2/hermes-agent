@@ -60,11 +60,21 @@ CONFIG_YAML_RE = re.compile(r"""["']config\.yaml["']""")
 
 
 def _iter_source_files():
-    for path in REPO_ROOT.rglob("*.py"):
-        rel = path.relative_to(REPO_ROOT)
-        if any(part in EXCLUDED_DIR_PARTS for part in rel.parts):
-            continue
-        yield rel, path
+    seen: set[Path] = set()
+    for attempt in range(2):
+        try:
+            for path in REPO_ROOT.rglob("*.py"):
+                if path in seen:
+                    continue
+                seen.add(path)
+                rel = path.relative_to(REPO_ROOT)
+                if any(part in EXCLUDED_DIR_PARTS for part in rel.parts):
+                    continue
+                yield rel, path
+            return
+        except FileNotFoundError:
+            if attempt:
+                raise
 
 
 def test_no_raw_config_yaml_reads_outside_owner_modules():
@@ -107,3 +117,28 @@ def test_read_user_config_raw_exists_and_documented():
     doc = read_user_config_raw.__doc__ or ""
     assert "ONLY legal for write-back round-trips and raw-file diagnostics" in doc
     assert "load_config()" in doc
+
+
+def test_source_scan_retries_when_an_ephemeral_cache_directory_disappears(
+    tmp_path, monkeypatch
+):
+    """A concurrent ``__pycache__`` cleanup must not abort the source guard."""
+    source = tmp_path / "hermes_cli" / "config_reader.py"
+    source.parent.mkdir()
+    source.write_text("pass\n")
+    calls = 0
+
+    def _flaky_rglob(self, pattern):
+        nonlocal calls
+        assert self == tmp_path
+        assert pattern == "*.py"
+        calls += 1
+        yield source
+        if calls == 1:
+            raise FileNotFoundError("simulated disappearing __pycache__")
+
+    monkeypatch.setitem(globals(), "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(Path, "rglob", _flaky_rglob)
+
+    assert list(_iter_source_files()) == [(Path("hermes_cli/config_reader.py"), source)]
+    assert calls == 2

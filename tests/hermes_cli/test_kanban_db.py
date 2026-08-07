@@ -766,6 +766,27 @@ def test_dispatch_worktree_task_persists_materialized_workspace_and_branch(kanba
     assert f"branch refs/heads/wt/{tid}" in listed
 
 
+def test_dispatch_skips_only_assignees_rejected_by_the_admission_predicate(kanban_home):
+    """A profile-scoped pause must leave that task ready without blocking peers."""
+    (kanban_home / "profiles" / "worker").mkdir(parents=True)
+    spawned: list[str] = []
+
+    with kb.connect() as conn:
+        default_task = kb.create_task(conn, title="default", assignee="default")
+        paused_task = kb.create_task(conn, title="paused", assignee="worker")
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda task, *_args: spawned.append(task.id),
+            dispatch_allowed=lambda assignee: assignee != "worker",
+        )
+
+        assert kb.get_task(conn, default_task).status == "running"
+        assert kb.get_task(conn, paused_task).status == "ready"
+
+    assert spawned == [default_task]
+    assert [task_id for task_id, *_rest in result.spawned] == [default_task]
+
+
 def test_dispatch_worktree_task_rerun_reuses_existing_linked_worktree_and_branch(kanban_home, tmp_path, monkeypatch):
     repo = tmp_path / "repo"
     _init_git_repo(repo)
