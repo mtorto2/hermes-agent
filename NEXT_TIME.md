@@ -32,9 +32,9 @@ Prepared by: Hermes
   - `backup/frozen-live-20260807-175337-branch`
   - `backup/frozen-live-20260807-175337-tag`
 - The obsolete `fork/dev` staging lane was retired after review: it was 10,163 commits behind live `main`, had no unique code, and its one historical handoff patch was already represented on `main`.
-- Two unfinished local states were preserved as explicit remote WIP archives rather than merged into production:
-  - `fork/archive/queued-paste-wip-20260731` at `8bf081b55` — queued/collapsed paste submission feature and tests.
-  - `fork/archive/interrupted-nous-sync-20260802` at `167ad5c70` — interrupted intake index plus terminal snapshot-hardening WIP.
+- Two unfinished local states were preserved as explicit remote archives rather than merged into production:
+  - `fork/archive/queued-paste-wip-20260731` at `8bf081b55` — redundant preservation copy only: the queued/collapsed-paste feature and its tests already exist on `main` at `5835201de`. Do not merge this archive.
+  - `fork/archive/interrupted-nous-sync-20260802` at `167ad5c70` — broad obsolete partial upstream intake plus the distinct local profile-isolation commit `d9a153721` and terminal snapshot-hardening WIP. Do not merge wholesale; a future Tate review must carry forward only narrow, tested local slices from a fresh current-`main` worktree.
 - The current remote Nous `origin/main` is an unreviewed future intake. Do not merge it merely because this update is complete.
 
 ## Worktree closure
