@@ -50,6 +50,7 @@ def test_export_snippet_shape():
     assert "unset" in snippet
     assert "${!HERMES_SESSION_*}" in snippet
     assert "${!HERMES_CRON_AUTO_DELIVER_*}" in snippet
+    assert "HERMES_CRON_SESSION" in snippet
     assert "HERMES_UI_SESSION_ID" in snippet
     assert "grep -vE" not in snippet
     # The redirection must be attached to a brace group wrapping the dump,
@@ -68,33 +69,55 @@ def test_export_snippet_shape():
 def test_shared_snapshot_no_cross_session_leak(tmp_path):
     import threading
 
+    from agent import secret_scope
     from gateway.session_context import _VAR_MAP, _UNSET, set_session_vars
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
     from tools.environments.local import LocalEnvironment
 
     env = LocalEnvironment(cwd=str(tmp_path), timeout=30)
     env.init_session()
+    secret_scope.set_multiplex_active(True)
     try:
-        def run_as(sid):
+        def run_as(sid, home, cron_session):
             out = {}
 
             def worker():
                 for v in _VAR_MAP.values():
                     v.set(_UNSET)
-                set_session_vars(session_key="k" + sid, session_id=sid, source="desktop")
-                out["r"] = env.execute('echo "[$HERMES_SESSION_ID]"')
+                home_token = set_hermes_home_override(home)
+                try:
+                    set_session_vars(
+                        session_key="k" + sid,
+                        session_id=sid,
+                        source="desktop",
+                        cron_session=cron_session,
+                    )
+                    out["r"] = env.execute(
+                        'printf "[%s][%s][%s]" "$HERMES_SESSION_ID" '
+                        '"${HERMES_CRON_SESSION-unset}" "$HERMES_HOME"'
+                    )
+                finally:
+                    reset_hermes_home_override(home_token)
 
             t = threading.Thread(target=worker)
             t.start()
             t.join()
             return out["r"].get("output", "")
 
-        out_a = run_as("SIDAAA")
-        out_b = run_as("SIDBBB")
+        profile_a = str(tmp_path / "profile-a")
+        profile_b = str(tmp_path / "profile-b")
+        out_a = run_as("SIDAAA", profile_a, "1")
+        out_b = run_as("SIDBBB", profile_b, "")
 
         assert "SIDAAA" in out_a, f"session A saw {out_a!r}"
         # The core assertion: B must see its OWN id, not A's leaked via snapshot.
         assert "SIDBBB" in out_b, f"session B saw {out_b!r}"
         assert "SIDAAA" not in out_b, f"session B leaked A's id: {out_b!r}"
+        assert "[1]" in out_a, f"cron session A saw {out_a!r}"
+        assert "[1]" not in out_b, f"non-cron B leaked cron identity: {out_b!r}"
+        assert profile_a in out_a, f"profile A saw {out_a!r}"
+        assert profile_b in out_b, f"profile B leaked A home: {out_b!r}"
+        assert profile_a not in out_b, f"profile B leaked A home: {out_b!r}"
 
         # And the snapshot file must not carry the session id at all.
         snap = env._snapshot_path
@@ -102,4 +125,5 @@ def test_shared_snapshot_no_cross_session_leak(tmp_path):
             with open(snap) as f:
                 assert "HERMES_SESSION_ID" not in f.read()
     finally:
+        secret_scope.set_multiplex_active(False)
         env.cleanup()

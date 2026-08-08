@@ -49,6 +49,16 @@ class TestTruncationSpill:
         full = p.read_text()
         assert "a1B2c3D4e5F6g7H8i9J0a1B2c3D4e5F6g7H8i9J0" not in full
 
+    def test_spill_excludes_internal_cwd_protocol_and_reports_user_output_size(self, small_cap):
+        r = json.loads(terminal_tool(
+            "python3 -c \"[print('line') for _ in range(600)]\"",
+            task_id="t-spill-cwd",
+        ))
+
+        full = Path(r["full_output_path"]).read_text(encoding="utf-8")
+        assert "__HERMES_CWD_" not in full
+        assert r["output_total_chars"] == len("line\n" * 600)
+
     def test_old_spills_cleaned(self, small_cap, tmp_path):
         spill_dir = tmp_path / ".hermes" / "cache" / "terminal-output"
         spill_dir.mkdir(parents=True, exist_ok=True)

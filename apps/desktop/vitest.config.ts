@@ -1,6 +1,10 @@
 import type { TestProjectConfiguration } from 'vitest/config';
 import { defineConfig } from 'vitest/config'
 
+// React's act() is unavailable when the parent process launched Vitest with
+// NODE_ENV=production. Desktop tests must own their renderer mode.
+process.env.NODE_ENV = 'test'
+
 const reactUi: TestProjectConfiguration = {
   extends: './vite.config.ts',
   test: {

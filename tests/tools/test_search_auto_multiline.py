@@ -34,12 +34,14 @@ class TestAutoMultiline:
         assert r["total_count"] >= 1
         assert "multiline" in r.get("warning", "")
 
+    @requires_ripgrep
     def test_literal_newline_in_pattern_matches(self, proj):
         # A raw newline in the pattern (not the \n escape) also routes to
         # multiline mode. Keep the pattern free of regex metachars.
         r = json.loads(search_tool("return True\n\ndef teardown", path=str(proj), task_id="t-ml"))
         assert "error" not in r
         assert r["total_count"] >= 1
+        assert "multiline" in r.get("warning", "")
 
     def test_plain_pattern_unaffected(self, proj):
         r = json.loads(search_tool("init_db", path=str(proj), task_id="t-ml"))

@@ -64,8 +64,14 @@ class _BoundedOutputCollector:
     # Hard ceiling on spill file size. Beyond this the file stops growing
     # (marker appended); protects disk from pathological runaway output.
     _SPILL_CAP_CHARS = 5_000_000
+    _SPILL_PENDING_MAX_CHARS = 64 * 1024
 
-    def __init__(self, max_chars: int, spill_path: "Path | None" = None):
+    def __init__(
+        self,
+        max_chars: int,
+        spill_path: "Path | None" = None,
+        spill_transform: "Callable[[str], str] | None" = None,
+    ):
         self.max_chars = max(1, int(max_chars))
         self._head_limit = int(self.max_chars * 0.4)
         self._tail_limit = self.max_chars - self._head_limit
@@ -79,35 +85,122 @@ class _BoundedOutputCollector:
         self._spill_fh: IO[str] | None = None
         self._spill_chars = 0
         self._spill_capped = False
+        self._spill_transform = spill_transform
+        self._spill_pending = ""
+        self._spill_requested = False
 
-    def _maybe_spill(self, text: str) -> None:
-        """Tee ``text`` to the spill file (opened lazily on first overflow)."""
-        if self._spill_path is None or self._spill_capped:
+    def _transform_spill_fragment(self, text: str, *, final: bool = False) -> str:
+        """Return a redacted spill fragment without ever persisting raw text.
+
+        Hold the unfinished token at the end of each stream chunk so a secret
+        split across reads is transformed as one unit. PEM blocks are held as a
+        whole for the same reason. An unbounded no-whitespace run is omitted
+        rather than risking raw output on disk.
+        """
+        if self._spill_transform is None:
+            self._spill_capped = True
+            return ""
+        self._spill_pending += text
+        if final:
+            ready, self._spill_pending = self._spill_pending, ""
+        else:
+            pem_start = self._spill_pending.find("-----BEGIN ")
+            if pem_start >= 0:
+                pem_end = self._spill_pending.find("-----END ", pem_start)
+                if pem_end == -1:
+                    ready, self._spill_pending = (
+                        self._spill_pending[:pem_start],
+                        self._spill_pending[pem_start:],
+                    )
+                else:
+                    pem_line_end = self._spill_pending.find("\n", pem_end)
+                    if pem_line_end == -1:
+                        ready, self._spill_pending = (
+                            self._spill_pending[:pem_start],
+                            self._spill_pending[pem_start:],
+                        )
+                    else:
+                        ready, self._spill_pending = (
+                            self._spill_pending[:pem_line_end + 1],
+                            self._spill_pending[pem_line_end + 1:],
+                        )
+            else:
+                boundary = max(
+                    self._spill_pending.rfind("\n"),
+                    self._spill_pending.rfind(" "),
+                    self._spill_pending.rfind("\t"),
+                )
+                if boundary == -1:
+                    if len(self._spill_pending) <= self._SPILL_PENDING_MAX_CHARS:
+                        return ""
+                    self._spill_pending = ""
+                    self._spill_capped = True
+                    return "\n... [spill omitted an unbroken output run for safe storage] ...\n"
+                ready, self._spill_pending = (
+                    self._spill_pending[:boundary + 1],
+                    self._spill_pending[boundary + 1:],
+                )
+        if not ready:
+            return ""
+        try:
+            return self._spill_transform(ready)
+        except Exception:
+            logger.warning("terminal spill transform failed; omitting fragment", exc_info=True)
+            self._spill_capped = True
+            return "\n... [spill fragment omitted after transform failure] ...\n"
+
+    def _write_spill_fragment(self, text: str) -> None:
+        """Persist already-sanitized *text*, enforcing the exact file cap."""
+        if not text or self._spill_path is None:
+            return
+        # A safe fragment may itself mark the recovery partial (for example an
+        # unbroken token omitted from storage). Still write that first marker;
+        # after a file exists, a capped spill never grows again.
+        if self._spill_capped and self._spill_fh is not None:
             return
         try:
             if self._spill_fh is None:
                 self._spill_path.parent.mkdir(parents=True, exist_ok=True)
                 self._spill_fh = open(self._spill_path, "w", encoding="utf-8", errors="replace")
-                # Backfill everything retained so far so the file holds the
-                # stream from byte 0, not just from the overflow point.
-                backlog = "".join(self._head) + "".join(self._tail)
-                self._spill_fh.write(backlog)
-                self._spill_chars = len(backlog)
             budget = self._SPILL_CAP_CHARS - self._spill_chars
-            if budget <= 0 or len(text) > budget:
-                self._spill_fh.write(text[:max(0, budget)])
-                self._spill_fh.write("\n... [spill capped at 5,000,000 chars] ...\n")
+            if len(text) > budget:
+                marker = f"\n... [spill capped at {self._SPILL_CAP_CHARS:,} chars] ...\n"
+                payload_budget = max(0, budget - len(marker))
+                payload = text[:payload_budget]
+                suffix = marker[:max(0, budget - len(payload))]
+                self._spill_fh.write(payload)
+                self._spill_fh.write(suffix)
+                self._spill_chars += len(payload) + len(suffix)
                 self._spill_capped = True
             else:
                 self._spill_fh.write(text)
-            self._spill_chars += len(text)
+                self._spill_chars += len(text)
         except OSError:
             # Disk trouble must never break command execution.
             self._spill_capped = True
 
+    def _queue_spill(self, text: str, *, final: bool = False) -> None:
+        self._write_spill_fragment(self._transform_spill_fragment(text, final=final))
+
+    def _start_spill(self, backlog: str) -> None:
+        if self._spill_requested or self._spill_path is None:
+            return
+        self._spill_requested = True
+        self._queue_spill(backlog)
+
+    def _ensure_spill_for_render(self, available_chars: int) -> None:
+        if (
+            self._spill_path is not None
+            and not self._spill_requested
+            and self._total_chars > available_chars
+        ):
+            self._start_spill("".join(self._head) + "".join(self._tail))
+
     def close_spill(self) -> "str | None":
         """Close the spill file and return its path if it was used."""
         with self._lock:
+            if self._spill_requested:
+                self._queue_spill("", final=True)
             if self._spill_fh is None:
                 return None
             try:
@@ -116,6 +209,11 @@ class _BoundedOutputCollector:
                 pass
             self._spill_fh = None
             return str(self._spill_path)
+
+    @property
+    def spill_capped(self) -> bool:
+        with self._lock:
+            return self._spill_capped
 
     @property
     def buffered_chars(self) -> int:
@@ -135,10 +233,12 @@ class _BoundedOutputCollector:
             # Spill tee: activates at the first overflow (backfilling what's
             # retained so far), then mirrors every subsequent chunk.
             if self._spill_path is not None and (
-                self._spill_fh is not None
+                self._spill_requested
                 or self._total_chars + text_len > self.max_chars
             ):
-                self._maybe_spill(text)
+                if not self._spill_requested:
+                    self._start_spill("".join(self._head) + "".join(self._tail))
+                self._queue_spill(text)
             self._total_chars += text_len
             start = 0
 
@@ -180,6 +280,7 @@ class _BoundedOutputCollector:
             head = "".join(self._head)
             tail = "".join(self._tail)
             available = self.max_chars - len(suffix)
+            self._ensure_spill_for_render(available)
             if self._total_chars <= available:
                 return head + tail + suffix
 
@@ -512,7 +613,7 @@ def _export_dump_excluding_session_vars(
     return (
         "{ ( "
         "unset ${!HERMES_SESSION_*} ${!HERMES_CRON_AUTO_DELIVER_*} "
-        f"HERMES_UI_SESSION_ID{extra_unset} 2>/dev/null; "
+        f"HERMES_UI_SESSION_ID HERMES_CRON_SESSION{extra_unset} 2>/dev/null; "
         "export -p; "
         ") || true; } "
         f"> {tmp_path}"
@@ -562,12 +663,26 @@ class BaseEnvironment(ABC):
         self._snapshot_path = f"{temp_dir}/hermes-snap-{self._session_id}.sh"
         self._cwd_file = f"{temp_dir}/hermes-cwd-{self._session_id}.txt"
         self._cwd_marker = _cwd_marker(self._session_id)
+        self._execution_cwd_local = threading.local()
         self._snapshot_ready = False
         self._snapshot_passthrough_names: set[str] = set()
         # When True, login bash is unusable (e.g. broken Git-for-Windows
         # ``Directory \\drivers\\etc`` startup) so execute() must not fall
         # back to ``bash -l`` per command — use non-login ``bash -c`` instead.
         self._prefer_nonlogin = False
+
+    def _set_execution_cwd(self, cwd: str) -> None:
+        """Keep one command's resolved cwd private to its calling thread."""
+        execution_cwd_local = getattr(self, "_execution_cwd_local", None)
+        if execution_cwd_local is None:
+            # Lightweight/mock environments can bypass BaseEnvironment.__init__.
+            execution_cwd_local = threading.local()
+            self._execution_cwd_local = execution_cwd_local
+        execution_cwd_local.cwd = cwd
+
+    def get_last_execution_cwd(self) -> str | None:
+        """Return the calling thread's cwd from its most recent execution."""
+        return getattr(getattr(self, "_execution_cwd_local", None), "cwd", None)
 
     # ------------------------------------------------------------------
     # Abstract methods
@@ -616,6 +731,7 @@ class BaseEnvironment(ABC):
             if is_multiplex_active():
                 from tools.env_passthrough import get_all_passthrough
                 names = (
+                    "HERMES_HOME",
                     *get_all_passthrough(),
                     *self._additional_profile_scoped_passthrough_names(),
                 )
@@ -699,7 +815,7 @@ class BaseEnvironment(ABC):
             f"echo 'set +u' >> {_snap_tmp}\n"
             # Publish atomically only if assembly succeeded; otherwise drop the
             # partial temp rather than leave it to be sourced or orphaned.
-            f"mv -f {_snap_tmp} {_quoted_snap} || rm -f {_snap_tmp}\n"
+            f"command -p mv -f {_snap_tmp} {_quoted_snap} || command -p rm -f {_snap_tmp}\n"
             f"builtin cd -- {_quoted_cwd} 2>/dev/null || true\n"
             f"printf '\\n{self._cwd_marker}%s{self._cwd_marker}\\n' \"$(pwd -P)\"\n"
         )
@@ -789,9 +905,10 @@ class BaseEnvironment(ABC):
         attempts_var = f"__hermes_snapshot_attempts_{suffix}"
         template = self._quote_shell_path(self._snapshot_path + ".tmp.XXXXXX")
         snapshot_prefix = self._quote_shell_path(self._snapshot_path)
+        snapshot_dir = self._quote_shell_path(os.path.dirname(self._snapshot_path))
         allocation = (
             f"{tmp_var}=$(\n"
-            f"  mktemp {template} 2>/dev/null || (\n"
+            f"  {candidate_var}=$(command -p mktemp {template} 2>/dev/null || (\n"
             f"    {attempts_var}=0\n"
             f"    while [ \"${attempts_var}\" -lt 32 ]; do\n"
             f"      {candidate_var}={snapshot_prefix}.tmp.$RANDOM.$RANDOM\n"
@@ -801,7 +918,14 @@ class BaseEnvironment(ABC):
             f"      fi\n"
             f"      {attempts_var}=$(({attempts_var} + 1))\n"
             f"    done\n"
-            f"  )\n"
+            f"  ))\n"
+            f"  if [ -n \"${candidate_var}\" ] && "
+            f"[ \"$(command -p dirname \"${candidate_var}\")\" = {snapshot_dir} ] && "
+            f"[ -f \"${candidate_var}\" ] && [ ! -L \"${candidate_var}\" ]; then\n"
+            f"    printf '%s' \"${candidate_var}\"\n"
+            f"  else\n"
+            f"    command -p rm -f \"${candidate_var}\" 2>/dev/null || true\n"
+            f"  fi\n"
             f")\n"
         )
         # The fallback variables stay inside command substitution, so they
@@ -890,8 +1014,8 @@ class BaseEnvironment(ABC):
             parts.append(
                 f"if [ -n {_snap_tmp} ]; then "
                 f"{{ {_export_dump_excluding_session_vars(_snap_tmp, snapshot_excluded)} "
-                f"&& mv -f {_snap_tmp} {_quoted_snap}; }} "
-                f"2>/dev/null || rm -f {_snap_tmp} 2>/dev/null || true; fi"
+                f"&& command -p mv -f {_snap_tmp} {_quoted_snap}; }} "
+                f"2>/dev/null || command -p rm -f {_snap_tmp} 2>/dev/null || true; fi"
             )
 
         # Emit the CWD stdout marker; all backends (including local, since
@@ -922,7 +1046,12 @@ class BaseEnvironment(ABC):
     # ------------------------------------------------------------------
 
     def _wait_for_process(
-        self, proc: ProcessHandle, timeout: int = 120, *, bounded_capture: bool = False
+        self,
+        proc: ProcessHandle,
+        timeout: int = 120,
+        *,
+        bounded_capture: bool = False,
+        spill_transform: "Callable[[str], str] | None" = None,
     ) -> dict:
         """Poll-based wait with interrupt checking and stdout draining.
 
@@ -978,7 +1107,11 @@ class BaseEnvironment(ABC):
                             pass
             except Exception:
                 spill_path = None
-        output = _BoundedOutputCollector(capture_limit, spill_path=spill_path)
+        output = _BoundedOutputCollector(
+            capture_limit,
+            spill_path=spill_path,
+            spill_transform=spill_transform,
+        )
 
         # Non-blocking drain via select().
         #
@@ -1250,7 +1383,8 @@ class BaseEnvironment(ABC):
         spill = collector.close_spill()
         if spill:
             result["output_total_chars"] = collector.total_chars
-            result["full_output_path"] = spill
+            result["output_spill_capped"] = collector.spill_capped
+            result["full_output_path" if not collector.spill_capped else "partial_output_path"] = spill
         return result
 
     def _kill_process(self, proc: ProcessHandle):
@@ -1289,6 +1423,9 @@ class BaseEnvironment(ABC):
         cwd_path = output[first + len(marker) : last].strip()
         if cwd_path:
             self.cwd = cwd_path
+            # This execution belongs to the calling thread; terminal callers
+            # must not read the shared environment's mutable cwd afterward.
+            self._set_execution_cwd(cwd_path)
 
         # Strip the marker line AND the \n we injected before it.
         # The wrapper emits: printf '\n__MARKER__%s__MARKER__\n'
@@ -1301,6 +1438,28 @@ class BaseEnvironment(ABC):
         line_end = line_end + 1 if line_end != -1 else len(output)
 
         result["output"] = output[:line_start] + output[line_end:]
+        if "output_total_chars" in result:
+            result["output_total_chars"] = max(
+                0,
+                int(result["output_total_chars"]) - (line_end - line_start),
+            )
+
+    def _sanitize_terminal_spill(self, text: str, command: str) -> str:
+        """Sanitize terminal recovery output before it reaches disk."""
+        from agent.redact import redact_terminal_output
+        from tools.ansi_strip import strip_ansi
+
+        marker = re.escape(self._cwd_marker)
+        without_cwd_protocol = re.sub(
+            rf"\n?{marker}[^\n]*{marker}\n?",
+            "",
+            text,
+        )
+        return redact_terminal_output(
+            strip_ansi(without_cwd_protocol),
+            command,
+            force=True,
+        )
 
     # ------------------------------------------------------------------
     # Hooks
@@ -1341,6 +1500,7 @@ class BaseEnvironment(ABC):
         the patch engine, code-execution RPC reads, log reads — MUST leave
         it False: truncating those corrupts data, not just display.
         """
+        self._set_execution_cwd("")
         self._before_execute()
 
         exec_command, sudo_stdin = self._prepare_command(command)
@@ -1375,8 +1535,14 @@ class BaseEnvironment(ABC):
         proc = self._run_bash(
             wrapped, login=login, timeout=effective_timeout, stdin_data=effective_stdin
         )
+        spill_transform = None
+        if bounded_capture:
+            spill_transform = lambda text: self._sanitize_terminal_spill(text, command)
         result = self._wait_for_process(
-            proc, timeout=effective_timeout, bounded_capture=bounded_capture
+            proc,
+            timeout=effective_timeout,
+            bounded_capture=bounded_capture,
+            spill_transform=spill_transform,
         )
         self._update_cwd(result)
 

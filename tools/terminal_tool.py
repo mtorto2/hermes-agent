@@ -2988,6 +2988,17 @@ def terminal_tool(
                 # Got a result
                 break
 
+            if result is None:
+                raise RuntimeError("terminal environment returned no execution result")
+            # BaseEnvironment retains an immutable cwd for this calling thread. Keep a
+            # compatibility fallback for third-party/legacy environments that
+            # only mutate ``env.cwd``; those cannot offer the same race safety.
+            result_cwd = (
+                getattr(env, "get_last_execution_cwd", lambda: None)()
+                or result.get("cwd")
+                or getattr(env, "cwd", None)
+            )
+
             # Dual-write (cwd rearch step 1): the env's post-command tracking
             # (marker parse / local sync) has just updated env.cwd with the
             # directory this command finished in. That cwd belongs to THIS
@@ -3000,7 +3011,7 @@ def terminal_tool(
             # would hijack the session's durable cwd for every later command
             # that doesn't pass ``workdir``. Skip the dual-write in that case.
             if not workdir:
-                record_session_cwd(session_key, getattr(env, "cwd", None))
+                record_session_cwd(session_key, result_cwd)
 
             # Extract output
             output = result.get("output", "")
@@ -3008,7 +3019,8 @@ def terminal_tool(
             # Spill metadata from the bounded collector: present only when
             # output overflowed the capture window (see _wait_for_process).
             spill_total_chars = result.get("output_total_chars")
-            spill_file_path = result.get("full_output_path")
+            spill_file_path = result.get("full_output_path") or result.get("partial_output_path")
+            spill_is_partial = bool(result.get("output_spill_capped"))
 
             # Add helpful message for sudo failures in messaging context
             output = _handle_sudo_failure(output, env_type)
@@ -3107,26 +3119,24 @@ def terminal_tool(
             # state; echoing it on change removes the guesswork (pattern
             # borrowed from crush's <cwd> injection).
             try:
-                post_cwd = getattr(env, "cwd", None)
+                post_cwd = result_cwd
                 if post_cwd and command_cwd and os.path.realpath(str(post_cwd)) != os.path.realpath(str(command_cwd)):
                     result_dict["cwd"] = str(post_cwd)
             except Exception:
                 pass
-            # Truncation metadata (codex/opencode/goose pattern): report the
-            # pre-truncation size and a spill-file handle so the model can
-            # retrieve the omitted middle with read_file/search_files instead
-            # of re-running the command. The spill was written raw by the
-            # collector; redact it here with the same pass as the visible
-            # output so no secret persists unmasked on disk.
+            # Truncation metadata: BaseEnvironment stores only already-sanitized
+            # spill text. A capped artifact is explicitly partial so callers
+            # never mistake a recovery excerpt for the full command output.
             if spill_file_path:
-                try:
-                    _sp = Path(spill_file_path)
-                    raw_spill = _sp.read_text(encoding="utf-8", errors="replace")
-                    _sp.write_text(
-                        redact_terminal_output(strip_ansi(raw_spill), command),
-                        encoding="utf-8", errors="replace",
+                result_dict["output_total_chars"] = spill_total_chars
+                if spill_is_partial:
+                    result_dict["partial_output_path"] = spill_file_path
+                    result_dict["truncation_note"] = (
+                        "Output exceeded the capture window (head+tail shown). "
+                        f"A sanitized recovery excerpt is capped and saved to "
+                        f"{spill_file_path}; it is not the full output."
                     )
-                    result_dict["output_total_chars"] = spill_total_chars
+                else:
                     result_dict["full_output_path"] = spill_file_path
                     result_dict["truncation_note"] = (
                         "Output exceeded the capture window (head+tail shown). "
@@ -3134,12 +3144,6 @@ def terminal_tool(
                         f"{spill_file_path} — search it with search_files or page it "
                         "with read_file instead of re-running the command."
                     )
-                except Exception:
-                    logger.debug("spill redaction failed; dropping spill handle", exc_info=True)
-                    try:
-                        Path(spill_file_path).unlink()
-                    except OSError:
-                        pass
             try:
                 from agent.verification_evidence import record_terminal_result
 

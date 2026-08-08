@@ -93,6 +93,28 @@ class TestPostCommandDualWrite:
         assert result["exit_code"] == 0
         assert tt.get_session_cwd("sess-a") is None
 
+    def test_result_owned_cwd_wins_over_shared_environment_race(self, monkeypatch):
+        """A concurrent session must not overwrite this call's recorded cwd."""
+
+        class FakeEnv:
+            env = {}
+            cwd = "/start"
+
+            def execute(self, command, **kwargs):
+                # Simulate a different session updating the shared environment
+                # immediately after this command's marker was parsed.
+                self.cwd = "/session-b/worktree"
+                return {"output": "", "returncode": 0}
+
+            def get_last_execution_cwd(self):
+                return "/session-a/worktree"
+
+        result = self._run(monkeypatch, "sess-a", FakeEnv())
+
+        assert result["exit_code"] == 0
+        assert tt.get_session_cwd("sess-a") == "/session-a/worktree"
+        assert result["cwd"] == "/session-a/worktree"
+
 
 class TestFileToolsReadTheRecord:
     """Step 2: file-tool path resolution prefers the session's own record."""
