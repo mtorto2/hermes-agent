@@ -492,9 +492,11 @@ def _export_dump_excluding_session_vars(
     lines. ``|| true`` keeps the success contract for callers that chain on it.
 
     The dump MUST be wrapped in a brace group with the redirection applied to
-    the group. This keeps the complete unset-and-dump sequence directed into
-    the already-allocated temporary file rather than exposing a pipeline
-    segment to partial output.
+    the group. *tmp_path* is typically a shell-variable expansion (a
+    mktemp-allocated per-writer temp name); a redirect on a pipeline segment
+    can expand it in a subshell rather than the shell that later expands
+    ``mv``. The brace-group redirect keeps the complete unset-and-dump sequence
+    directed to the allocated file and both expansions consistent.
     """
     # ${!PREFIX*} is bash 3.2+ name-prefix expansion; empty matches are fine
     # because ``unset`` with only missing names is ignored under 2>/dev/null.

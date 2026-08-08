@@ -42,7 +42,7 @@ def test_regex_matches_bridged_session_vars():
 
 
 def test_export_snippet_shape():
-    tmp_ref = '"$__hermes_snapshot_tmp"'
+    tmp_ref = '"${__hermes_snapshot_tmp_test}"'
     snippet = _export_dump_excluding_session_vars(tmp_ref)
     assert "export -p" in snippet
     # Unset-by-name (not line-grep): multi-line declare values must not leave

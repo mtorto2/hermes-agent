@@ -496,8 +496,10 @@ class TestGatewaySystemServiceRouting:
         monkeypatch.setattr(gateway_cli, "_select_systemd_scope", lambda system=False: False)
         monkeypatch.setattr(gateway_cli, "_preflight_user_systemd", lambda: None)
         monkeypatch.setattr(gateway_cli, "_require_service_installed", lambda action, system=False: None)
+        monkeypatch.setattr(gateway_cli, "_preflight_user_systemd", lambda **kwargs: None)
         monkeypatch.setattr(gateway_cli, "refresh_systemd_unit_if_needed", lambda system=False: calls.append(("refresh", system)))
-        monkeypatch.setattr(gateway_cli, "_get_restart_drain_timeout", lambda: 12.0)
+        # Wait budget covers after-turn deferral + drain + headroom (#77184).
+        monkeypatch.setattr(gateway_cli, "_get_restart_exit_wait_budget", lambda: 27.0)
         monkeypatch.setattr(
             "gateway.status.get_running_pid",
             lambda: 654,
@@ -529,12 +531,14 @@ class TestGatewaySystemServiceRouting:
 
         gateway_cli.systemd_restart()
 
-        assert ("graceful", 654, 17.0) in calls
+        assert ("graceful", 654, 27.0) in calls
         assert any(call[0] == "reset-failed" for call in calls)
         assert any(call[0] == "restart" for call in calls)
         assert ("wait", False, 654) in calls
         out = capsys.readouterr().out.lower()
         assert "restarting gracefully" in out
+        assert "21627" not in out  # must use the mocked budget, not live defaults
+        assert "27" in out
 
     def test_systemd_restart_uses_systemd_main_pid_when_pid_file_is_missing(self, monkeypatch, capsys):
         calls = []
@@ -543,7 +547,7 @@ class TestGatewaySystemServiceRouting:
         monkeypatch.setattr(gateway_cli, "_preflight_user_systemd", lambda: None)
         monkeypatch.setattr(gateway_cli, "_require_service_installed", lambda action, system=False: None)
         monkeypatch.setattr(gateway_cli, "refresh_systemd_unit_if_needed", lambda system=False: None)
-        monkeypatch.setattr(gateway_cli, "_get_restart_drain_timeout", lambda: 10.0)
+        monkeypatch.setattr(gateway_cli, "_get_restart_exit_wait_budget", lambda: 10.0)
         monkeypatch.setattr("gateway.status.get_running_pid", lambda: None)
         monkeypatch.setattr(
             gateway_cli,
@@ -570,7 +574,7 @@ class TestGatewaySystemServiceRouting:
 
         gateway_cli.systemd_restart()
 
-        assert ("graceful", 777, 15.0) in calls
+        assert ("graceful", 777, 10.0) in calls
         assert ("wait", False, 777) in calls
         assert "restarting gracefully (pid 777)" in capsys.readouterr().out.lower()
 
