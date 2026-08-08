@@ -48,8 +48,6 @@ describe('input compactor helpers', () => {
     expect(isInputCompactionKey('t', { meta: true } as any, 't')).toEqual({ wholeBuffer: true })
   })
 
-
-
   it('only enables compaction for explicitly enabled unmasked inputs', () => {
     expect(canRunInputCompactor(false)).toBe(false)
     expect(canRunInputCompactor(true)).toBe(true)
@@ -69,7 +67,6 @@ describe('input compactor helpers', () => {
     })
   })
 })
-
 
 class FakeStream extends EventEmitter {
   chunks: string[] = []

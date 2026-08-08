@@ -451,7 +451,11 @@ describe('OAuth onboarding', () => {
         return { ok: true, status: 'approved' }
       }
 
-      if (path === '/api/model/options' || path.startsWith('/api/model/recommended-default') || path === '/api/model/set') {
+      if (
+        path === '/api/model/options' ||
+        path.startsWith('/api/model/recommended-default') ||
+        path === '/api/model/set'
+      ) {
         throw new Error(`should not fetch or write model defaults while preserving: ${path}`)
       }
 
@@ -493,10 +497,13 @@ describe('OAuth onboarding', () => {
     vi.useFakeTimers()
 
     let resolvePoll!: (value: { status: 'approved' }) => void
+
     const pollPromise = new Promise<{ status: 'approved' }>(resolve => {
       resolvePoll = resolve
     })
+
     const calls: string[] = []
+
     const deviceProvider: OAuthProvider = {
       ...provider('nous', 'Nous Portal'),
       flow: 'device_code'
@@ -524,7 +531,11 @@ describe('OAuth onboarding', () => {
         return { ok: true }
       }
 
-      if (path === '/api/model/options' || path.startsWith('/api/model/recommended-default') || path === '/api/model/set') {
+      if (
+        path === '/api/model/options' ||
+        path.startsWith('/api/model/recommended-default') ||
+        path === '/api/model/set'
+      ) {
         throw new Error(`stale poll should not continue onboarding: ${path}`)
       }
 
@@ -567,10 +578,13 @@ describe('OAuth onboarding', () => {
     vi.useFakeTimers()
 
     let rejectPoll!: (reason: Error) => void
+
     const pollPromise = new Promise<never>((_, reject) => {
       rejectPoll = reject
     })
+
     const calls: string[] = []
+
     const deviceProvider: OAuthProvider = {
       ...provider('nous', 'Nous Portal'),
       flow: 'device_code'

@@ -28,7 +28,12 @@ class MemoryStorage implements Storage {
 
 function ensureStorage(name: 'localStorage' | 'sessionStorage'): void {
   const current = window[name]
-  if (typeof current?.getItem === 'function' && typeof current?.setItem === 'function' && typeof current?.clear === 'function') {
+
+  if (
+    typeof current?.getItem === 'function' &&
+    typeof current?.setItem === 'function' &&
+    typeof current?.clear === 'function'
+  ) {
     return
   }
 

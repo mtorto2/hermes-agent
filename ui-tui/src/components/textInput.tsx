@@ -218,7 +218,6 @@ export const isInputCompactionKey = (input: string, key: Key, eventRaw: string):
 
 export const canRunInputCompactor = (enabled: boolean, mask?: string): boolean => enabled && !mask
 
-
 interface InputCompactorProcessOptions {
   compactorPath: string
   killGraceMs?: number
@@ -1689,77 +1688,81 @@ export function TextInput({
   return (
     <Box flexDirection="column" width={columns}>
       <Box
-      onClick={(e: MouseEventLite) => {
-        if (!focus) {
-          return
-        }
+        onClick={(e: MouseEventLite) => {
+          if (!focus) {
+            return
+          }
 
-        e.stopImmediatePropagation?.()
-        clearSel()
-        const next = offsetAt(e)
-        setCur(next)
-        curRef.current = next
-      }}
-      onMouseDown={(e: MouseEventLite) => {
-        if (!focus) {
-          return
-        }
-
-        // Right-click → copy active selection if any, otherwise paste.
-        if (e.button === 2) {
           e.stopImmediatePropagation?.()
-          const decision = decideRightClickAction(vRef.current, selRange())
+          clearSel()
+          const next = offsetAt(e)
+          setCur(next)
+          curRef.current = next
+        }}
+        onMouseDown={(e: MouseEventLite) => {
+          if (!focus) {
+            return
+          }
 
-          if (decision.action === 'copy') {
-            void writeClipboardText(decision.text)
+          // Right-click → copy active selection if any, otherwise paste.
+          if (e.button === 2) {
+            e.stopImmediatePropagation?.()
+            const decision = decideRightClickAction(vRef.current, selRange())
+
+            if (decision.action === 'copy') {
+              void writeClipboardText(decision.text)
+
+              return
+            }
+
+            emitPaste({ cursor: curRef.current, hotkey: true, text: '', value: vRef.current })
 
             return
           }
 
-          emitPaste({ cursor: curRef.current, hotkey: true, text: '', value: vRef.current })
+          if (e.button !== 0) {
+            return
+          }
 
-          return
-        }
+          e.stopImmediatePropagation?.()
+          const offset = offsetAt(e)
 
-        if (e.button !== 0) {
-          return
-        }
+          if (isMultiClickAt(offset)) {
+            mouseAnchorRef.current = null
+            selectAll()
 
-        e.stopImmediatePropagation?.()
-        const offset = offsetAt(e)
+            return
+          }
 
-        if (isMultiClickAt(offset)) {
-          mouseAnchorRef.current = null
-          selectAll()
+          startMouseSelection(offset)
+        }}
+        onMouseDrag={(e: MouseEventLite) => {
+          if (!focus || e.button !== 0 || mouseAnchorRef.current === null) {
+            return
+          }
 
-          return
-        }
-
-        startMouseSelection(offset)
-      }}
-      onMouseDrag={(e: MouseEventLite) => {
-        if (!focus || e.button !== 0 || mouseAnchorRef.current === null) {
-          return
-        }
-
-        e.stopImmediatePropagation?.()
-        dragMouseSelection(offsetAt(e))
-      }}
-      onMouseUp={(e: MouseEventLite) => {
-        e.stopImmediatePropagation?.()
-        endMouseSelection()
-      }}
-      ref={boxRef}
-      width={columns}
-    >
-      {/* Explicit theme color on the typed text — default fg tracks the HOST
+          e.stopImmediatePropagation?.()
+          dragMouseSelection(offsetAt(e))
+        }}
+        onMouseUp={(e: MouseEventLite) => {
+          e.stopImmediatePropagation?.()
+          endMouseSelection()
+        }}
+        ref={boxRef}
+        width={columns}
+      >
+        {/* Explicit theme color on the typed text — default fg tracks the HOST
           terminal's polarity, not the skin's, so a live dark-skin repaint on a
           light terminal would otherwise leave the input black-on-black. */}
-      <Text color={color} wrap="wrap">
-        {rendered}
-      </Text>
+        <Text color={color} wrap="wrap">
+          {rendered}
+        </Text>
       </Box>
-      {enableInputCompactor && inputCompactionStatus && <Text color="gray" wrap="truncate-end">{inputCompactionStatus}</Text>}
+      {enableInputCompactor && inputCompactionStatus && (
+        <Text color="gray" wrap="truncate-end">
+          {inputCompactionStatus}
+        </Text>
+      )}
     </Box>
   )
 }

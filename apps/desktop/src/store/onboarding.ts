@@ -25,8 +25,20 @@ export type OnboardingMode = 'apikey' | 'oauth'
 export type OnboardingFlow =
   | { status: 'idle' }
   | { provider: OAuthProvider; status: 'starting' }
-  | { code: string; preserveExistingDefault?: boolean; provider: OAuthProvider; start: PkceStart; status: 'awaiting_user' }
-  | { copied: boolean; preserveExistingDefault?: boolean; provider: OAuthProvider; start: DeviceStart; status: 'polling' }
+  | {
+      code: string
+      preserveExistingDefault?: boolean
+      provider: OAuthProvider
+      start: PkceStart
+      status: 'awaiting_user'
+    }
+  | {
+      copied: boolean
+      preserveExistingDefault?: boolean
+      provider: OAuthProvider
+      start: DeviceStart
+      status: 'polling'
+    }
   | { preserveExistingDefault?: boolean; provider: OAuthProvider; start: OAuthStartResponse; status: 'submitting' }
   | { copied: boolean; preserveExistingDefault?: boolean; provider: OAuthProvider; status: 'external_pending' }
   | { provider: OAuthProvider; status: 'success' }
