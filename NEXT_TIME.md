@@ -43,7 +43,7 @@ Prepared by: Hermes
   - August 6 preservation worktree with active process CWDs;
   - August 2 preservation worktree with uncommitted changes;
   - queued-paste review worktree with uncommitted changes.
-- Git's missing `/private/tmp/hermes-baseline-f4a8eb960` registration may be pruned as metadata cleanup only.
+- Git's missing `/private/tmp/hermes-baseline-f4a8eb960` registration was pruned as metadata cleanup only. A full non-Git source snapshot still exists at that path; it is retained and must not be deleted or altered without a separate source-classification review.
 
 ## Next safe work
 
