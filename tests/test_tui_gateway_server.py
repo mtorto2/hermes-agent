@@ -65,6 +65,153 @@ def test_tui_notification_poller_retries_unregistered_agent_lights_slot(monkeypa
     assert len(retry_calls) == 1
 
 
+class _DeferredSlotService:
+    """Light cue service stub that starts without an Agent Lights backend.
+
+    ``retry_slot_registration`` succeeds (a slot freed up) only once
+    ``free_slot`` is set, mirroring another session releasing its slot.
+    """
+
+    def __init__(self):
+        self.slot_status_backend = None
+        self.retry_calls = 0
+        self.free_slot = threading.Event()
+        self.registered = threading.Event()
+
+    def mark_slot_online(self):
+        return self.slot_status_backend is not None
+
+    def retry_slot_registration(self):
+        self.retry_calls += 1
+        if self.slot_status_backend is not None:
+            return False
+        if not self.free_slot.is_set():
+            return False
+        self.slot_status_backend = object()
+        self.registered.set()
+        return True
+
+
+def test_tui_light_slot_retry_supervisor_claims_freed_slot_without_poller(monkeypatch):
+    # The supervisor must recover the slot with NO notification poller running:
+    # this test never starts _notification_poller_loop.
+    monkeypatch.setattr(server, "_TUI_LIGHT_SLOT_RETRY_INTERVAL_S", 0.01)
+
+    service = _DeferredSlotService()
+    session = {"_light_cue_service": service}
+
+    server._start_tui_light_slot_retry(session)
+    thread = session["_light_slot_retry_thread"]
+
+    service.free_slot.set()
+    assert service.registered.wait(timeout=5.0)
+
+    # Once registered the supervisor must stand down, not keep polling.
+    thread.join(timeout=5.0)
+    assert not thread.is_alive()
+    calls_after_success = service.retry_calls
+    time.sleep(0.05)
+    assert service.retry_calls == calls_after_success
+
+
+def test_tui_light_slot_retry_supervisor_is_idempotent_per_session(monkeypatch):
+    monkeypatch.setattr(server, "_TUI_LIGHT_SLOT_RETRY_INTERVAL_S", 30.0)
+
+    service = _DeferredSlotService()
+    session = {"_light_cue_service": service}
+
+    server._start_tui_light_slot_retry(session)
+    first = session["_light_slot_retry_thread"]
+    server._start_tui_light_slot_retry(session)
+    assert session["_light_slot_retry_thread"] is first
+
+    session["_light_slot_retry_stop"].set()
+    first.join(timeout=5.0)
+    assert not first.is_alive()
+
+
+def test_tui_light_slot_retry_supervisor_stops_on_finalize_and_stays_stopped(monkeypatch):
+    monkeypatch.setattr(server, "_TUI_LIGHT_SLOT_RETRY_INTERVAL_S", 0.01)
+
+    service = _DeferredSlotService()  # slot never freed: retries keep failing
+    session = {"_light_cue_service": service}
+
+    server._start_tui_light_slot_retry(session)
+    thread = session["_light_slot_retry_thread"]
+
+    deadline = time.monotonic() + 5.0
+    while service.retry_calls == 0 and time.monotonic() < deadline:
+        time.sleep(0.005)
+    assert service.retry_calls > 0
+
+    server._finalize_session(session)
+    thread.join(timeout=5.0)
+    assert not thread.is_alive()
+
+    calls_after_stop = service.retry_calls
+    time.sleep(0.05)
+    assert service.retry_calls == calls_after_stop
+
+    # A finalized session must not resurrect the supervisor.
+    server._start_tui_light_slot_retry(session)
+    assert session["_light_slot_retry_thread"] is thread
+    assert not thread.is_alive()
+
+
+def test_tui_light_slot_retry_start_cannot_race_session_finalization(monkeypatch):
+    # Finalization marks the session finalized before waiting on this same lock.
+    # A concurrent startup caller must then observe that state and create no
+    # supervisor after finalization's stop/join pass.
+    gate = threading.Lock()
+    monkeypatch.setattr(server, "_tui_light_slot_retry_start_lock", gate)
+    session = {"_light_cue_service": _DeferredSlotService()}
+
+    gate.acquire()
+    try:
+        finalizer = threading.Thread(target=server._finalize_session, args=(session,))
+        finalizer.start()
+        deadline = time.monotonic() + 5.0
+        while not session.get("_finalized") and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert session.get("_finalized") is True
+
+        starter = threading.Thread(target=server._start_tui_light_slot_retry, args=(session,))
+        starter.start()
+    finally:
+        gate.release()
+
+    finalizer.join(timeout=5.0)
+    starter.join(timeout=5.0)
+    assert not finalizer.is_alive()
+    assert not starter.is_alive()
+    assert "_light_slot_retry_thread" not in session
+
+
+def test_startup_slot_publish_supervises_retry_only_when_unregistered(monkeypatch):
+    monkeypatch.setattr(server, "_TUI_LIGHT_SLOT_RETRY_INTERVAL_S", 30.0)
+
+    def _fake_get_service(session):
+        return session.get("_light_cue_service")
+
+    monkeypatch.setattr(server, "_get_tui_light_cue_service", _fake_get_service)
+
+    # Capacity full at startup -> supervision starts.
+    blocked = _DeferredSlotService()
+    session = {"_light_cue_service": blocked}
+    server._publish_tui_slot_online(session)
+    thread = session.get("_light_slot_retry_thread")
+    assert thread is not None and thread.is_alive()
+    session["_light_slot_retry_stop"].set()
+    thread.join(timeout=5.0)
+
+    # Slot already registered at startup -> no supervisor thread.
+    registered = _DeferredSlotService()
+    registered.slot_status_backend = object()
+    ok_session = {"_light_cue_service": registered}
+    server._publish_tui_slot_online(ok_session)
+    assert "_light_slot_retry_thread" not in ok_session
+
+
 @pytest.fixture(autouse=True)
 def _neuter_agent_prewarm_timer(request, monkeypatch):
     """Stub the deferred agent pre-warm timer for every test in this module.

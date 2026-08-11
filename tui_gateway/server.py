@@ -693,6 +693,18 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
             notif_thread.join(timeout=1.0)
         except Exception:
             pass
+    # Serialize against startup so a retry worker cannot be attached after
+    # this finalized session has already performed its stop/join pass.
+    with _tui_light_slot_retry_start_lock:
+        slot_retry_stop = session.get("_light_slot_retry_stop")
+        if slot_retry_stop is not None:
+            slot_retry_stop.set()
+        slot_retry_thread = session.get("_light_slot_retry_thread")
+        if slot_retry_thread is not None and slot_retry_thread is not threading.current_thread():
+            try:
+                slot_retry_thread.join(timeout=1.0)
+            except Exception:
+                pass
 
     agent = session.get("agent")
     lock = session.get("history_lock")
@@ -1921,6 +1933,68 @@ def _retry_tui_light_slot_registration(session: dict | None) -> bool:
         return False
 
 
+_tui_light_slot_retry_start_lock = threading.Lock()
+
+
+def _tui_light_slot_retry_loop(stop_event: threading.Event, session: dict) -> None:
+    """Claim a freed Agent Lights slot for a session that started without one.
+
+    Dedicated supervision thread: the notification poller also retries, but
+    its liveness is tied to process-notification plumbing, and a session whose
+    poller never started (or exited) must still recover a slot. Stands down
+    once the service holds a backend, and checks ``_finalized`` before every
+    retry so a finalizing session can't be written to after shutdown.
+    """
+    while not stop_event.wait(_TUI_LIGHT_SLOT_RETRY_INTERVAL_S):
+        if session.get("_finalized"):
+            return
+        if _retry_tui_light_slot_registration(session):
+            return
+        service = session.get("_light_cue_service")
+        if service is not None and getattr(service, "slot_status_backend", None) is not None:
+            return
+
+
+def _start_tui_light_slot_retry(session: dict | None) -> None:
+    """Start slot-retry supervision for a session. Idempotent per session."""
+    if not session:
+        return
+    with _tui_light_slot_retry_start_lock:
+        if session.get("_finalized"):
+            return
+        existing = session.get("_light_slot_retry_thread")
+        if existing is not None and existing.is_alive():
+            return
+        stop = threading.Event()
+        thread = threading.Thread(
+            target=_tui_light_slot_retry_loop,
+            args=(stop, session),
+            daemon=True,
+        )
+        session["_light_slot_retry_stop"] = stop
+        session["_light_slot_retry_thread"] = thread
+        thread.start()
+
+
+def _publish_tui_slot_online(session: dict | None) -> None:
+    """Publish a session's Agent Lights slot at startup, best-effort.
+
+    When the mark fails because no backend could be registered (capacity was
+    full), leave a supervisor behind so the session adopts a normal slot once
+    one frees up.
+    """
+    if not session:
+        return
+    try:
+        service = _get_tui_light_cue_service(session)
+        if service is None:
+            return
+        if not service.mark_slot_online() and getattr(service, "slot_status_backend", None) is None:
+            _start_tui_light_slot_retry(session)
+    except Exception:
+        logger.debug("TUI startup slot idle mark failed", exc_info=True)
+
+
 def _emit_tui_light_cue(sid: str, event: Any) -> bool:
     """Best-effort TUI prompt lifecycle light cue emission."""
     try:
@@ -2368,12 +2442,7 @@ def _start_agent_build(sid: str, session: dict) -> None:
 
             _wire_callbacks(sid)
 
-            try:
-                service = _get_tui_light_cue_service(current)
-                if service is not None:
-                    service.mark_slot_online()
-            except Exception:
-                logger.debug("TUI startup slot idle mark failed", exc_info=True)
+            _publish_tui_slot_online(current)
 
 
             # Surface the self-improvement review's "💾 …" summary as an event
@@ -6825,12 +6894,7 @@ def _init_session(
         # session startup resilient).
         pass
     _wire_callbacks(sid)
-    try:
-        service = _get_tui_light_cue_service(_sessions[sid])
-        if service is not None:
-            service.mark_slot_online()
-    except Exception:
-        logger.debug("TUI startup slot idle mark failed", exc_info=True)
+    _publish_tui_slot_online(_sessions.get(sid))
     with _sessions_lock:
         if sid in _sessions:
             _sessions[sid]["_notif_stop"] = _start_notification_poller(sid, _sessions[sid])
@@ -8015,12 +8079,7 @@ def _(rid, params: dict) -> dict:
     # Publish the slot immediately for menu-bar surfaces. This is intentionally
     # independent of AIAgent construction so a new `HERMES_SLOT=N hermes --tui`
     # shows as idle/gray as soon as the TUI session comes online.
-    try:
-        service = _get_tui_light_cue_service(_sessions[sid])
-        if service is not None:
-            service.mark_slot_online()
-    except Exception:
-        logger.debug("TUI session-create slot idle mark failed", exc_info=True)
+    _publish_tui_slot_online(_sessions.get(sid))
 
     # Return the lightweight session immediately so Ink can paint the composer
     # + skeleton panel, then build the real AIAgent just after this response is
