@@ -15,7 +15,7 @@ Prepared by: Hermes
   - The pre-promotion live diff is retained at `~/.hermes/backups/agent-lights-live-prepromotion-20260814-081925/`.
 - Fresh isolated verification passed: `52` Agent Lights Python tests; `30` native menu-bar tests; native menu-bar build; and `git diff --check`. Two independent reviews found and corrected documentation-only contract mismatches.
 - Matt confirmed there were no open TUI tabs before promotion. Do not create or terminate TUI sessions solely to validate this change.
-- Runtime status: the existing Agent Lights app and the three profile gateways predate this source promotion. Rebuild/relaunch the native app, then have Matt run the external-Terminal ordered gateway restart (business → default → personal); use a fresh post-restart screenshot and Telegram/profile smoke before declaring the behavior active.
+- Runtime status: the native Agent Lights app was rebuilt, ad-hoc-signature verified, and relaunched from the promoted checkout. The three profile gateways predate this source promotion; have Matt run the external-Terminal ordered gateway restart (business → default → personal), then use a fresh post-restart screenshot and Telegram/profile smoke before declaring the behavior active.
 - Separate unresolved issue: valid PID-matching normal slot artifacts have sometimes disappeared after registration. Do not claim the six-slot change resolves that distinct pruning/cleanup symptom.
 
 ### Resume order after Matt returns
