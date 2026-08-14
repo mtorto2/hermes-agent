@@ -241,6 +241,38 @@ final class SlotStatusTests: XCTestCase {
         ])
     }
 
+    func testStatusIndicatorLayoutSupportsSixNormalHermesSlotsAndExcludesOutOfRangeSlots() throws {
+        let statuses = try (1...7).map { slot in
+            try SlotStatus.decode(
+                from: "{\"slot\":\(slot),\"state\":\"working\",\"source\":\"hermes\"}".data(using: .utf8)!
+            )
+        }
+
+        let layout = StatusIndicatorLayout(
+            hermesStatuses: statuses,
+            agentGroup: AgentRingGroup(statuses: [])
+        )
+
+        XCTAssertEqual(layout.normalSlotIndicators.map(\.slot), [1, 2, 3, 4, 5, 6])
+        XCTAssertEqual(layout.filledDotCount, 6)
+    }
+
+    func testFloatingMonitorLayoutSupportsSixNormalHermesSlots() throws {
+        let statuses = try (1...6).map { slot in
+            try SlotStatus.decode(
+                from: "{\"slot\":\(slot),\"state\":\"working\",\"source\":\"hermes\"}".data(using: .utf8)!
+            )
+        }
+
+        let layout = FloatingMonitorLayout(
+            size: FloatingMonitorSize(width: 500, height: 230),
+            hermesStatuses: statuses,
+            agentGroup: AgentRingGroup(statuses: [])
+        )
+
+        XCTAssertEqual(layout.items.filter { !$0.isAgent }.count, 6)
+    }
+
     func testStatusIndicatorGeometryKeepsRingsSeparatedAndDotsLegible() throws {
         let geometry = StatusIndicatorGeometry()
 
@@ -479,11 +511,35 @@ final class SlotStatusTests: XCTestCase {
           "updated_at": "2026-05-25T12:00:00+00:00"
         }
         """.data(using: .utf8)!
-
         let status = try SlotStatus.decode(from: payload)
         let now = Date(timeIntervalSince1970: 1_000)
 
         XCTAssertTrue(status.shouldRender(now: now, fileModifiedAt: now.addingTimeInterval(-30)))
         XCTAssertFalse(status.shouldRender(now: now, fileModifiedAt: now.addingTimeInterval(-300)))
+    }
+
+    func testStatusIndicatorLayoutRendersOnlyLiveNormalSlotsAndUsesOutlineForIdle() throws {
+        let working = try SlotStatus.decode(from: """
+        {"slot":2,"state":"working","source":"hermes","model_name":"openai/gpt-5.5"}
+        """.data(using: .utf8)!)
+        let idle = try SlotStatus.decode(from: """
+        {"slot":6,"state":"idle","source":"hermes","model_name":"anthropic/claude-opus-4.8"}
+        """.data(using: .utf8)!)
+
+        let layout = StatusIndicatorLayout(
+            hermesStatuses: [working, idle],
+            agentGroup: AgentRingGroup(statuses: [])
+        )
+
+        XCTAssertEqual(layout.normalSlotIndicators.map(\.slot), [2, 6])
+        XCTAssertEqual(layout.normalSlotIndicators.map(\.style), [.filled, .outline])
+        XCTAssertEqual(layout.normalSlotIndicators.map(\.state), [.working, .idle])
+        XCTAssertEqual(layout.filledDotCount, 1)
+    }
+
+    func testAgentLightsSharedDirectoryIgnoresProfileScopedHermesHome() {
+        let directory = AgentLightsPath.sharedDirectory(userHomeDirectory: "/Users/matt")
+
+        XCTAssertEqual(directory.path, "/Users/matt/.hermes/agent-lights")
     }
 }

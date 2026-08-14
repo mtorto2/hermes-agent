@@ -11,6 +11,8 @@ The app reads normal Hermes slot files from:
 ~/.hermes/agent-lights/slots/2.json
 ~/.hermes/agent-lights/slots/3.json
 ~/.hermes/agent-lights/slots/4.json
+~/.hermes/agent-lights/slots/5.json
+~/.hermes/agent-lights/slots/6.json
 ```
 
 Kanban worker agents use a separate capacity pool under:
@@ -26,29 +28,41 @@ Kanban worker agents use a separate capacity pool under:
 ~/.hermes/agent-lights/agents/8.json
 ```
 
-Each file is written by Hermes when a terminal/TUI instance or Kanban worker starts. Hermes will auto-assign the first available slot within the appropriate pool, capped at 4 active normal instances and 8 active Kanban workers, using per-slot lock files to avoid concurrent startup collisions. Setting `HERMES_SLOT=1..4` still forces a specific normal-Hermes slot; Kanban workers auto-assign within their 1..8 pool. Missing or invalid values such as `HERMES_SLOT=9` fall back to auto-assignment when capacity is available.
+Agent Lights is a shared, cross-profile surface rooted at the primary user home:
+the companion reads `~/.hermes/agent-lights` even when a producer runs under a
+profile-specific `HERMES_HOME`. Hermes auto-assigns the first available slot
+within the appropriate pool, capped at 6 active normal instances and 8 active
+Kanban workers, using per-slot lock files to avoid concurrent startup
+collisions. Setting `HERMES_SLOT=1..6` forces a specific normal-Hermes slot;
+Kanban workers auto-assign within their 1..8 pool. Missing or invalid values
+such as `HERMES_SLOT=9` fall back to auto-assignment when capacity is available.
 
 ## Dot mapping
 
-Dots represent active running Hermes instances only. Missing, stale, or dead-PID slots are hidden instead of rendered as gray unused lanes.
-
-Left-to-right dots follow active slot order: slot 1, then slot 2, then slot 3, then slot 4. If only slot 1 is active, only one dot is shown; if slots 1 and 3 are active, two dots are shown.
+The menu-bar item renders valid, renderable normal Hermes session status files
+in stable slot order 1 through 6. Each live idle session is a dim gray
+**outline**—a clear “agent is open, but not working” cue—while a live active
+session is a filled lifecycle-colored dot. Missing, stale, and post-grace
+dead-PID slots are not capacity placeholders and do not add an extra circle;
+recent dead/no-PID files remain visible for their 120-second freshness grace.
 
 | State | Dot |
 | --- | --- |
-| working | green |
-| human_intervention | yellow |
-| final_answer | red steady |
-| error | red steady for MVP; flashing/pulse is next polish |
-| idle | gray, but only when the slot's producing process is alive |
+| no slot / stale / post-grace dead PID | hidden |
+| recent dead/no-PID file (≤120 seconds) | rendered from its last valid state |
+| working | green filled |
+| human_intervention | yellow filled |
+| final_answer | red filled, steady |
+| error | red filled, steady for MVP; flashing/pulse is next polish |
+| idle live session | dim gray outline |
 
-Normal Hermes CLI/TUI instances render as horizontal filled dots in the primary
-menu-bar item. Kanban workers render as compact filled-circle groups in that
-same visible item so Ice/menu-bar managers cannot hide a second status item
-independently. The agent group appears only while at least one worker is active:
-slots 1..4 render as the first 2×2 bank and slots 5..8 as a second 2×2 bank;
-active worker circles use lifecycle colors; unused worker capacity circles
-remain gray.
+Normal Hermes CLI/TUI instances render as horizontal dots in the primary
+menu-bar item; an empty normal slot adds nothing. Kanban workers render as
+compact filled-circle groups in that same visible item so Ice/menu-bar managers
+cannot hide a second status item independently. The agent group appears only
+while at least one worker is active: slots 1..4 render as the first 2×2 bank
+and slots 5..8 as a second 2×2 bank; active worker circles use lifecycle colors;
+unused worker capacity circles remain gray.
 
 A slot renders when its status file is valid and either:
 
@@ -98,10 +112,10 @@ The status menu also includes **Show Floating Monitor**. This opens a Sticky
 Notes-style monitor window near the upper-right of the screen: translucent
 off-white, rounded, resizable, always-on-top (`.floating` panel level), and
 closable with a simple `×` control. The window shows the same live status feed at
-a larger scale: normal Hermes TUI sessions render as large filled circles with no
-outline, and Kanban worker capacity renders as a large filled 2×2 group with gray
-placeholders. The monitor keeps the same left-to-right ordering as the menu-bar
-item: each Hermes TUI circle occupies one visual unit, and the entire Kanban 2×2
+a larger scale: up to six normal Hermes TUI sessions render as large filled circles
+with no outline, and Kanban worker capacity renders as a large filled 4×2 grid
+(two 2×2 banks) with gray placeholders. The monitor keeps the same left-to-right ordering as the menu-bar
+item: each Hermes TUI circle occupies one visual unit, and the entire Kanban 4×2
 grid occupies one matching unit to its right. The circle layout recalculates from
 the current window size, so resizing the panel scales and repositions the
 indicators instead of leaving a fixed-size icon. **Monitor More Transparent** and
@@ -112,8 +126,9 @@ steps.
 
 Hermes will best-effort launch the companion app when a CLI/TUI instance claims
 an Agent Lights slot. The launcher uses the built Swift debug binary if present
-and packages it into `.build/AgentLightsMenuBar.app` before opening it in the
-background. If the Swift binary has not been built yet, run:
+and packages it into `.build/AgentLightsMenuBar.app`, ad-hoc signs that local
+bundle, then opens it in the background. If the Swift binary has not been built
+yet, run:
 
 ```bash
 cd apps/agent-lights-menu-bar

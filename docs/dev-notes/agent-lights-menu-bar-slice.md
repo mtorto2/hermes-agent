@@ -33,7 +33,7 @@ Add a second local status backend beside the WiZ backend:
 
 ```text
 LightCueEvent + HERMES_SLOT -> ~/.hermes/agent-lights/slots/<slot>.json
-macOS menu app watches/reads those files -> renders four dots
+macOS menu app watches/reads those files -> renders up to six dots
 ```
 
 Slot identity should be explicit, not inferred from Terminal tabs:
@@ -43,20 +43,22 @@ HERMES_SLOT=1 hermes --tui
 HERMES_SLOT=2 hermes --tui
 HERMES_SLOT=3 hermes --tui
 HERMES_SLOT=4 hermes --tui
+HERMES_SLOT=5 hermes --tui
+HERMES_SLOT=6 hermes --tui
 ```
 
-Matt may still physically keep these as Terminal tabs 1-4 and switch with Command-1/2/3/4. The env var makes the system robust if Terminal tab metadata is unavailable or brittle.
+Matt may still physically keep these as Terminal tabs and switch normally. The env var makes the system robust if Terminal tab metadata is unavailable or brittle.
 
 ## v1 visual decision
 
 Menu bar icon:
 
 ```text
-● ● ● ●
-1 2 3 4 implied left-to-right, not rendered as numbers
+● ● ● ● ● ●
+1 through 6 implied left-to-right, not rendered as numbers
 ```
 
-No numbers in the icon. Four small circles only.
+No numbers in the icon. Up to six small circles only.
 
 Agreed v1 color semantics:
 
@@ -76,7 +78,7 @@ Decision: `final_answer` stays red until the next prompt starts in that same slo
 ## Proposed implementation slice
 
 1. Add a file/status backend to the existing light-cue service. — **done in branch**
-2. Read `HERMES_SLOT` from environment; ignore file backend when missing or outside 1-4. — **done in branch**
+2. Read `HERMES_SLOT` from environment; ignore file backend when missing or outside 1-6. — **done in branch**
 3. Write atomic per-slot JSON under `~/.hermes/agent-lights/slots/`. — **done in branch**
 4. Include at least: `slot`, `event`, `state`, `updated_at`, `pid`, optional `session_id`, optional `title`. — **core fields done; optional fields later**
 5. Add tests for backend mapping and atomic writes. — **done in branch**
@@ -87,7 +89,7 @@ Decision: `final_answer` stays red until the next prompt starts in that same slo
 - Do not scrape Terminal text.
 - Do not infer state from Terminal tab title/window content.
 - Do not require Kanban.
-- Do not support more than four dots.
+- Do not support more than six dots.
 - Do not build a full dashboard.
 - Do not introduce a broad smart-home framework.
 - Do not make background/cron/Kanban workers noisy by default.

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -502,6 +503,28 @@ def test_agent_lights_menu_bar_launcher_prepares_app_bundle_from_existing_debug_
     assert "Terminal" in plist
 
 
+def test_agent_lights_menu_bar_launcher_ad_hoc_signs_the_refreshed_bundle(tmp_path, monkeypatch):
+    binary_path = tmp_path / "apps" / "agent-lights-menu-bar" / ".build" / "debug" / "AgentLightsMenuBar"
+    binary_path.parent.mkdir(parents=True)
+    binary_path.write_bytes(b"debug-binary")
+    calls = []
+
+    def record_run(arguments, **kwargs):
+        calls.append((arguments, kwargs))
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr("agent.light_cues.subprocess.run", record_run)
+    launcher = AgentLightsMenuBarLauncher(repo_root=tmp_path)
+
+    app_path = launcher._ensure_app_bundle()
+
+    assert app_path is not None
+    assert calls == [(
+        ["/usr/bin/codesign", "--force", "--sign", "-", "--timestamp=none", str(app_path)],
+        {"check": False, "stdout": -3, "stderr": -3, "timeout": 3},
+    )]
+
+
 def test_agent_lights_menu_bar_launcher_refreshes_existing_bundle_from_debug_binary(tmp_path):
     binary_path = tmp_path / "apps" / "agent-lights-menu-bar" / ".build" / "debug" / "AgentLightsMenuBar"
     binary_path.parent.mkdir(parents=True)
@@ -580,12 +603,24 @@ def test_slot_status_file_backend_ignores_missing_or_invalid_slot_without_auto_a
     monkeypatch.delenv("HERMES_SLOT", raising=False)
     assert SlotStatusFileBackend.from_env() is None
 
-    monkeypatch.setenv("HERMES_SLOT", "5")
+    monkeypatch.setenv("HERMES_SLOT", "7")
     assert SlotStatusFileBackend.from_env() is None
 
     monkeypatch.setenv("HERMES_SLOT", "nope")
     assert SlotStatusFileBackend.from_env() is None
     assert not (tmp_path / "agent-lights").exists()
+
+
+def test_slot_status_file_backend_accepts_sixth_normal_slot(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_SLOT", "6")
+
+    backend = SlotStatusFileBackend.from_env()
+
+    assert backend is not None
+    assert backend.slot == 6
+    assert backend.emit_event(LightCueEvent.IDLE) is True
+    assert (tmp_path / "agent-lights" / "slots" / "6.json").exists()
 
 
 def test_slot_status_file_backend_auto_assigns_first_available_slot(tmp_path, monkeypatch):
@@ -665,7 +700,7 @@ def test_slot_status_file_backend_auto_assign_reclaims_dead_recent_slot(tmp_path
 
 def test_slot_status_file_backend_auto_assigns_invalid_slot_to_available_slot(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setenv("HERMES_SLOT", "6")
+    monkeypatch.setenv("HERMES_SLOT", "7")
     slots = tmp_path / "agent-lights" / "slots"
     slots.mkdir(parents=True)
     (slots / "1.json").write_text(json.dumps({"slot": 1, "pid": 111, "state": "idle"}), encoding="utf-8")
@@ -677,12 +712,12 @@ def test_slot_status_file_backend_auto_assigns_invalid_slot_to_available_slot(tm
     assert backend.slot == 2
 
 
-def test_slot_status_file_backend_auto_assign_caps_at_four_live_slots(tmp_path, monkeypatch):
+def test_slot_status_file_backend_auto_assign_caps_at_six_live_slots(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.delenv("HERMES_SLOT", raising=False)
     slots = tmp_path / "agent-lights" / "slots"
     slots.mkdir(parents=True)
-    for slot in range(1, 5):
+    for slot in range(1, 7):
         (slots / f"{slot}.json").write_text(json.dumps({"slot": slot, "pid": 100 + slot, "state": "idle"}), encoding="utf-8")
     monkeypatch.setattr(SlotStatusFileBackend, "_pid_is_running", staticmethod(lambda pid: True))
 
@@ -714,7 +749,7 @@ def test_light_cue_service_retries_slot_claim_when_capacity_frees(tmp_path, monk
     monkeypatch.delenv("HERMES_SLOT", raising=False)
     slots = tmp_path / "agent-lights" / "slots"
     slots.mkdir(parents=True)
-    for slot in range(1, 5):
+    for slot in range(1, 7):
         (slots / f"{slot}.json").write_text(json.dumps({"slot": slot, "pid": 100 + slot, "state": "idle"}), encoding="utf-8")
     monkeypatch.setattr(SlotStatusFileBackend, "_pid_is_running", staticmethod(lambda pid: True))
 
@@ -736,7 +771,7 @@ def test_light_cue_service_retries_unregistered_slot_without_waiting_for_lifecyc
     monkeypatch.delenv("HERMES_SLOT", raising=False)
     slots = tmp_path / "agent-lights" / "slots"
     slots.mkdir(parents=True)
-    for slot in range(1, 5):
+    for slot in range(1, 7):
         (slots / f"{slot}.json").write_text(
             json.dumps({"slot": slot, "pid": 100 + slot, "state": "idle"}),
             encoding="utf-8",
@@ -770,7 +805,7 @@ def test_light_cue_service_slot_retry_restores_latest_unregistered_lifecycle_sta
     monkeypatch.delenv("HERMES_SLOT", raising=False)
     slots = tmp_path / "agent-lights" / "slots"
     slots.mkdir(parents=True)
-    for slot in range(1, 5):
+    for slot in range(1, 7):
         (slots / f"{slot}.json").write_text(
             json.dumps({"slot": slot, "pid": 100 + slot, "state": "idle"}),
             encoding="utf-8",

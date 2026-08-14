@@ -10,6 +10,17 @@ public enum SlotLifecycleState: String, Codable, Equatable {
     case error
 }
 
+/// Agent Lights is a shared local surface across Hermes profiles, so it always
+/// reads the primary user home's status directory rather than a profile-scoped
+/// HERMES_HOME inherited from whichever producer launched it.
+public enum AgentLightsPath {
+    public static func sharedDirectory(userHomeDirectory: String) -> URL {
+        URL(fileURLWithPath: userHomeDirectory)
+            .appendingPathComponent(".hermes")
+            .appendingPathComponent("agent-lights")
+    }
+}
+
 public struct SlotStatus: Equatable {
     public static let recentWithoutLivePidWindow: TimeInterval = 120
 
@@ -265,6 +276,23 @@ public enum AgentIndicatorStyle: Equatable {
     case filledCircle
 }
 
+public enum NormalSlotIndicatorStyle: Equatable {
+    case filled
+    case outline
+}
+
+public struct NormalSlotIndicator: Equatable {
+    public let slot: Int
+    public let state: SlotLifecycleState
+    public let style: NormalSlotIndicatorStyle
+
+    public init(status: SlotStatus) {
+        self.slot = status.slot
+        self.state = status.state
+        self.style = status.state == .idle ? .outline : .filled
+    }
+}
+
 public struct StatusIndicatorGeometry: Equatable {
     public let hermesDotDiameter: Double
     public let hermesDotSpacing: Double
@@ -294,6 +322,7 @@ public struct StatusIndicatorGeometry: Equatable {
 }
 
 public struct StatusIndicatorLayout: Equatable {
+    public let normalSlotIndicators: [NormalSlotIndicator]
     public let filledDotCount: Int
     public let agentRingCount: Int
     public let agentRingColumns: Int
@@ -305,7 +334,11 @@ public struct StatusIndicatorLayout: Equatable {
     }
 
     public init(hermesStatuses: [SlotStatus], agentGroup: AgentRingGroup) {
-        self.filledDotCount = min(hermesStatuses.count, 4)
+        self.normalSlotIndicators = hermesStatuses
+            .filter { (1...6).contains($0.slot) }
+            .sorted { $0.slot < $1.slot }
+            .map(NormalSlotIndicator.init)
+        self.filledDotCount = normalSlotIndicators.filter { $0.style == .filled }.count
         self.agentRingCount = agentGroup.shouldRender ? agentGroup.capacity : 0
         let columns = max(2, ((agentGroup.capacity + 3) / 4) * 2)
         self.agentRingColumns = columns
@@ -387,7 +420,7 @@ public struct FloatingMonitorLayout: Equatable {
     public let items: [FloatingMonitorItem]
 
     public init(size: FloatingMonitorSize, hermesStatuses: [SlotStatus], agentGroup: AgentRingGroup) {
-        let activeHermes = Array(hermesStatuses.prefix(4))
+        let activeHermes = Array(hermesStatuses.prefix(6))
         let includeAgents = agentGroup.shouldRender
         let agentUnitCount = includeAgents ? 1 : 0
         let unitCount = activeHermes.count + agentUnitCount

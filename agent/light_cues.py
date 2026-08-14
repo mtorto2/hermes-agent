@@ -192,6 +192,16 @@ class AgentLightsMenuBarLauncher:
 """,
                 encoding="utf-8",
             )
+            signing = subprocess.run(
+                ["/usr/bin/codesign", "--force", "--sign", "-", "--timestamp=none", str(app_path)],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=3,
+            )
+            if signing.returncode != 0:
+                logger.debug("Failed to ad-hoc sign Agent Lights menu bar app")
+                return None
         except Exception as exc:
             logger.debug("Failed to prepare Agent Lights menu bar app bundle: %s", exc)
             return None
@@ -240,7 +250,7 @@ class SlotStatusFileBackend:
         watches the root Hermes home, while profile sessions run with
         ``HERMES_HOME=~/.hermes/profiles/<name>``.  Use the default Hermes root
         for slot files so default/Hermes, Tate/business, and Aurelius/personal
-        all appear in the same four-circle surface.  Keep an env override for
+        all appear in the same six-slot surface.  Keep an env override for
         tests and unusual deployments.
         """
         raw_override = os.environ.get("HERMES_AGENT_LIGHTS_HOME", "").strip()
@@ -263,7 +273,7 @@ class SlotStatusFileBackend:
     def _slot_capacity(cls, directory: Path) -> int:
         if os.environ.get("HERMES_KANBAN_TASK") or directory.name == "agents":
             return 8
-        return 4
+        return 6
 
     @classmethod
     def _claim_available_slot(cls, directory: Path) -> int | None:

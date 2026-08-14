@@ -1,8 +1,29 @@
 # Next Time
 
-Updated: 2026-08-07
+Updated: 2026-08-14
 Project: Hermes Agent — Matt local fork / live runtime
 Prepared by: Hermes
+
+## Active handoff — Agent Lights six-slot reconciliation (August 14, 2026)
+
+- **Read this section before the older August 7 closeout below.** That closeout remains historical background; it does not describe the active Agent Lights work.
+- The six-slot work was semantically reconciled in the isolated worktree `/Users/matt/.hermes/worktrees/agent-lights-reconcile-20260814`, then reviewed and promoted into this live checkout with Matt's approval.
+  - Normal TUI capacity is `1..6`; Kanban worker capacity remains a separate `1..8` pool.
+  - Producers and the native menu-bar app use the shared root `~/.hermes/agent-lights` across default, Tate/business, and Aurelius/personal profiles.
+  - The primary menu bar renders live idle normal slots as dim outlines and active slots as filled dots; the floating monitor renders up to six normal sessions as filled circles and retains the eight-worker 4×2 grid.
+  - The launcher ad-hoc signs the freshly assembled local app bundle before opening it.
+  - The pre-promotion live diff is retained at `~/.hermes/backups/agent-lights-live-prepromotion-20260814-081925/`.
+- Fresh isolated verification passed: `52` Agent Lights Python tests; `30` native menu-bar tests; native menu-bar build; and `git diff --check`. Two independent reviews found and corrected documentation-only contract mismatches.
+- Matt confirmed there were no open TUI tabs before promotion. Do not create or terminate TUI sessions solely to validate this change.
+- Runtime status: the existing Agent Lights app and the three profile gateways predate this source promotion. Rebuild/relaunch the native app, then have Matt run the external-Terminal ordered gateway restart (business → default → personal); use a fresh post-restart screenshot and Telegram/profile smoke before declaring the behavior active.
+- Separate unresolved issue: valid PID-matching normal slot artifacts have sometimes disappeared after registration. Do not claim the six-slot change resolves that distinct pruning/cleanup symptom.
+
+### Resume order after Matt returns
+
+1. Confirm the live `main` commit and fork remote match, then verify the native app was rebuilt/relaunched.
+2. Confirm Matt ran the ordered external gateway restart and inspect fresh profile logs/status.
+3. Launch fresh TUI sessions only if desired; confirm normal slots 1–6 and visible circles with an actual menu-bar screenshot.
+4. Continue the slot-pruning root-cause investigation separately if valid PID-matching files still disappear.
 
 ## Closed update state
 

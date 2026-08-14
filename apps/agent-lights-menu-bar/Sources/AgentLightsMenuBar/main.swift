@@ -35,10 +35,9 @@ private final class AgentLightsApp: NSObject, NSApplicationDelegate, NSMenuDeleg
     private var terminalCustomTitlesCache: (loadedAt: Date, titlesByTTY: [String: String])?
 
     override init() {
-        let home = ProcessInfo.processInfo.environment["HERMES_HOME"]
-            ?? NSHomeDirectory() + "/.hermes"
-        let agentLightsDirectory = URL(fileURLWithPath: home)
-            .appendingPathComponent("agent-lights")
+        let agentLightsDirectory = AgentLightsPath.sharedDirectory(
+            userHomeDirectory: NSHomeDirectory()
+        )
         self.slotsDirectory = agentLightsDirectory
             .appendingPathComponent("slots")
         self.agentsDirectory = agentLightsDirectory
@@ -99,12 +98,12 @@ private final class AgentLightsApp: NSObject, NSApplicationDelegate, NSMenuDeleg
     }
 
     private func render() {
-        let slotStatuses = (1...4).compactMap { loadRenderableStatus(directory: slotsDirectory, slot: $0) }
+        let slotStatuses = (1...6).compactMap { loadRenderableStatus(directory: slotsDirectory, slot: $0) }
         let agentStatuses = (1...8).compactMap { loadRenderableStatus(directory: agentsDirectory, slot: $0) }
         let legacyAgentStatuses = slotStatuses.filter(\.isKanbanWorker)
         let hermesStatuses = slotStatuses.filter { !$0.isKanbanWorker }
         let allAgentStatuses = agentStatuses + legacyAgentStatuses
-        // Keep normal Hermes lights stable by their Agent Lights slot letters (A-D).
+        // Keep normal Hermes lights stable by their Agent Lights slot letters (A-F).
         // Terminal window/tab ordering is still used for click-to-focus association,
         // but not for visual ordering; Terminal's AppleScript window order changes
         // with focus and made the dots jump around.
@@ -611,10 +610,11 @@ private final class FloatingMonitorView: NSView {
 
 private enum DotRenderer {
     static func image(for statuses: [SlotStatus], agentGroup: AgentRingGroup = AgentRingGroup(statuses: [])) -> NSImage {
-        let visibleStatuses = Array(statuses.prefix(4))
+        let visibleStatuses = Array(statuses.prefix(6))
         let layout = StatusIndicatorLayout(hermesStatuses: visibleStatuses, agentGroup: agentGroup)
+        let normalSlotIndicators = layout.normalSlotIndicators
         let geometry = StatusIndicatorGeometry()
-        let dotCount = max(layout.filledDotCount, layout.shouldRenderAgentRings ? 0 : 1)
+        let dotCount = normalSlotIndicators.count
         let dotWidth = dotCount > 0 ? CGFloat(8) + CGFloat(dotCount) * CGFloat(geometry.hermesDotSpacing) : 0
         let gapWidth: CGFloat = layout.shouldRenderAgentRings && dotCount > 0 ? 6 : 0
         let ringWidth = layout.shouldRenderAgentRings ? CGFloat(geometry.agentIndicatorWidth) : 0
@@ -625,13 +625,20 @@ private enum DotRenderer {
         NSColor.clear.setFill()
         NSRect(origin: .zero, size: size).fill()
 
-        for (index, status) in visibleStatuses.enumerated() {
+        for (index, indicator) in normalSlotIndicators.enumerated() {
             let x = CGFloat(4) + CGFloat(index) * CGFloat(geometry.hermesDotSpacing)
             let dotDiameter = CGFloat(geometry.hermesDotDiameter)
             let rect = NSRect(x: x, y: (18 - dotDiameter) / 2, width: dotDiameter, height: dotDiameter)
             let path = NSBezierPath(ovalIn: rect)
-            color(for: status.state).setFill()
-            path.fill()
+            switch indicator.style {
+            case .filled:
+                color(for: indicator.state).setFill()
+                path.fill()
+            case .outline:
+                NSColor.secondaryLabelColor.withAlphaComponent(0.72).setStroke()
+                path.lineWidth = 1.4
+                path.stroke()
+            }
         }
 
         if layout.shouldRenderAgentRings {
