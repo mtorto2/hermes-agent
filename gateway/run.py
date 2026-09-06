@@ -30850,13 +30850,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 # optional 🎙️ echo back to the user.
                                 _media_urls = getattr(_peek_event, "media_urls", None) or []
                                 if self._pending_event_audio_paths(_peek_event):
+                                    _pending_adapter = self._adapter_for_source(_peek_event.source)
                                     pending_text, _ = await self._transcribe_and_echo_pending_voice(
                                         _peek_event,
-                                        _adapter,
-                                        source,
+                                        _pending_adapter,
+                                        _peek_event.source,
                                         pending_text,
                                         log_context="Voice-interrupt",
-                                        metadata={"thread_id": source.thread_id} if source.thread_id else None,
                                     )
                                 elif not pending_text and _media_urls:
                                     pending_text = _build_media_placeholder(_peek_event)
@@ -31132,13 +31132,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             if _bp_event is not None:
                                 _bp_media_urls = getattr(_bp_event, "media_urls", None) or []
                                 if self._pending_event_audio_paths(_bp_event):
+                                    _bp_voice_adapter = self._adapter_for_source(_bp_event.source)
                                     _bp_text, _ = await self._transcribe_and_echo_pending_voice(
                                         _bp_event,
-                                        _backup_adapter,
-                                        source,
+                                        _bp_voice_adapter,
+                                        _bp_event.source,
                                         _bp_text or "",
                                         log_context="Voice-backup-interrupt",
-                                        metadata={"thread_id": source.thread_id} if source.thread_id else None,
                                     )
                                 elif not _bp_text and _bp_media_urls:
                                     _bp_text = _build_media_placeholder(_bp_event)
@@ -31234,13 +31234,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             if _bp_event is not None:
                                 _bp_media_urls = getattr(_bp_event, "media_urls", None) or []
                                 if self._pending_event_audio_paths(_bp_event):
+                                    _bp_voice_adapter = self._adapter_for_source(_bp_event.source)
                                     _bp_text, _ = await self._transcribe_and_echo_pending_voice(
                                         _bp_event,
-                                        _backup_adapter,
-                                        source,
+                                        _bp_voice_adapter,
+                                        _bp_event.source,
                                         _bp_text or "",
                                         log_context="Voice-backup-interrupt",
-                                        metadata={"thread_id": source.thread_id} if source.thread_id else None,
                                     )
                                 elif not _bp_text and _bp_media_urls:
                                     _bp_text = _build_media_placeholder(_bp_event)
@@ -31420,13 +31420,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _pending_text = pending_event.text or ""
                     _media_urls = getattr(pending_event, "media_urls", None) or []
                     if self._pending_event_audio_paths(pending_event):
+                        _pending_adapter = self._adapter_for_source(pending_event.source)
                         pending, _ = await self._transcribe_and_echo_pending_voice(
                             pending_event,
-                            adapter,
-                            source,
+                            _pending_adapter,
+                            pending_event.source,
                             _pending_text,
                             log_context="Voice-drain",
-                            metadata={"thread_id": source.thread_id} if source.thread_id else None,
                         )
                         if not pending:
                             pending = _build_media_placeholder(pending_event)
