@@ -6,7 +6,7 @@
 - **Source (Blue, read-only):** `/Users/matt/.hermes/hermes-agent`
 - **Frozen tag:** `v2026.8.31`
 - **Required and resolved commit:** `29112bef099274229cadff79cdff7bf7b99c4b77`
-- **Checkout mode:** detached `HEAD` at the frozen tag
+- **Checkout mode:** initially detached at the frozen tag; now on candidate-local branch `candidate/tg-voice-01` with only documented local checkpoints.
 - **Candidate remote:** `origin = git@github.com:NousResearch/hermes-agent.git`
 
 ## Local-only construction
@@ -64,4 +64,15 @@ No active state, profile, session, auth, credential, cron, configuration, gatewa
 - **Persistent source wheel:** `/Users/matt/.hermes/runtime/evidence/green-v2026.8.31-tgvoice-35d2e44/matt_hermes_extensions-0.1.0-py3-none-any.whl` (same wheel SHA-256 above)
 - **Candidate environment:** CPython 3.11.15, created with `uv sync --locked --extra dev`; the candidate gateway scope passed 12/12 using its own `.venv` with candidate-source import binding verified.
 - **Clean extension verification checkout:** `/Users/matt/.hermes/runtime/extensions/matt-hermes-extensions-35d2e44`, detached at the exact extension checkpoint; its full suite passed 183/183 using the candidate interpreter.
+- **Activation state:** **NOT ACTIVE**. No runtime/current link, process, gateway, provider, profile/state, credential, config, or service action occurred.
+
+## RELEASE-01 declared candidate-patch contract revision (candidate-local)
+
+- **Reason:** RELEASE-01 previously rejected every candidate patch because it required the frozen tag to equal runtime `HEAD`, despite already receiving declared patch IDs. The candidate runtime contains only the documented TG-VOICE checkpoint plus provenance commits, all descended from the frozen tag.
+- **Extension revision:** `fb2a8b6e97b089603c7ef7d33675e839d12d9cc8` on isolated local branch `candidate/frozen-parity-patches`; no push occurred.
+- **Contract:** exact frozen-tag `HEAD` still passes. A non-identical runtime `HEAD` now passes only when the frozen tag is a local Git ancestor **and** safe declared patch IDs are supplied. An undeclared descendant and an unrelated tagged history both fail closed.
+- **Test evidence:** RED captured for the declared descendant; focused GREEN passed 2/2; independent reviewer passed with no security or logic findings; full extension suite passed 186/186; Ruff and `git diff --check` passed.
+- **Installed extension wheel:** `matt-hermes-extensions==0.1.0`, SHA-256 `0e06a4c632064e2e9decd52a064ee7e62fabb01cc3b9a352c6ab1b069b75b59c`, built from the isolated revision and installed only into candidate `.venv` with `uv pip --reinstall --no-deps`.
+- **Installed-code verification:** the four updated parity modules matched the committed source byte-for-byte by SHA-256; `matt-hermes-parity --help` and `uv pip check` succeeded.
+- **Persistent install/rollback artifacts:** `/Users/matt/.hermes/runtime/evidence/green-v2026.8.31-parity-fix-fb2a8b6/` plus the previous wheel retained at `/Users/matt/.hermes/runtime/evidence/green-v2026.8.31-tgvoice-35d2e44/matt_hermes_extensions-0.1.0-py3-none-any.whl` (SHA-256 `e4af8e6c89668fcc2484d004d0d2456f30bb62f0b055d7fd3bbe5f73faeaf37c`).
 - **Activation state:** **NOT ACTIVE**. No runtime/current link, process, gateway, provider, profile/state, credential, config, or service action occurred.
