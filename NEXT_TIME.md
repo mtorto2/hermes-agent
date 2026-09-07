@@ -25,26 +25,28 @@ Prepared by: Hermes
   - **Launch invariant:** any Green Python process must explicitly set `HERMES_PYTHON_SRC_ROOT` to this Green root. An inherited Blue value correctly redirects the bootstrap to Blue and creates a mixed-source import failure.
 - **Next and only promotion gate:** obtain a fresh explicit approval for a Blue/live promotion plan. That plan must separately prove Green/Blue commit topology, stage one runtime-path change at a time, preserve all profile gateways, and require a human inbound Telegram proof before any live cutover. Do not push, restart, replace, or switch Blue based on this document alone.
 
-## Active handoff — Agent Lights six-slot reconciliation (August 14, 2026)
+## Current status — Agent Lights six-slot reconciliation (August 14, 2026)
 
-- **Read this section before the older August 7 closeout below.** That closeout remains historical background; it does not describe the active Agent Lights work.
-- The six-slot work was semantically reconciled in the isolated worktree `/Users/matt/.hermes/worktrees/agent-lights-reconcile-20260814`, then reviewed and promoted into this live checkout with Matt's approval.
+- **Read this section before the older August 7 closeout below.** That closeout remains historical background; it does not describe the deployed six-slot work.
+- The six-slot work was semantically reconciled in `/Users/matt/.hermes/worktrees/agent-lights-reconcile-20260814`, then reviewed, promoted, and published to Matt's fork with Matt's approval.
   - Normal TUI capacity is `1..6`; Kanban worker capacity remains a separate `1..8` pool.
   - Producers and the native menu-bar app use the shared root `~/.hermes/agent-lights` across default, Tate/business, and Aurelius/personal profiles.
-  - The primary menu bar renders live idle normal slots as dim outlines and active slots as filled dots; the floating monitor renders up to six normal sessions as filled circles and retains the eight-worker 4×2 grid.
+  - The primary menu bar renders live idle normal slots as dim outlines and active slots as filled dots; the floating monitor supports up to six normal sessions and retains the eight-worker 4×2 grid.
   - The launcher ad-hoc signs the freshly assembled local app bundle before opening it.
   - The pre-promotion live diff is retained at `~/.hermes/backups/agent-lights-live-prepromotion-20260814-081925/`.
-- Fresh isolated verification passed: `52` Agent Lights Python tests; `30` native menu-bar tests; native menu-bar build; and `git diff --check`. Two independent reviews found and corrected documentation-only contract mismatches.
-- Matt confirmed there were no open TUI tabs before promotion. Do not create or terminate TUI sessions solely to validate this change.
-- Runtime status: the native Agent Lights app was rebuilt, ad-hoc-signature verified, and relaunched from the promoted checkout. The three profile gateways predate this source promotion; have Matt run the external-Terminal ordered gateway restart (business → default → personal), then use a fresh post-restart screenshot and Telegram/profile smoke before declaring the behavior active.
-- Separate unresolved issue: valid PID-matching normal slot artifacts have sometimes disappeared after registration. Do not claim the six-slot change resolves that distinct pruning/cleanup symptom.
+- Fresh isolated verification passed: `52` Agent Lights Python tests; `30` native menu-bar tests; native menu-bar build; and `git diff --check`. Two independent reviews corrected documentation-only contract mismatches.
+- Deployment/runtime confirmation completed:
+  - The native Agent Lights app was rebuilt, signature-verified, and relaunched from the promoted checkout; exactly one companion process is running.
+  - Default, Tate/business, and Aurelius/personal gateways were restarted in the approved order (business → default → personal), reconnected to Telegram, and each processed a normal post-restart message.
+  - The live checkout is clean and matches Matt's `fork/main`.
+  - The accessible Agent Lights menu currently reports `Hermes: 0 active  Agents: 0 active`, which is expected while no TUI sessions are open.
+- Do not create or terminate TUI sessions solely to validate this change.
 
-### Resume order after Matt returns
+### Deferred visual check and separate follow-up
 
-1. Confirm the live `main` commit and fork remote match, then verify the native app was rebuilt/relaunched.
-2. Confirm Matt ran the ordered external gateway restart and inspect fresh profile logs/status.
-3. Launch fresh TUI sessions only if desired; confirm normal slots 1–6 and visible circles with an actual menu-bar screenshot.
-4. Continue the slot-pruning root-cause investigation separately if valid PID-matching files still disappear.
+1. When Matt naturally has fresh TUI sessions open, capture the Agent Lights menu bar and confirm normal slots/circles `1..6` render as expected. This is the only remaining six-slot validation.
+2. Valid PID-matching normal slot artifacts have sometimes disappeared after registration. This is a separate, currently inactive producer-side pruning/cleanup issue; do not claim the six-slot change resolves it. Resume root-cause investigation only if a live TUI loses its slot/light again.
+3. No code, gateway, or companion-app change is needed unless that visual check or recurrence reveals a new failure.
 
 ## Closed update state
 
