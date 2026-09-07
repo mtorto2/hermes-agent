@@ -12,6 +12,8 @@ import subprocess
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
 from hermes_cli.main import cmd_update
 
 
@@ -45,6 +47,42 @@ def _make_run_side_effect(
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
     return side_effect
+
+
+@pytest.fixture(autouse=True)
+def _isolate_update_lifecycle(monkeypatch, tmp_path):
+    """Run mocked ``cmd_update`` paths without touching live runtime state."""
+    from hermes_cli import main as hermes_main
+
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    (checkout / ".git").mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    original_cmd_update = cmd_update
+
+    def _isolated_cmd_update(*args, **kwargs):
+        with patch("hermes_cli.main.PROJECT_ROOT", checkout):
+            return original_cmd_update(*args, **kwargs)
+
+    monkeypatch.setitem(globals(), "cmd_update", _isolated_cmd_update)
+    monkeypatch.setattr(hermes_main, "_capture_active_lazy_features", lambda: [])
+    monkeypatch.setattr(hermes_main, "_capture_active_tool_dependencies", lambda: [])
+    monkeypatch.setattr(hermes_main, "_run_pre_update_backup", lambda *a, **kw: None)
+    monkeypatch.setattr(hermes_main, "_finish_dashboard_update_cleanup", lambda *a, **kw: None)
+    monkeypatch.setattr(
+        "hermes_cli.update_inventory.collect_runtime_inventory",
+        lambda: SimpleNamespace(runtimes=[], to_dict=lambda: {}),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.update_receipt.collect_fleet_versions", lambda **kw: []
+    )
+    monkeypatch.setattr(
+        "hermes_cli.update_cmd._restart_macos_launchd_gateways",
+        lambda *a, **kw: ([], []),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.macos_tcc_anchor.ensure_tcc_anchor", lambda *a, **kw: None
+    )
 
 
 class TestUpdateYesConfigMigration:

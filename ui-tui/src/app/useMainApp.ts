@@ -35,6 +35,7 @@ import { DEFAULT_VOICE_RECORD_KEY, isMac, type ParsedVoiceRecordKey } from '../l
 import { createResizeCoalescer } from '../lib/resizeCoalescer.js'
 import { asRpcResult, rpcErrorMessage } from '../lib/rpc.js'
 import { terminalParityHints } from '../lib/terminalParity.js'
+import { shouldUseHermesTerminalTitle } from '../lib/terminalTitle.js'
 import {
   buildToolTrailLine,
   formatAbandonedClarify,
@@ -630,19 +631,25 @@ export function useMainApp(gw: GatewayClient) {
 
   // Tab title: `⚠` waiting on approval/sudo/secret/clarify, `⏳` busy, `✓` idle.
   // Format: `<marker> <session name> · <model> · <cwd>` — name/cwd omitted when absent.
+  // Terminal.app and Agent Lights slots intentionally receive no OSC title
+  // writes, preserving human-owned terminal/tab titles.
   const model = ui.info?.model?.replace(/^.*\//, '') ?? ''
 
   const marker = overlay.approval || overlay.sudo || overlay.secret || overlay.clarify ? '⚠' : ui.busy ? '⏳' : '✓'
 
   const tabCwd = ui.info?.cwd
 
+  const tabSlot = process.env.HERMES_SLOT
+
   useTerminalTitle(
-    model
-      ? {
-          tab: composeTabTitle(marker, ui.sessionTitle, '', ''),
-          window: composeTabTitle(marker, ui.sessionTitle, model, tabCwd ? shortCwd(tabCwd, 24) : '')
-        }
-      : 'Hermes'
+    shouldUseHermesTerminalTitle(tabSlot)
+      ? model
+        ? {
+            tab: composeTabTitle(marker, ui.sessionTitle, '', ''),
+            window: composeTabTitle(marker, ui.sessionTitle, model, tabCwd ? shortCwd(tabCwd, 24) : ''),
+          }
+        : 'Hermes'
+      : null
   )
 
   useEffect(() => {

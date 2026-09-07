@@ -32,17 +32,29 @@ from hermes_constants import get_hermes_home
 from hermes_time import now as _hermes_now
 
 NOTEPAD_FILE = get_hermes_home().resolve() / "cron" / "notepad.db"
+# Keep the public module constant as a compatibility seam for callers/tests
+# that deliberately repoint it, without pinning a long-lived process to the
+# profile that imported this module first.
+_IMPORT_NOTEPAD_FILE = NOTEPAD_FILE
 MAX_VALUE_BYTES = 16 * 1024
 MAX_KEY_CHARS = 128
 MAX_JOB_TOTAL_BYTES = 64 * 1024
 _lock = threading.RLock()
 
 
+def _current_notepad_file() -> Path:
+    """Resolve the active profile store unless the compatibility constant moved."""
+    if NOTEPAD_FILE != _IMPORT_NOTEPAD_FILE:
+        return NOTEPAD_FILE
+    return get_hermes_home().resolve() / "cron" / "notepad.db"
+
+
 def _connect() -> sqlite3.Connection:
     from cron.jobs import _ensure_cron_dir
 
-    _ensure_cron_dir(NOTEPAD_FILE.parent)
-    return sqlite3.connect(NOTEPAD_FILE, timeout=5)
+    notepad_file = _current_notepad_file()
+    _ensure_cron_dir(notepad_file.parent)
+    return sqlite3.connect(notepad_file, timeout=5)
 
 
 def _initialize_schema(conn: sqlite3.Connection) -> None:

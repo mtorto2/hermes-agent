@@ -8,6 +8,7 @@ import logging
 import os
 import posixpath
 import sys
+import tempfile
 import threading
 from pathlib import Path, PurePosixPath
 
@@ -659,6 +660,41 @@ _SENSITIVE_PATH_PREFIXES = (
     "/private/var/db/", "/private/var/root/",
 )
 _SENSITIVE_EXACT_PATHS = {"/var/run/docker.sock", "/run/docker.sock"}
+_TEMP_PATH_SENSITIVE_PREFIX_EXCEPTIONS = (
+    "/private/var/folders",
+    "/private/var/tmp",
+)
+
+
+def _is_path_under(path: str, parent: str) -> bool:
+    try:
+        return os.path.commonpath([path, parent]) == parent
+    except (OSError, ValueError):
+        return False
+
+
+def _is_allowed_temp_path(path: str) -> bool:
+    """Return True when *path* is under a known safe temp exception root.
+
+    On macOS, ``tempfile.gettempdir()`` usually resolves below
+    ``/private/var/folders/.../T``. That location is writable user temp space,
+    not a privileged system database/log path, so it should not be caught by the
+    broad ``/private/var/`` safety prefix. Because ``tempfile.gettempdir()`` can
+    be environment-controlled, only known temp roots under sensitive prefixes are
+    allowed to bypass the sensitive-path guard.
+    """
+    try:
+        temp_root = os.path.realpath(tempfile.gettempdir())
+        real_path = os.path.realpath(path)
+    except (OSError, ValueError):
+        return False
+    if not _is_path_under(real_path, temp_root):
+        return False
+    return any(
+        _is_path_under(real_path, exception_root)
+        and _is_path_under(temp_root, exception_root)
+        for exception_root in _TEMP_PATH_SENSITIVE_PREFIX_EXCEPTIONS
+    )
 
 _hermes_config_resolved: str | None = None
 _hermes_config_resolved_loaded = False
@@ -692,6 +728,8 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
         f"Refusing to write to sensitive system path: {filepath}\n"
         "Use the terminal tool with sudo if you need to modify system files."
     )
+    if _is_allowed_temp_path(resolved) or _is_allowed_temp_path(normalized):
+        return None
     for prefix in _SENSITIVE_PATH_PREFIXES:
         if resolved.startswith(prefix) or normalized.startswith(prefix):
             return _err

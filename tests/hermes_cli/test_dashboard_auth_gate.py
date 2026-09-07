@@ -141,6 +141,10 @@ def _stub_uvicorn_run(monkeypatch):
 
     monkeypatch.setattr(uvicorn, "Config", _FakeConfig)
     monkeypatch.setattr(uvicorn, "Server", lambda config: _FakeServer())
+    # This helper is a no-bind server harness. Its concern is the auth/config
+    # contract, not whether an arbitrary fixed host port is occupied on the
+    # developer machine.
+    monkeypatch.setattr(web_server, "_port_bind_conflict", lambda _host, _port: False)
     return captured
 
 

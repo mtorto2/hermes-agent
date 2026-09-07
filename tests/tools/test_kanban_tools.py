@@ -111,6 +111,117 @@ def test_list_filters_tasks(monkeypatch, worker_env):
     assert tenant_ids == [c]
 
 
+def test_list_rejects_invalid_status(monkeypatch, worker_env):
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    from tools import kanban_tools as kt
+    out = kt._handle_list({"status": "not-a-state"})
+    assert "status must be one of" in json.loads(out).get("error", "")
+
+
+def test_list_rejects_bad_limit(monkeypatch, worker_env):
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    from tools import kanban_tools as kt
+    assert json.loads(kt._handle_list({"limit": "nope"})).get("error")
+    assert json.loads(kt._handle_list({"limit": 0})).get("error")
+
+
+def test_list_parses_include_archived_string_false(monkeypatch, worker_env):
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        live = kb.create_task(conn, title="live task", assignee="factory")
+        archived = kb.create_task(conn, title="archived task", assignee="factory")
+        assert kb.archive_task(conn, archived)
+    finally:
+        conn.close()
+
+    from tools import kanban_tools as kt
+    out = kt._handle_list({
+        "assignee": "factory",
+        "include_archived": "false",
+    })
+    ids = [t["id"] for t in json.loads(out)["tasks"]]
+    assert live in ids
+    assert archived not in ids
+
+
+def test_list_parses_include_archived_string_true(monkeypatch, worker_env):
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        live = kb.create_task(conn, title="live task", assignee="factory")
+        archived = kb.create_task(conn, title="archived task", assignee="factory")
+        assert kb.archive_task(conn, archived)
+    finally:
+        conn.close()
+
+    from tools import kanban_tools as kt
+    out = kt._handle_list({
+        "assignee": "factory",
+        "include_archived": "true",
+    })
+    ids = [t["id"] for t in json.loads(out)["tasks"]]
+    assert live in ids
+    assert archived in ids
+
+
+def test_list_rejects_bad_include_archived(monkeypatch, worker_env):
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    from tools import kanban_tools as kt
+    out = kt._handle_list({"include_archived": "sometimes"})
+    assert "include_archived must be" in json.loads(out).get("error", "")
+
+
+def test_complete_captures_active_agent_usage(worker_env):
+    from types import SimpleNamespace
+
+    from model_tools import handle_function_call
+
+    agent = SimpleNamespace(
+        provider="openrouter",
+        model="anthropic/claude-sonnet-4",
+        session_input_tokens=10,
+        session_output_tokens=5,
+        session_cache_read_tokens=2,
+        session_cache_write_tokens=1,
+        session_reasoning_tokens=3,
+        session_prompt_tokens=13,
+        session_completion_tokens=5,
+        session_total_tokens=18,
+        session_api_calls=2,
+        session_estimated_cost_usd=0.0123,
+        session_cost_status="estimated",
+        session_cost_source="pricing_table",
+    )
+
+    out = handle_function_call(
+        "kanban_complete",
+        {"summary": "usage captured", "metadata": {"manual": True}},
+        agent=agent,
+    )
+    assert json.loads(out)["ok"] is True
+
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        run = kb.latest_run(conn, worker_env)
+        usage = run.metadata["run_usage"]
+        assert usage["provider"] == "openrouter"
+        assert usage["model"] == "anthropic/claude-sonnet-4"
+        assert usage["input_tokens"] == 10
+        assert usage["output_tokens"] == 5
+        assert usage["cache_read_tokens"] == 2
+        assert usage["cache_write_tokens"] == 1
+        assert usage["reasoning_tokens"] == 3
+        assert usage["request_count"] == 2
+        assert usage["estimated_cost_usd"] == 0.0123
+        assert run.metadata["manual"] is True
+    finally:
+        conn.close()
+
+
 def test_complete_happy_path(worker_env):
     from tools import kanban_tools as kt
     out = kt._handle_complete({
@@ -226,6 +337,31 @@ def test_block_happy_path(worker_env):
         assert kb.get_task(conn, worker_env).status == "blocked"
     finally:
         conn.close()
+
+
+def test_block_emits_human_intervention_light_cue(worker_env, monkeypatch):
+    from tools import kanban_tools as kt
+
+    emitted = []
+
+    class FakeLightCueService:
+        def emit(self, event):
+            emitted.append(getattr(event, "value", event))
+            return True
+
+    monkeypatch.setattr(kt, "build_light_cue_service_from_config", lambda *a, **k: FakeLightCueService(), raising=False)
+
+    out = kt._handle_block({"reason": "need clarification"})
+
+    assert json.loads(out)["ok"] is True
+    assert emitted == ["human_intervention"]
+
+
+def test_block_rejects_empty_reason(worker_env):
+    from tools import kanban_tools as kt
+    for bad in ["", "   ", None]:
+        out = kt._handle_block({"reason": bad})
+        assert json.loads(out).get("error")
 
 
 def _make_goal_mode_worker_env(monkeypatch, tmp_path):

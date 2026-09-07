@@ -71,21 +71,46 @@ def _patch_managed_uv(request):
         yield
 
 
-@pytest.fixture(autouse=True)
-def _patch_gateway_discovery():
-    """Keep cmd_update's gateway auto-restart phase off this machine's gateways.
+@pytest.fixture
+def isolated_update_checkout(tmp_path):
+    """A disposable git-shaped checkout for full ``cmd_update`` calls."""
+    checkout = tmp_path / "_isolated_update_checkout"
+    checkout.mkdir()
+    (checkout / ".git").mkdir()
+    return checkout
 
-    The restart phase used to swallow every exception at debug level, so these
-    end-to-end tests never noticed it touching real gateway discovery. Since
-    the phase is surfaced (#78574: an aborted restart now fails the update),
-    an unmocked ``find_gateway_pids`` on a box with a live gateway reaches the
-    conftest live-system guard and turns into a spurious ``sys.exit(1)``.
-    Discovery returning nothing makes the phase a clean no-op for every test
-    in this module (none of them assert on gateway restarts).
+
+@pytest.fixture(autouse=True)
+def _patch_gateway_discovery(monkeypatch, tmp_path, isolated_update_checkout):
+    """Keep update tests hermetic: no live checkout, home, or gateway probes.
+
+    Individual helper tests may override ``PROJECT_ROOT`` or ``HERMES_HOME`` for
+    their assertions. The default prevents mocked ``cmd_update`` paths from
+    reaching this Mac's checkout, profile state, backups, or launchd services.
     """
+    checkout = isolated_update_checkout
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+
+    # Keep direct helper tests on the canonical PROJECT_ROOT they assert against.
+    # Only full update flows need an isolated checkout.
+    original_cmd_update = cmd_update
+
+    def _isolated_cmd_update(*args, **kwargs):
+        with patch("hermes_cli.main.PROJECT_ROOT", checkout):
+            return original_cmd_update(*args, **kwargs)
+
+    monkeypatch.setitem(globals(), "cmd_update", _isolated_cmd_update)
     with patch("hermes_cli.gateway.find_gateway_pids", return_value=[]), \
          patch("hermes_cli.gateway.supports_systemd_services", return_value=False), \
-         patch("hermes_cli.gateway.find_profile_gateway_processes", return_value=[]):
+         patch("hermes_cli.gateway.find_profile_gateway_processes", return_value=[]), \
+         patch(
+             "hermes_cli.update_inventory.collect_runtime_inventory",
+             return_value=SimpleNamespace(runtimes=[], to_dict=lambda: {}),
+         ), \
+         patch("hermes_cli.update_receipt.collect_fleet_versions", return_value=[]), \
+         patch("hermes_cli.main._run_pre_update_backup", return_value=None), \
+         patch("hermes_cli.main._finish_dashboard_update_cleanup", return_value=None), \
+         patch("hermes_cli.update_cmd._restart_macos_launchd_gateways", return_value=([], [])):
         yield
 
 
@@ -278,7 +303,7 @@ class TestCmdUpdateBranchFallback:
     @patch("shutil.which", return_value=None)
     @patch("subprocess.run")
     def test_update_on_fork_checks_upstream_when_origin_up_to_date(
-        self, mock_run, _mock_which, mock_args, capsys
+        self, mock_run, _mock_which, mock_args, capsys, isolated_update_checkout
     ):
         """Regression for issue #26172: forks whose local HEAD already matches
         origin/main must still consult upstream/main before printing
@@ -303,7 +328,7 @@ class TestCmdUpdateBranchFallback:
         )
         sync_mock.assert_called_once_with(
             expected_git_cmd,
-            PROJECT_ROOT,
+            isolated_update_checkout,
             assume_yes=False,
             input_fn=None,
         )

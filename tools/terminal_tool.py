@@ -46,7 +46,8 @@ import threading
 import atexit
 import shutil
 import subprocess
-from pathlib import Path
+from dataclasses import dataclass, replace
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Optional, Dict, Any, List
 
 from utils import env_var_enabled
@@ -67,6 +68,13 @@ def _redact_terminal_error_text(value: Any) -> str:
 # long-running subprocesses immediately instead of blocking until timeout.
 # ---------------------------------------------------------------------------
 from tools.interrupt import is_interrupted, _interrupt_event  # noqa: F401 — re-exported
+from tools.docker_mount_policy import (
+    CONTAINER_CWD_ROOTS as _CONTAINER_CWD_ROOTS,
+    docker_run_has_host_access as _docker_run_has_host_access,
+    docker_volume_uses_host_path as _policy_docker_volume_uses_host_path,
+    is_in_container_cwd_root as _is_in_container_cwd_root,
+    validated_docker_mount_root as _validated_docker_mount_root,
+)
 from tools.registry import tool_error
 from tools.shell_heredoc import strip_inert_heredoc_bodies
 # display_hermes_home imported lazily at call site (stale-module safety during hermes update)
@@ -361,24 +369,27 @@ from tools.approval import (
 
 
 def _docker_volume_uses_host_path(volume_spec: str) -> bool:
-    """Return True when a docker volume spec bind-mounts a host path."""
-    if not isinstance(volume_spec, str):
-        return False
-
-    vol = volume_spec.strip()
-    return bool(vol) and (
-        vol.startswith(("/", "~", "./", "../")) or
-        (len(vol) >= 3 and vol[1] == ":" and vol[2] in ("/", "\\"))
-    )
+    """Compatibility wrapper for the shared Docker capability policy."""
+    return _policy_docker_volume_uses_host_path(volume_spec)
 
 
-def _docker_has_host_access(config: Dict[str, Any]) -> bool:
-    """Return True when a Docker sandbox exposes host paths through bind mounts."""
+def _docker_has_host_access(
+    config: Dict[str, Any], host_cwd: Optional[str] = None,
+) -> bool:
+    """Return whether Docker exposes host paths through effective bind mounts.
+
+    ``host_cwd`` is the task/session-resolved mount capability.  When omitted,
+    the configured validated root preserves legacy call sites; when supplied,
+    it ensures approval follows the actual session-specific bind.
+    """
     if config.get("env_type") != "docker":
         return False
-    if config.get("host_cwd") and config.get("docker_mount_cwd_to_workspace"):
-        return True
-    return any(_docker_volume_uses_host_path(vol) for vol in config.get("docker_volumes", []))
+    return _docker_run_has_host_access(
+        auto_mount_cwd=config.get("docker_mount_cwd_to_workspace"),
+        host_cwd=host_cwd or config.get("host_cwd"),
+        docker_volumes=config.get("docker_volumes", []),
+        docker_extra_args=config.get("docker_extra_args", []),
+    )
 
 
 def _check_all_guards(command: str, env_type: str,
@@ -1579,23 +1590,17 @@ def _resolve_task_host_cwd(config: Dict[str, Any], task_id: Optional[str]) -> Op
     if not config.get("docker_mount_cwd_to_workspace"):
         return None
     if not _docker_session_isolation_enabled():
-        return config.get("host_cwd")
+        return _validated_docker_mount_root(config.get("host_cwd"))
     if _resolve_container_task_id(task_id) == "default":
         # Top-level CLI parent — single-session process, legacy behavior.
-        return config.get("host_cwd")
+        return _validated_docker_mount_root(config.get("host_cwd"))
     overrides = resolve_task_overrides(task_id)
     if overrides.get("cwd_source") == "process":
         return None
     candidate = overrides.get("cwd")
     if not isinstance(candidate, str) or not candidate.strip():
         return None
-    candidate = os.path.abspath(os.path.expanduser(candidate))
-    if not os.path.isdir(candidate):
-        return None
-    if candidate.startswith(("/workspace", "/root")):
-        # Already an in-container path, not a host workspace.
-        return None
-    return candidate
+    return _validated_docker_mount_root(candidate)
 
 
 # Configuration from environment variables
@@ -1635,11 +1640,32 @@ def _safe_getcwd() -> str:
         return os.getenv("TERMINAL_CWD") or os.path.expanduser("~")
 
 
-# Path prefixes that identify a *host* working directory which cannot exist
-# inside a container sandbox. Covers POSIX user dirs and Windows drive paths
-# (``C:\Users\...`` / ``C:/Users/...``) — the latter is how a Windows host's
-# cwd looks when it leaks toward a Linux container's ``-w`` flag.
-_HOST_CWD_PREFIXES = ("/Users/", "/home/", "C:\\", "C:/")
+# POSIX user-directory roots are host-only in a Linux sandbox, including the
+# exact roots themselves.  Keep the descendants as a separate compatibility
+# constant because older callers/tests inspect this public module detail.
+_HOST_CWD_ROOTS = ("/Users", "/home")
+_HOST_CWD_PREFIXES = tuple(f"{root}/" for root in _HOST_CWD_ROOTS) + ("C:\\", "C:/")
+
+
+def _has_windows_drive_prefix(path: str) -> bool:
+    """Return whether *path* is drive-qualified, including ``C:relative``."""
+    return len(path) >= 2 and path[1] == ":"
+
+
+def _is_windows_unc_path(path: str) -> bool:
+    """Return whether *path* is an UNC path in either common separator form."""
+    return path.startswith(("\\\\", "//"))
+
+
+def _is_known_host_cwd(path: str) -> bool:
+    """Return whether *path* has a host-only working-directory form."""
+    return (
+        path in _HOST_CWD_ROOTS
+        or any(path.startswith(prefix) for prefix in _HOST_CWD_PREFIXES)
+        or _has_windows_drive_prefix(path)
+        or _is_windows_unc_path(path)
+    )
+
 
 _CONTAINER_BACKENDS = frozenset({"docker", "singularity", "modal", "daytona", "vercel_sandbox"})
 
@@ -1683,24 +1709,152 @@ def _get_plugin_env_provider(env_type: str):
 
 
 def _is_unusable_container_cwd(cwd: str) -> bool:
-    """Return True if *cwd* is a host/relative path that won't work as the
-    working directory inside a container sandbox.
+    """Return whether *cwd* cannot safely be a Linux-container workdir.
 
-    A container's cwd must be an absolute path that exists *inside* the
-    sandbox (e.g. ``/workspace`` or ``/root``). A host path (``/home/user``,
-    ``C:\\Users\\me``) or a relative path (``.``, ``src/``) is meaningless to
-    ``docker run -w`` and makes the container fail to start (exit 125).
+    This classification deliberately uses container path semantics, not the
+    host interpreter's ``os.path`` flavor: a Windows drive or UNC path remains
+    a host path even when Hermes itself runs on Windows.
     """
     if not cwd:
         return False
-    if any(cwd.startswith(p) for p in _HOST_CWD_PREFIXES):
+    if _is_known_host_cwd(cwd):
         return True
-    # Relative paths (".", "src/") can't be a container workdir either. Windows
-    # drive paths are absolute on Windows but os.path.isabs() is False on a
-    # POSIX host, so they're already caught by the prefix check above.
-    if not os.path.isabs(cwd):
-        return True
-    return False
+    # Docker and the other container backends require a POSIX absolute working
+    # directory.  A relative candidate is never safe merely because the host
+    # platform happens to consider it absolute.
+    return not PurePosixPath(cwd).is_absolute()
+
+
+def _sanitize_environment_cwd(cwd: str, config: Dict[str, Any]) -> str:
+    """Return *cwd* only when it is usable by the configured backend.
+
+    Session and task CWD records originate on client surfaces such as ACP, so
+    container backends must never receive a host or relative path from them.
+    Fall back to the already-sanitized configured in-container CWD instead.
+    """
+    env_type = config["env_type"]
+    default_cwd = config["cwd"]
+    if _is_container_backend(env_type) and _is_unusable_container_cwd(cwd):
+        if cwd != default_cwd:
+            logger.info(
+                "Ignoring host/relative cwd %r for %s backend "
+                "(won't exist in sandbox). Using %r instead.",
+                cwd, env_type, default_cwd,
+            )
+        return default_cwd
+    return cwd
+
+
+def _normalise_cwd_parts(parts: tuple[str, ...]) -> Optional[List[str]]:
+    """Lexically normalize path parts, rejecting any escape above their root."""
+    normalised: List[str] = []
+    for part in parts:
+        if part in ("", ".", "/", "\\"):
+            continue
+        if part == "..":
+            if not normalised:
+                return None
+            normalised.pop()
+        else:
+            normalised.append(part)
+    return normalised
+
+
+def _cwd_path_flavor(path: str) -> Optional[str]:
+    """Classify a raw CWD as Windows-rooted, POSIX-rooted, or relative.
+
+    The check is syntactic and host-independent.  A single leading backslash is
+    treated as Windows-rooted-but-drive-relative and therefore never becomes a
+    safe relative child of a POSIX mount.
+    """
+    if _has_windows_drive_prefix(path) or _is_windows_unc_path(path) or path.startswith("\\"):
+        return "windows"
+    if path.startswith("/"):
+        return "posix"
+    return None
+
+
+def _mounted_workspace_cwd(cwd: str, host_cwd: Optional[str]) -> Optional[str]:
+    """Map only a normalized CWD contained by this session's mount to ``/workspace``.
+
+    The mapping is purely lexical: it does not dereference or otherwise touch
+    user-provided paths.  Only a syntactically relative candidate is evaluated
+    beneath the mount root.  Rooted candidates must use the same path flavor as
+    the root and remain a normalized descendant of it.
+    """
+    if not host_cwd or not cwd:
+        return None
+
+    raw_cwd = os.path.expanduser(cwd)
+    raw_host = os.path.expanduser(host_cwd)
+    candidate_flavor = _cwd_path_flavor(raw_cwd)
+    mount_flavor = _cwd_path_flavor(raw_host)
+
+    if candidate_flavor is None:
+        if mount_flavor is None:
+            return None
+        relative = PurePosixPath(raw_cwd.replace("\\", "/"))
+        relative_parts = _normalise_cwd_parts(relative.parts)
+        if relative_parts is None:
+            return None
+        return "/workspace" if not relative_parts else "/workspace/" + "/".join(relative_parts)
+
+    if candidate_flavor != mount_flavor:
+        return None
+    path_type = PureWindowsPath if candidate_flavor == "windows" else PurePosixPath
+    candidate = path_type(raw_cwd)
+    mount_root = path_type(raw_host)
+    if not candidate.is_absolute() or not mount_root.is_absolute():
+        return None
+    if path_type is PureWindowsPath:
+        same_anchor = candidate.anchor.casefold() == mount_root.anchor.casefold()
+    else:
+        same_anchor = candidate.anchor == mount_root.anchor
+    if not same_anchor:
+        return None
+
+    candidate_parts = _normalise_cwd_parts(candidate.parts[1:])
+    mount_parts = _normalise_cwd_parts(mount_root.parts[1:])
+    if candidate_parts is None or mount_parts is None:
+        return None
+    if path_type is PureWindowsPath:
+        contained = [part.casefold() for part in candidate_parts[:len(mount_parts)]] == [
+            part.casefold() for part in mount_parts
+        ]
+    else:
+        contained = candidate_parts[:len(mount_parts)] == mount_parts
+    if not contained:
+        return None
+    relative_parts = candidate_parts[len(mount_parts):]
+    return "/workspace" if not relative_parts else "/workspace/" + "/".join(relative_parts)
+
+
+def _resolve_environment_cwd(
+    cwd: str, config: Dict[str, Any], host_cwd: Optional[str],
+) -> str:
+    """Sanitize *cwd* for environment creation, honouring the session mount.
+
+    ``_sanitize_environment_cwd`` owns the rule that host or relative paths
+    must never reach a container workdir.  When the candidate is covered by
+    THIS session's mounted workspace, map it to the equivalent ``/workspace``
+    path; otherwise use the configured in-container fallback.  Absolute
+    in-container overrides (``/workspace``, ``/root``, RL/benchmark sandboxes)
+    pass through untouched.
+    """
+    if host_cwd and cwd and _is_container_backend(config["env_type"]):
+        # A path proven lexically contained by this session's validated mount is
+        # host-backed regardless of whether its POSIX prefix appears in the
+        # portable host classifier (macOS may expose real paths below
+        # /private, for example). Map it before the fallback classifier.
+        mapped_cwd = _mounted_workspace_cwd(cwd, host_cwd)
+        if mapped_cwd is not None:
+            if cwd != mapped_cwd:
+                logger.info(
+                    "Remapping session-mounted cwd %r for %s backend to %r.",
+                    cwd, config["env_type"], mapped_cwd,
+                )
+            return mapped_cwd
+    return _sanitize_environment_cwd(cwd, config)
 
 
 # One-shot guard for the config-fallback bridge below.  Purely an
@@ -1817,14 +1971,11 @@ def _get_env_config() -> Dict[str, Any]:
     host_cwd = None
     if env_type == "docker" and mount_docker_cwd:
         docker_cwd_source = os.getenv("TERMINAL_CWD") or _safe_getcwd()
-        candidate = os.path.abspath(os.path.expanduser(docker_cwd_source))
-        if (
-            any(candidate.startswith(p) for p in _HOST_CWD_PREFIXES)
-            or (os.path.isabs(candidate) and os.path.isdir(candidate) and not candidate.startswith(("/workspace", "/root")))
-        ):
-            host_cwd = candidate
+        validated_mount_root = _validated_docker_mount_root(docker_cwd_source)
+        if validated_mount_root is not None:
+            host_cwd = validated_mount_root
             cwd = "/workspace"
-    elif _is_container_backend(env_type) and cwd:
+    if _is_container_backend(env_type) and cwd:
         # Host paths and relative paths that won't work inside containers
         if _is_unusable_container_cwd(cwd) and cwd != default_cwd:
             logger.info("Ignoring TERMINAL_CWD=%r for %s backend "
@@ -1945,9 +2096,157 @@ def _container_config_from_config(config: Dict[str, Any]) -> dict:
     }
 
 
+@dataclass(frozen=True)
+class _TaskEnvironmentPlan:
+    """Resolved task environment inputs, before any sandbox side effect occurs."""
+
+    task_id: Optional[str]
+    effective_task_id: str
+    config: Dict[str, Any]
+    env_type: str
+    image: str
+    cwd: str
+    host_cwd: Optional[str]
+    timeout: int
+    ssh_config: Optional[dict]
+    container_config: Optional[dict]
+    local_config: Optional[dict]
+
+
+def _prepare_task_environment(
+    task_id: Optional[str] = None,
+    *,
+    config: Optional[Dict[str, Any]] = None,
+    host_local: bool = False,
+    prefer_recorded_cwd: bool = False,
+) -> _TaskEnvironmentPlan:
+    """Resolve one task's environment inputs without creating or caching it.
+
+    Every consumer derives image/configuration, mount capability, and container
+    CWD here. ``prefer_recorded_cwd`` preserves the documented lazy-vs-direct
+    precedence difference as an explicit non-goal rather than another copied
+    creation path.
+    """
+    resolved_config = config if config is not None else _get_env_config()
+    env_type = "local" if host_local else resolved_config["env_type"]
+    effective_task_id = _resolve_container_task_id(task_id)
+    if host_local:
+        effective_task_id = f"host-local-{effective_task_id}"
+
+    overrides = resolve_task_overrides(task_id)
+    if env_type == "docker":
+        image = overrides.get("docker_image") or resolved_config["docker_image"]
+    elif env_type == "singularity":
+        image = overrides.get("singularity_image") or resolved_config["singularity_image"]
+    elif env_type == "modal":
+        image = overrides.get("modal_image") or resolved_config["modal_image"]
+    elif env_type == "daytona":
+        image = overrides.get("daytona_image") or resolved_config["daytona_image"]
+    else:
+        image = ""
+
+    recorded_cwd = get_session_cwd(task_id)
+    override_cwd = overrides.get("cwd")
+    selected_cwd = (
+        (recorded_cwd or override_cwd)
+        if prefer_recorded_cwd
+        else (override_cwd or recorded_cwd)
+    ) or resolved_config["cwd"]
+    host_cwd = _resolve_task_host_cwd(resolved_config, task_id)
+    cwd = _resolve_environment_cwd(selected_cwd, resolved_config, host_cwd)
+
+    return _TaskEnvironmentPlan(
+        task_id=task_id,
+        effective_task_id=effective_task_id,
+        config=resolved_config,
+        env_type=env_type,
+        image=image,
+        cwd=cwd,
+        host_cwd=host_cwd,
+        timeout=resolved_config["timeout"],
+        ssh_config=(
+            _ssh_config_from_config(resolved_config)
+            if env_type == "ssh" else None
+        ),
+        container_config=(
+            _container_config_from_config(resolved_config)
+            if _is_container_backend(env_type) else None
+        ),
+        local_config=(
+            {"persistent": resolved_config.get("local_persistent", False)}
+            if env_type == "local" else None
+        ),
+    )
+
+
+def _get_or_create_task_environment(plan: _TaskEnvironmentPlan):
+    """Return the cached task environment or create it from one resolved plan."""
+    _start_cleanup_thread()
+    with _env_lock:
+        existing_key = (
+            plan.effective_task_id
+            if plan.effective_task_id in _active_environments
+            else (
+                plan.task_id
+                if plan.task_id and plan.task_id in _active_environments
+                else None
+            )
+        )
+        if existing_key is not None:
+            _last_activity[existing_key] = time.time()
+            return _active_environments[existing_key]
+
+    with _creation_locks_lock:
+        task_lock = _creation_locks.setdefault(
+            plan.effective_task_id, threading.Lock(),
+        )
+
+    with task_lock:
+        with _env_lock:
+            existing_key = (
+                plan.effective_task_id
+                if plan.effective_task_id in _active_environments
+                else (
+                    plan.task_id
+                    if plan.task_id and plan.task_id in _active_environments
+                    else None
+                )
+            )
+            if existing_key is not None:
+                _last_activity[existing_key] = time.time()
+                return _active_environments[existing_key]
+
+        if plan.env_type == "singularity":
+            _check_disk_usage_warning()
+        logger.info(
+            "Creating new %s environment for task %s...",
+            plan.env_type, plan.effective_task_id[:8],
+        )
+        env = _create_environment(
+            env_type=plan.env_type,
+            image=plan.image,
+            cwd=plan.cwd,
+            timeout=plan.timeout,
+            ssh_config=plan.ssh_config,
+            container_config=plan.container_config,
+            local_config=plan.local_config,
+            task_id=plan.effective_task_id,
+            host_cwd=plan.host_cwd,
+        )
+        with _env_lock:
+            _active_environments[plan.effective_task_id] = env
+            _last_activity[plan.effective_task_id] = time.time()
+        logger.info(
+            "%s environment ready for task %s",
+            plan.env_type, plan.effective_task_id[:8],
+        )
+        return env
+
+
 def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
-                        ssh_config: dict = None, container_config: dict = None,
-                        local_config: dict = None,
+                        ssh_config: Optional[dict] = None,
+                        container_config: Optional[dict] = None,
+                        local_config: Optional[dict] = None,
                         task_id: str = "default",
                         host_cwd: Optional[str] = None):
     """
@@ -2282,72 +2581,22 @@ def ensure_task_env(task_id: Optional[str] = None):
     failure leaves the caller's fail-closed error path intact).
     """
     config = _get_env_config()
-    env_type = config["env_type"]
-    if env_type == "local":
+    if config["env_type"] == "local":
         return None
 
-    effective_task_id = _resolve_container_task_id(task_id)
-
-    # Fast path: already active — mirror terminal_tool and refresh activity.
-    existing = get_active_env(effective_task_id)
-    if existing is not None:
-        with _env_lock:
-            _last_activity[effective_task_id] = time.time()
-        return existing
-
-    overrides = resolve_task_overrides(task_id)
-    if env_type == "docker":
-        image = overrides.get("docker_image") or config["docker_image"]
-    elif env_type == "singularity":
-        image = overrides.get("singularity_image") or config["singularity_image"]
-    elif env_type == "modal":
-        image = overrides.get("modal_image") or config["modal_image"]
-    elif env_type == "daytona":
-        image = overrides.get("daytona_image") or config["daytona_image"]
-    else:
-        image = ""
-
-    _start_cleanup_thread()
-
-    # Per-task creation lock so a concurrent terminal_tool call and this helper
-    # don't each spawn a sandbox for the same task.
-    with _creation_locks_lock:
-        task_lock = _creation_locks.setdefault(effective_task_id, threading.Lock())
-
-    with task_lock:
-        existing = get_active_env(effective_task_id)
-        if existing is not None:
-            return existing
-        try:
-            new_env = _create_environment(
-                env_type=env_type,
-                image=image,
-                cwd=config["cwd"],
-                timeout=config["timeout"],
-                ssh_config=_ssh_config_from_config(config) if env_type == "ssh" else None,
-                container_config=(
-                    _container_config_from_config(config)
-                    if _is_container_backend(env_type) else None
-                ),
-                local_config=None,
-                task_id=effective_task_id,
-                host_cwd=_resolve_task_host_cwd(config, task_id),
-            )
-        except Exception as exc:  # noqa: BLE001 — best-effort bring-up
-            logger.warning(
-                "Lazy %s environment init failed for task %s: %s",
-                env_type, effective_task_id[:8], exc,
-            )
-            return None
-
-        with _env_lock:
-            _active_environments[effective_task_id] = new_env
-            _last_activity[effective_task_id] = time.time()
-        logger.info(
-            "%s environment lazily initialized for task %s",
-            env_type, effective_task_id[:8],
+    plan = _prepare_task_environment(
+        task_id,
+        config=config,
+        prefer_recorded_cwd=True,
+    )
+    try:
+        return _get_or_create_task_environment(plan)
+    except Exception as exc:  # noqa: BLE001 — best-effort bring-up
+        logger.warning(
+            "Lazy %s environment init failed for task %s: %s",
+            plan.env_type, plan.effective_task_id[:8], exc,
         )
-        return new_env
+        return None
 
 
 def is_persistent_env(task_id: str) -> bool:
@@ -2782,38 +3031,24 @@ def _resolve_command_cwd(
     default_cwd: str,
     session_key: Optional[str] = None,
     env_type: Optional[str] = None,
+    host_cwd: Optional[str] = None,
 ) -> str:
-    """Return the cwd for a command. Explicit ``workdir=`` overrides everything.
+    """Return the in-environment CWD for a command.
 
-    Otherwise the session's own cwd RECORD (``get_session_cwd``) wins — it is
-    written after every completed command for this session, so it IS the
-    session's ``cd`` state, with no shared-env ambiguity: another session's
-    ``cd`` lands in another record and can't affect us. A session with no
-    record yet (first command) runs in ``default_cwd`` (config/override cwd),
-    which is also what seeds a fresh environment.
-
-    ``env_type`` makes the record container-aware: on container backends a
-    recorded HOST path (a desktop/TUI surface registering its host workspace
-    via ``register_task_env_overrides`` → ``record_session_cwd``) is unusable
-    inside the sandbox — the shell prefixes every command with ``cd <host
-    path>`` and fails with exit 126. Same guard class as the env-creation
-    sanitizers (#50636, #54447); this is the per-command sibling site.
+    ``workdir`` still has precedence over session state, but on a container
+    backend it cannot bypass the host/relative-path guard.  If this session's
+    host workspace is mounted, host and relative values map to ``/workspace``;
+    otherwise they fall back to the configured in-container default.  Local
+    and legacy callers without an ``env_type`` retain their existing behavior.
     """
-    if workdir:
-        return workdir
-    recorded = get_session_cwd(session_key)
-    if (
-        recorded
-        and _is_container_backend(env_type)
-        and _is_unusable_container_cwd(recorded)
-    ):
-        logger.info(
-            "Ignoring recorded session cwd %r for %s backend "
-            "(host/relative path won't work in sandbox). Using %r instead.",
-            recorded, env_type, default_cwd,
-        )
-        return default_cwd
-    return recorded or default_cwd
+    cwd = workdir or get_session_cwd(session_key) or default_cwd
+    if env_type is None:
+        return cwd
+    return _resolve_environment_cwd(
+        cwd,
+        {"env_type": env_type, "cwd": default_cwd},
+        host_cwd,
+    )
 
 
 def terminal_tool(
@@ -2873,69 +3108,17 @@ def terminal_tool(
                 "status": "error",
             }, ensure_ascii=False)
 
-        # Get configuration
-        config = _get_env_config()
-        env_type = "local" if _host_local else config["env_type"]
-
-        # Use task_id for environment isolation. By default all subagent
-        # task_ids collapse back to "default" so the top-level agent and
-        # every delegate_task child share one container; only task_ids with
-        # a registered env override (RL benchmarks) get isolated sandboxes.
-        effective_task_id = _resolve_container_task_id(task_id)
-        if _host_local:
-            # Hermes-owned control-plane children must run beside the current
-            # interpreter, never inside the model's configured Docker/SSH/etc.
-            # Keep their environment cache separate from the configured backend.
-            effective_task_id = f"host-local-{effective_task_id}"
-
-        # Check per-task overrides (set by environments like TerminalBench2Env)
-        # before falling back to global env var config. ``resolve_task_overrides``
-        # reads the raw task id first then the collapsed container id, so a
-        # CWD-only override (which collapses ``effective_task_id`` to
-        # ``"default"``) is still found under its originating session id while
-        # isolation-keyed RL/benchmark overrides keep resolving as before.
-        overrides = resolve_task_overrides(task_id)
-        
-        # Select image based on env type, with per-task override support
-        if env_type == "docker":
-            image = overrides.get("docker_image") or config["docker_image"]
-        elif env_type == "singularity":
-            image = overrides.get("singularity_image") or config["singularity_image"]
-        elif env_type == "modal":
-            image = overrides.get("modal_image") or config["modal_image"]
-        elif env_type == "daytona":
-            image = overrides.get("daytona_image") or config["daytona_image"]
-        else:
-            image = ""
-
-        cwd = overrides.get("cwd") or get_session_cwd(task_id) or config["cwd"]
-        # Session-scoped mount resolution (single owner: _resolve_task_host_cwd).
-        # Under per-session isolation a fresh session must not inherit the
-        # process-global TERMINAL_CWD mount left behind by a previous session.
-        host_cwd = _resolve_task_host_cwd(config, task_id)
-        # A per-task cwd override (registered by the gateway/TUI for workspace
-        # tracking, or by RL/benchmark envs) wins over config["cwd"] — but
-        # config["cwd"] was already sanitized for container backends in
-        # _get_env_config() while the override is raw. On a container backend a
-        # raw host path (e.g. a Windows desktop session's C:\Users\<user>, or a
-        # POSIX /home/<user>) reaches `docker run -w <host-path>` and the
-        # container fails to start (exit 125). Re-apply the same host/relative
-        # path guard to the *resolved* cwd so the override can't bypass it.
-        # When the host path IS this session's mounted workspace, remap it to
-        # /workspace (where the mount lands) instead of discarding it.
-        # Valid in-container override paths (RL/benchmark sandboxes that set
-        # cwd to /workspace, /root, etc.) are absolute non-host paths and pass
-        # through untouched.
-        if _is_container_backend(env_type) and _is_unusable_container_cwd(cwd):
-            remapped = "/workspace" if host_cwd else config["cwd"]
-            if cwd != remapped:
-                logger.info(
-                    "Remapping host/relative cwd override %r for %s backend "
-                    "(won't exist in sandbox). Using %r instead.",
-                    cwd, env_type, remapped,
-                )
-            cwd = remapped
-        default_timeout = config["timeout"]
+        # Resolve the entire task environment before guard evaluation, without
+        # creating a sandbox.  The same plan later drives the one shared
+        # cache/lock/create primitive used by lazy and remote-code paths.
+        plan = _prepare_task_environment(task_id, host_local=_host_local)
+        config = plan.config
+        env_type = plan.env_type
+        effective_task_id = plan.effective_task_id
+        image = plan.image
+        host_cwd = plan.host_cwd
+        cwd = plan.cwd
+        default_timeout = plan.timeout
 
         # Validate an explicit timeout before it flows into deadline math.
         # ``timeout or default`` silently turns 0 into the default (0 can't mean
@@ -2969,93 +3152,19 @@ def terminal_tool(
                     "status": "error",
                 }, ensure_ascii=False)
 
-        # Start cleanup thread
-        _start_cleanup_thread()
-
-        # Get or create environment.
-        # Use a per-task creation lock so concurrent tool calls for the same
-        # task_id wait for the first one to finish creating the sandbox,
-        # instead of each creating their own (wasting Modal resources).
-        env: Any = None
-        with _env_lock:
-            # Prefer the collapsed container id, but fall back to an env cached
-            # under the raw task_id. Per-session surfaces (ACP/gateway/dashboard)
-            # with a CWD-only override collapse to "default" for container
-            # sharing, yet an env may already be cached under the originating
-            # task_id; honor it instead of spawning a duplicate.
-            _existing_key = (
-                effective_task_id if effective_task_id in _active_environments
-                else (task_id if task_id and task_id in _active_environments else None)
+        try:
+            env = _get_or_create_task_environment(
+                replace(plan, timeout=effective_timeout),
             )
-            if _existing_key is not None:
-                _last_activity[_existing_key] = time.time()
-                env = _active_environments[_existing_key]
-                needs_creation = False
-            else:
-                needs_creation = True
-
-        if needs_creation:
-            # Per-task lock: only one thread creates the sandbox, others wait
-            with _creation_locks_lock:
-                if effective_task_id not in _creation_locks:
-                    _creation_locks[effective_task_id] = threading.Lock()
-                task_lock = _creation_locks[effective_task_id]
-
-            with task_lock:
-                # Double-check after acquiring the per-task lock
-                with _env_lock:
-                    _existing_key = (
-                        effective_task_id if effective_task_id in _active_environments
-                        else (task_id if task_id and task_id in _active_environments else None)
-                    )
-                    if _existing_key is not None:
-                        _last_activity[_existing_key] = time.time()
-                        env = _active_environments[_existing_key]
-                        needs_creation = False
-
-                if needs_creation:
-                    if env_type == "singularity":
-                        _check_disk_usage_warning()
-                    logger.info("Creating new %s environment for task %s...", env_type, effective_task_id[:8])
-                    try:
-                        ssh_config = _ssh_config_from_config(config) if env_type == "ssh" else None
-                        container_config = (
-                            _container_config_from_config(config)
-                            if _is_container_backend(env_type) else None
-                        )
-
-                        local_config = None
-                        if env_type == "local":
-                            local_config = {
-                                "persistent": config.get("local_persistent", False),
-                            }
-
-                        new_env = _create_environment(
-                            env_type=env_type,
-                            image=image,
-                            cwd=cwd,
-                            timeout=effective_timeout,
-                            ssh_config=ssh_config,
-                            container_config=container_config,
-                            local_config=local_config,
-                            task_id=effective_task_id,
-                            host_cwd=host_cwd,
-                        )
-                    except ImportError as e:
-                        return json.dumps({
-                            "output": "",
-                            "exit_code": -1,
-                            "error": _redact_terminal_error_text(
-                                f"Terminal tool disabled: environment creation failed ({e})"
-                            ),
-                            "status": "disabled"
-                        }, ensure_ascii=False)
-
-                    with _env_lock:
-                        _active_environments[effective_task_id] = new_env
-                        _last_activity[effective_task_id] = time.time()
-                        env = new_env
-                    logger.info("%s environment ready for task %s", env_type, effective_task_id[:8])
+        except ImportError as e:
+            return json.dumps({
+                "output": "",
+                "exit_code": -1,
+                "error": _redact_terminal_error_text(
+                    f"Terminal tool disabled: environment creation failed ({e})"
+                ),
+                "status": "disabled"
+            }, ensure_ascii=False)
 
         assert env is not None  # all creation failure paths return above
 
@@ -3102,14 +3211,18 @@ def terminal_tool(
                     ),
                     "status": "error",
                 }, ensure_ascii=False)
-            guard_cwd_base = get_session_cwd(session_key)
-            if guard_cwd_base is None:
-                guard_cwd_base = getattr(env, "cwd", None) or cwd
+            # Resolve relative script paths from the live environment CWD—the
+            # same base execution will use. A pre-creation task plan can be
+            # stale after a session changed directory.
+            environment_cwd = getattr(env, "cwd", None)
+            if not isinstance(environment_cwd, str) or not environment_cwd:
+                environment_cwd = cwd
             guard_cwd = _resolve_command_cwd(
                 workdir=workdir,
-                default_cwd=guard_cwd_base,
+                default_cwd=environment_cwd,
                 session_key=session_key,
                 env_type=env_type,
+                host_cwd=host_cwd,
             )
 
             def _read_script_in_env(script_path: str) -> Optional[str]:
@@ -3241,7 +3354,7 @@ def terminal_tool(
         if not force:
             approval = _check_all_guards(
                 command, env_type,
-                has_host_access=_docker_has_host_access(config),
+                has_host_access=_docker_has_host_access(config, host_cwd),
             )
             if not approval["approved"]:
                 # Check if this is an approval_required (gateway ask mode)
@@ -3303,6 +3416,7 @@ def terminal_tool(
                 default_cwd=cwd,
                 session_key=session_key,
                 env_type=env_type,
+                host_cwd=host_cwd,
             )
             try:
                 if env_type == "local":
@@ -3578,6 +3692,7 @@ def terminal_tool(
                         default_cwd=cwd,
                         session_key=session_key,
                         env_type=env_type,
+                        host_cwd=host_cwd,
                     )
                     execute_kwargs = {
                         "timeout": effective_timeout,

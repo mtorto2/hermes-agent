@@ -18,6 +18,7 @@ import pytest
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent
 from gateway.session import SessionEntry, SessionSource, build_session_key
+from agent.light_cues import LightCueEvent
 
 
 def _make_source() -> SessionSource:
@@ -47,6 +48,7 @@ def _make_runner():
     # No send_slash_confirm override -> button render returns None,
     # _request_slash_confirm falls back to text path.
     adapter.send_slash_confirm = AsyncMock(return_value=None)
+    adapter.emit_light_cue_for_chat = AsyncMock(return_value=True)
     runner.adapters = {Platform.TELEGRAM: adapter}
 
     session_entry = SessionEntry(
@@ -78,6 +80,59 @@ def _make_runner():
 
 
 @pytest.mark.asyncio
+async def test_gate_off_runs_execute_immediately(monkeypatch):
+    """When approvals.destructive_slash_confirm is False, the destructive
+    action runs immediately without prompting."""
+    runner = _make_runner()
+    runner._read_user_config = lambda: {"approvals": {"destructive_slash_confirm": False}}
+    runner._session_key_for_source = lambda src: build_session_key(src)
+
+    sentinel = "✨ Session reset!"
+    execute = AsyncMock(return_value=sentinel)
+
+    result = await runner._maybe_confirm_destructive_slash(
+        event=_make_event("/new"),
+        command="new",
+        title="/new",
+        detail="Discards history.",
+        execute=execute,
+    )
+
+    execute.assert_awaited_once()
+    assert result == sentinel
+
+
+@pytest.mark.asyncio
+async def test_gate_on_text_fallback_returns_prompt_without_executing(monkeypatch):
+    """When the gate is on and the adapter has no button UI, the user gets
+    a text prompt back and the destructive action is NOT yet run."""
+    runner = _make_runner()
+    runner._read_user_config = lambda: {"approvals": {"destructive_slash_confirm": True}}
+    runner._session_key_for_source = lambda src: build_session_key(src)
+
+    execute = AsyncMock(return_value="should not run yet")
+
+    result = await runner._maybe_confirm_destructive_slash(
+        event=_make_event("/new"),
+        command="new",
+        title="/new",
+        detail="Discards history.",
+        execute=execute,
+    )
+
+    execute.assert_not_awaited()
+    emit_assert = getattr(
+        runner.adapters[Platform.TELEGRAM].emit_light_cue_for_chat,
+        "assert_awaited_once_with",
+    )
+    emit_assert("c1", LightCueEvent.HUMAN_INTERVENTION)
+    assert isinstance(result, str)
+    assert "Confirm /new" in result
+    assert "Approve Once" in result
+    assert "Cancel" in result
+
+
+@pytest.mark.asyncio
 async def test_gate_on_pending_confirm_registered(monkeypatch):
     """When the gate is on, a pending slash-confirm entry is registered for
     the session — the user's /approve reply will resolve it."""
@@ -102,6 +157,81 @@ async def test_gate_on_pending_confirm_registered(monkeypatch):
     assert pending is not None
     assert pending["command"] == "new"
     _slash_confirm_mod.clear(session_key)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("command", ["/new", "/reset"])
+async def test_busy_new_confirmation_defers_interrupt_and_reset(command):
+    """An active-session /new or /reset keeps the current turn until approved."""
+    from gateway.run import _INTERRUPT_REASON_RESET
+    from tools import slash_confirm as _slash_confirm_mod
+
+    runner = _make_runner()
+    runner._read_user_config = lambda: {"approvals": {"destructive_slash_confirm": True}}
+    source = _make_source()
+    session_key = build_session_key(source)
+    runner._session_key_for_source = lambda _source: session_key
+    runner._interrupt_and_clear_session = AsyncMock()
+    runner._handle_reset_command = AsyncMock(return_value="✨ Session reset!")
+    _slash_confirm_mod.clear(session_key)
+
+    event = MessageEvent(text=command, source=source, message_id="m-busy")
+    result = await runner._busy_new_command(event, session_key, source)
+
+    assert isinstance(result, str)
+    assert "Confirm /new" in result
+    runner._interrupt_and_clear_session.assert_not_awaited()
+    runner._handle_reset_command.assert_not_awaited()
+
+    pending = _slash_confirm_mod.get_pending(session_key)
+    assert pending is not None
+    resolved = await _slash_confirm_mod.resolve(session_key, pending["confirm_id"], "once")
+
+    assert resolved == "✨ Session reset!"
+    runner._interrupt_and_clear_session.assert_awaited_once_with(
+        session_key,
+        source,
+        interrupt_reason=_INTERRUPT_REASON_RESET,
+        invalidation_reason="new_command",
+    )
+    runner._handle_reset_command.assert_awaited_once_with(event)
+    _slash_confirm_mod.clear(session_key)
+
+
+@pytest.mark.asyncio
+async def test_resolving_confirmation_restores_working_light_cue():
+    """A button/text resolution must clear the human-intervention cue.
+
+    The callback resolves through tools.slash_confirm rather than the original
+    inbound request method, so the wrapper registered by the gateway owns the
+    terminal Agent Lights cue.
+    """
+    from tools import slash_confirm as _slash_confirm_mod
+
+    runner = _make_runner()
+    runner._read_user_config = lambda: {"approvals": {"destructive_slash_confirm": True}}
+    session_key = build_session_key(_make_source())
+    runner._session_key_for_source = lambda source: session_key
+    _slash_confirm_mod.clear(session_key)
+    execute = AsyncMock(return_value="should not run")
+
+    await runner._maybe_confirm_destructive_slash(
+        event=_make_event("/new"),
+        command="new",
+        title="/new",
+        detail="Discards history.",
+        execute=execute,
+    )
+
+    pending = _slash_confirm_mod.get_pending(session_key)
+    assert pending is not None
+    await _slash_confirm_mod.resolve(session_key, pending["confirm_id"], "cancel")
+
+    execute.assert_not_awaited()
+    assert runner.adapters[Platform.TELEGRAM].emit_light_cue_for_chat.await_args_list == [
+        (("c1", LightCueEvent.HUMAN_INTERVENTION), {}),
+        (("c1", LightCueEvent.WORKING), {}),
+    ]
 
 
 @pytest.mark.asyncio

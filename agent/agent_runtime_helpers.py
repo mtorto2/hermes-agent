@@ -28,6 +28,7 @@ import logging
 import re
 import threading
 import time
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -43,7 +44,9 @@ from agent.prompt_builder import format_steer_marker
 from agent.tool_dispatch_helpers import _trajectory_normalize_msg, make_tool_result_message
 from agent.trajectory import convert_scratchpad_to_think
 from agent.credential_pool import (
+    AUTH_TYPE_API_KEY,
     STATUS_EXHAUSTED,
+    api_key_fallback_requires_approval,
     credential_pool_matches_provider,
     resolve_runtime_pool_key,
 )
@@ -105,6 +108,131 @@ def _ra():
     """Lazy ``run_agent`` reference for test-patch routing."""
     import run_agent
     return run_agent
+
+
+def _approve_api_key_fallback(agent, entry: Any, *, status_code: Optional[int]) -> bool:
+    """Ask before a pool rotation would spend through a billable API key.
+
+    The approval utility owns the live surface: prompt_toolkit in the local TUI
+    and a pending approval message in a gateway conversation. It fails closed
+    when neither exists, so a background or cron run cannot silently consume
+    API credits after an OAuth entitlement failure.
+    """
+    provider = str(getattr(agent, "provider", "") or "").strip().lower()
+    if (
+        getattr(entry, "auth_type", None) != AUTH_TYPE_API_KEY
+        or not api_key_fallback_requires_approval(provider)
+    ):
+        return True
+
+    try:
+        from tools.approval import request_elicitation_consent
+
+        decision = request_elicitation_consent(
+            message=f"{provider} API-key fallback",
+            description=(
+                f"The {provider} OAuth credential could not serve this request "
+                f"(HTTP {status_code or 'unknown'}). Continuing would use the "
+                "configured API key and may consume billable API credits. "
+                "Approve this one fallback request?"
+            ),
+            surface="credential-api-key-fallback",
+        )
+    except Exception as exc:  # Payment gates must fail closed.
+        logger.error("Could not request %s API-key fallback approval: %s", provider, exc)
+        return False
+
+    if decision == "accept":
+        logger.info("%s API-key fallback explicitly approved for this request", provider)
+        return True
+
+    logger.warning("%s API-key fallback blocked: no explicit approval", provider)
+    return False
+
+
+# Credential rotation changes these fields; preserve clients themselves so the
+# approved request cannot retire/close the safe runtime we must return to.
+_API_KEY_FALLBACK_FIELDS = (
+    "api_key", "base_url", "_credential_pool_entry_id", "_client_kwargs",
+    "client", "_anthropic_client", "_anthropic_api_key",
+    "_anthropic_base_url", "_is_anthropic_oauth",
+)
+
+
+def restore_api_key_fallback(agent) -> None:
+    """Revoke a one-request grant before any further inference or user turn."""
+    snapshot = getattr(agent, "_api_key_fallback_restore", None)
+    if not isinstance(snapshot, dict):
+        return
+    clients = {name: getattr(agent, name, None)
+               for name in ("client", "_anthropic_client")}
+    for name, value in snapshot.items():
+        setattr(agent, name, value)
+    agent._api_key_fallback_restore = None
+    for name, client in clients.items():
+        if client is None or client is snapshot.get(name):
+            continue
+        try:
+            if name == "client":
+                agent._retire_shared_openai_client(client, reason="api_key_fallback_complete")
+            else:
+                client.close()
+        except Exception:
+            logger.debug("one-request fallback client cleanup failed", exc_info=True)
+
+
+@contextmanager
+def api_key_fallback_attempt(agent):
+    """Spend a grant on one dispatch, retaining only its failed identity.
+
+    This boundary must unwind before the streaming helper handles retries.
+    A later safe dispatch supersedes any failure that was handled internally.
+    """
+    agent.__dict__.pop("_api_key_fallback_failed_identity", None)
+    snapshot = getattr(agent, "_api_key_fallback_restore", None)
+    identity = (
+        getattr(agent, "api_key", None),
+        getattr(agent, "_credential_pool_entry_id", None),
+    )
+    try:
+        yield
+    except BaseException:
+        if (
+            isinstance(snapshot, dict)
+            and getattr(agent, "_api_key_fallback_restore", None) is snapshot
+        ):
+            agent._api_key_fallback_failed_identity = identity
+        raise
+    finally:
+        # An interrupted worker can outlive its turn. It must not restore a
+        # newer grant after the outer defensive cleanup revoked its own.
+        if (
+            isinstance(snapshot, dict)
+            and getattr(agent, "_api_key_fallback_restore", None) is snapshot
+        ):
+            restore_api_key_fallback(agent)
+
+
+def _swap_pool_credential(agent, entry) -> None:
+    """Install an approved API key temporarily; ordinary rotations stay sticky."""
+    if (
+        getattr(entry, "auth_type", None) != AUTH_TYPE_API_KEY
+        or not api_key_fallback_requires_approval(getattr(agent, "provider", ""))
+    ):
+        agent._swap_credential(entry)
+        return
+    restore_api_key_fallback(agent)
+    snapshot = {name: getattr(agent, name, None) for name in _API_KEY_FALLBACK_FIELDS}
+    if isinstance(snapshot["_client_kwargs"], dict):
+        snapshot["_client_kwargs"] = dict(snapshot["_client_kwargs"])
+    agent._api_key_fallback_restore = snapshot
+    agent.client = None
+    agent._anthropic_client = None
+    try:
+        agent._swap_credential(entry)
+    except BaseException:
+        restore_api_key_fallback(agent)
+        raise
 
 
 AGENT_RUNTIME_POST_HOOK_TOOL_NAMES = frozenset(
@@ -1117,6 +1245,7 @@ def recover_with_credential_pool(
     instead of the one-hour billing bench — the same 400 can be a
     content-filter rejection that leaves the credential healthy.
     """
+    failed_identity = agent.__dict__.pop("_api_key_fallback_failed_identity", None)
     pool = agent._credential_pool
     if pool is None:
         return False, has_retried_429
@@ -1167,6 +1296,8 @@ def recover_with_credential_pool(
     # carries no key at all.
     _api_key_hint = getattr(agent, "api_key", None) or None
     _raw_credential_id = getattr(agent, "_credential_pool_entry_id", None)
+    if failed_identity is not None:
+        _api_key_hint, _raw_credential_id = failed_identity
     _credential_id = (
         _raw_credential_id
         if isinstance(_raw_credential_id, str) and _raw_credential_id
@@ -1238,13 +1369,15 @@ def recover_with_credential_pool(
         # leaving this recovery pool without ``current_id``. Match the key
         # that actually failed instead of quarantining a different account.
         next_entry = _rotate_failed_credential(rotate_status)
-        if next_entry is not None:
+        if next_entry is not None and _approve_api_key_fallback(
+            agent, next_entry, status_code=rotate_status
+        ):
             _ra().logger.info(
                 "Credential %s (billing) — rotated to pool entry %s",
                 rotate_status,
                 getattr(next_entry, "id", "?"),
             )
-            agent._swap_credential(next_entry)
+            _swap_pool_credential(agent, next_entry)
             return True, False
         return False, has_retried_429
 
@@ -1276,13 +1409,15 @@ def recover_with_credential_pool(
             )
             rotate_status = status_code if status_code is not None else 429
             next_entry = _rotate_failed_credential(rotate_status)
-            if next_entry is not None:
+            if next_entry is not None and _approve_api_key_fallback(
+                agent, next_entry, status_code=rotate_status
+            ):
                 _ra().logger.info(
                     "Credential %s (rate limit, pre-exhausted) — rotated to pool entry %s",
                     rotate_status,
                     getattr(next_entry, "id", "?"),
                 )
-                agent._swap_credential(next_entry)
+                _swap_pool_credential(agent, next_entry)
                 return True, False
             return False, True
 
@@ -1296,17 +1431,21 @@ def recover_with_credential_pool(
                 or "usage limit reached" in context_message
                 or "usage limit has been reached" in context_message
             )
-        if not has_retried_429 and not usage_limit_reached:
+        # A failed one-request grant cannot authorize another fallback attempt.
+        # Exhaust that exact identity even on its first ordinary 429.
+        if failed_identity is None and not has_retried_429 and not usage_limit_reached:
             return False, True
         rotate_status = status_code if status_code is not None else 429
         next_entry = _rotate_failed_credential(rotate_status)
-        if next_entry is not None:
+        if next_entry is not None and _approve_api_key_fallback(
+            agent, next_entry, status_code=rotate_status
+        ):
             _ra().logger.info(
                 "Credential %s (rate limit) — rotated to pool entry %s",
                 rotate_status,
                 getattr(next_entry, "id", "?"),
             )
-            agent._swap_credential(next_entry)
+            _swap_pool_credential(agent, next_entry)
             return True, False
         return False, True
 
@@ -1407,13 +1546,15 @@ def recover_with_credential_pool(
         # The failed entry is already marked exhausted by the refresh attempt.
         rotate_status = status_code if status_code is not None else 401
         next_entry = _rotate_failed_credential(rotate_status)
-        if next_entry is not None:
+        if next_entry is not None and _approve_api_key_fallback(
+            agent, next_entry, status_code=rotate_status
+        ):
             _ra().logger.info(
                 "Credential %s (auth refresh failed) — rotated to pool entry %s",
                 rotate_status,
                 getattr(next_entry, "id", "?"),
             )
-            agent._swap_credential(next_entry)
+            _swap_pool_credential(agent, next_entry)
             return True, False
 
     return False, has_retried_429
@@ -3713,6 +3854,7 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 enabled_tools=list(agent.valid_tool_names) if agent.valid_tool_names else None,
                 skip_pre_tool_call_hook=True,
                 skip_tool_request_middleware=True,
+                agent=agent,
                 enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                 disabled_toolsets=getattr(agent, "disabled_toolsets", None),
                 tool_request_middleware_trace=list(_tool_middleware_trace),

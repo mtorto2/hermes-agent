@@ -12,6 +12,9 @@ path retained as a compatibility fallback.
 import threading
 import time
 import types
+from unittest.mock import Mock
+
+import pytest
 
 import tools.async_delegation as ad
 from tui_gateway import server
@@ -617,6 +620,37 @@ def test_busy_image_prompts_keep_b_and_c_attachments_in_submission_order(monkeyp
 
 # ── _drain_queued_prompt ───────────────────────────────────────────────────
 
+@pytest.mark.parametrize("compute_host", [False, True])
+def test_drain_waits_for_settling_barrier_before_claiming_queue(monkeypatch, compute_host):
+    dispatch = Mock(return_value={"result": {"status": "started"}})
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda _s: compute_host)
+    monkeypatch.setattr(server, "_run_prompt_submit", dispatch)
+    monkeypatch.setattr(server, "_submit_prompt_to_compute_host", dispatch)
+    head = {"text": "C", "transport": "ws-c"}
+    tail = {"text": "D", "transport": "ws-d"}
+    session = _session(running=False, _turn_settling=True, transport="ws-b",
+                       queued_prompt=head, queued_prompts=[tail])
+
+    assert server._drain_queued_prompt("delayed-a", "sid", session) is False
+    dispatch.assert_not_called()
+    assert session["running"] is False
+    assert session["_turn_settling"] is True
+    assert session["transport"] == "ws-b"
+    assert session["queued_prompt"] is head
+    assert session["queued_prompts"] == [tail]
+
+    with session["history_lock"]:
+        session.pop("_turn_settling")
+    assert server._drain_queued_prompt("current-b", "sid", session) is True
+    dispatch.assert_called_once_with(
+        "current-b", "sid", session, "C", queued_prompt_generation=0,
+    )
+    assert session["running"] is True
+    assert session["transport"] == "ws-c"
+    assert session["queued_prompt"] is tail
+    assert not session.get("queued_prompts")
+
+
 def test_drain_fires_queued_prompt_and_claims_running(monkeypatch):
     fired = {}
     monkeypatch.setattr(
@@ -780,3 +814,63 @@ def test_drain_continues_with_later_queued_prompt_after_dispatch_failure(monkeyp
     assert session["queued_prompt"] is None
     assert session.get("queued_prompts") is None
 
+
+
+@pytest.mark.parametrize("mode", ["interrupt", "steer", "queue"])
+@pytest.mark.parametrize("queued", [False, True])
+@pytest.mark.parametrize("image_paths", [[], ["/tmp/successor.png"]])
+def test_busy_helper_queues_during_idle_publication(monkeypatch, mode, queued, image_paths):
+    monkeypatch.setattr(server, "_load_busy_input_mode", lambda: mode)
+    agent = types.SimpleNamespace(
+        _supports_active_turn_redirect=True,
+        redirect=Mock(return_value=True),
+        steer=Mock(return_value=True),
+        interrupt=Mock(),
+    )
+    interrupt = Mock()
+    monkeypatch.setattr(server, "_interrupt_busy_session", interrupt)
+    session = _session(agent=agent, running=False, _turn_settling=True,
+                       attached_images=list(image_paths))
+
+    response = server._handle_busy_submit(
+        "r1", "sid", session, "successor", "ws-1", queued=queued,
+    )
+
+    assert response is not None
+    assert response["result"]["status"] == "queued"
+    expected = {"text": "successor", "transport": "ws-1"}
+    if image_paths:
+        expected["image_paths"] = image_paths
+    assert session["queued_prompt"] == expected
+    assert session["attached_images"] == []
+    assert session["running"] is False
+    assert session["_turn_settling"] is True
+    agent.redirect.assert_not_called()
+    agent.steer.assert_not_called()
+    agent.interrupt.assert_not_called()
+    interrupt.assert_not_called()
+
+
+@pytest.mark.parametrize("running,settling", [(True, False), (False, True)])
+def test_hosted_submit_rejects_busy_or_settling_session(monkeypatch, running, settling):
+    session = _session(source="bot_room", running=running, _turn_settling=settling)
+    monkeypatch.setitem(server._sessions, "hosted-busy", session)
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda *args: False)
+    run = Mock()
+    monkeypatch.setattr(server, "_run_prompt_submit", run)
+
+    response = server._methods["prompt.submit"]("r1", {
+        "session_id": "hosted-busy",
+        "text": "successor",
+        "_hosted_task": {
+            "room_id": "room", "task_id": "task", "thread_id": "thread",
+            "turn_id": "turn", "execution_generation": 1,
+        },
+        "_hosted_terminal_callback": lambda *args: None,
+    })
+
+    assert response["error"]["code"] == 4091
+    assert session["running"] is running
+    assert session["_turn_settling"] is settling
+    assert session.get("queued_prompt") is None
+    run.assert_not_called()

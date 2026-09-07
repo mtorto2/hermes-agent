@@ -3753,6 +3753,7 @@ class AIAgent:
                     state[path] = {
                         "tool": tool_name,
                         "error_preview": preview,
+                        "stat_fingerprint": self._file_mutation_stat_fingerprint(path),
                     }
         else:
             for path in targets:
@@ -3827,6 +3828,32 @@ class AIAgent:
             return text
         return cls._FOOTER_PATH_RE.sub(lambda m: f"`{m.group(0)}`", text)
 
+    @staticmethod
+    def _file_mutation_stat_fingerprint(path: str) -> tuple[int, int] | None:
+        """Return a lightweight on-disk fingerprint for verifier targets.
+
+        The verifier primarily tracks ``patch`` / ``write_file`` tool results,
+        but a later approved ``terminal`` / ``execute_code`` call can still
+        repair the same file.  Capturing the target's size + nanosecond mtime
+        lets the final footer suppress stale failures when the file did change
+        after the failed file-tool attempt.
+        """
+        try:
+            st = os.stat(os.path.expanduser(str(path)))
+            return (int(st.st_mtime_ns), int(st.st_size))
+        except Exception:
+            return None
+
+    @classmethod
+    def _file_mutation_failure_still_current(cls, path: str, info: Dict[str, Any]) -> bool:
+        """Return True when a recorded failed mutation still looks current."""
+        before = info.get("stat_fingerprint") if isinstance(info, dict) else None
+        if before is None:
+            # Historical/test-constructed entries lack a baseline; keep the
+            # conservative original behavior and report them.
+            return True
+        return cls._file_mutation_stat_fingerprint(path) == before
+
     @classmethod
     def _format_file_mutation_failure_footer(cls, failed: Dict[str, Dict[str, Any]]) -> str:
         """Render the per-turn failed-mutation dict as a user-facing footer.
@@ -3843,14 +3870,21 @@ class AIAgent:
         """
         if not failed:
             return ""
+        current_failed = {
+            path: info
+            for path, info in failed.items()
+            if cls._file_mutation_failure_still_current(path, info)
+        }
+        if not current_failed:
+            return ""
         lines = [
             "⚠️ File-mutation verifier: "
-            f"{len(failed)} file(s) were NOT modified this turn despite any "
+            f"{len(current_failed)} file(s) were NOT modified this turn despite any "
             "wording above that may suggest otherwise. Run `git status` or "
             "`read_file` to confirm."
         ]
         shown = 0
-        for path, info in failed.items():
+        for path, info in current_failed.items():
             if shown >= 10:
                 break
             preview = (info.get("error_preview") or "").strip()
@@ -3860,7 +3894,7 @@ class AIAgent:
             else:
                 lines.append(f"  • `{path}` — [{tool}] failed")
             shown += 1
-        remaining = len(failed) - shown
+        remaining = len(current_failed) - shown
         if remaining > 0:
             lines.append(f"  • … and {remaining} more")
         # Neutralize any path the preview text echoed (the bullet path is
@@ -8701,6 +8735,9 @@ class AIAgent:
         moa_config: Optional[dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
+        from agent.agent_runtime_helpers import restore_api_key_fallback
+
+        restore_api_key_fallback(self)
         # A review deliberately shares this agent's session_id for prompt-cache
         # parity. Fence review startup or interrupt an admitted request, then
         # await that request's exit before opening any live-turn Relay or task
@@ -9114,6 +9151,7 @@ class AIAgent:
                 finish_task_run(**task_context, error=exc)
             raise
         finally:
+            restore_api_key_fallback(self)
             try:
                 if relay_turn is not None:
                     relay_runtime.SESSION_COORDINATOR.end_turn(

@@ -170,6 +170,141 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
 # Task creation + status inference
 # ---------------------------------------------------------------------------
 
+def test_create_task_no_parents_is_ready(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="ship it", assignee="alice")
+        t = kb.get_task(conn, tid)
+    assert t is not None
+    assert t.status == "ready"
+    assert t.assignee == "alice"
+    assert t.workspace_kind == "scratch"
+
+
+def test_create_task_with_parent_is_todo_until_parent_done(kanban_home):
+    with kb.connect() as conn:
+        p = kb.create_task(conn, title="parent")
+        c = kb.create_task(conn, title="child", parents=[p])
+        assert kb.get_task(conn, c).status == "todo"
+        kb.complete_task(conn, p, result="ok")
+        assert kb.get_task(conn, c).status == "ready"
+
+
+def test_create_task_unknown_parent_errors(kanban_home):
+    with kb.connect() as conn, pytest.raises(ValueError, match="unknown parent"):
+        kb.create_task(conn, title="orphan", parents=["t_ghost"])
+
+
+def test_workspace_kind_validation(kanban_home):
+    with kb.connect() as conn, pytest.raises(ValueError, match="workspace_kind"):
+        kb.create_task(conn, title="bad ws", workspace_kind="cloud")
+
+
+def test_create_task_persists_worktree_branch_name(kanban_home, tmp_path):
+    target = tmp_path / ".worktrees" / "t6-wire"
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="ship worktree",
+            workspace_kind="worktree",
+            workspace_path=str(target),
+            branch_name=" wt/t6-wire ",
+        )
+        task = kb.get_task(conn, tid)
+        events = kb.list_events(conn, tid)
+        context = kb.build_worker_context(conn, tid)
+
+    assert task.branch_name == "wt/t6-wire"
+    assert events[0].payload["branch_name"] == "wt/t6-wire"
+    assert "Branch:   wt/t6-wire" in context
+
+
+def test_complete_task_normalizes_run_usage_and_writes_ledger(kanban_home, monkeypatch):
+    """Completed runs should persist dashboard-ready usage metadata and a JSONL receipt."""
+    import json
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="measure me", assignee="worker")
+        kb.claim_task(conn, tid)
+        run = kb.active_run(conn, tid)
+        conn.execute("UPDATE task_runs SET started_at = ? WHERE id = ?", (100, run.id))
+        conn.commit()
+
+        monkeypatch.setattr(kb.time, "time", lambda: 130)
+        assert kb.complete_task(
+            conn,
+            tid,
+            summary="done",
+            metadata={
+                "kept": "yes",
+                "run_usage": {
+                    "provider": "openrouter",
+                    "model": "anthropic/claude-sonnet-4",
+                    "prompt_tokens": "10",
+                    "completion_tokens": 5,
+                    "estimated_cost_usd": "0.0123",
+                    "cost_status": "estimated",
+                    "cost_source": "pricing_table",
+                },
+            },
+        )
+        completed = kb.latest_run(conn, tid)
+
+    assert completed.metadata["kept"] == "yes"
+    usage = completed.metadata["run_usage"]
+    assert usage["provider"] == "openrouter"
+    assert usage["model"] == "anthropic/claude-sonnet-4"
+    assert usage["runtime_seconds"] == 30
+    assert usage["runtime_status"] == "ok"
+    assert usage["prompt_tokens"] == 10
+    assert usage["completion_tokens"] == 5
+    assert usage["total_tokens"] == 15
+    assert usage["estimated_cost_usd"] == 0.0123
+    assert usage["cost_status"] == "estimated"
+    assert usage["cost_source"] == "pricing_table"
+
+    ledger = kb.worker_logs_dir() / "run_usage.jsonl"
+    assert ledger.exists()
+    line = ledger.read_text().strip().splitlines()[-1]
+    receipt = json.loads(line)
+    assert receipt["task_id"] == tid
+    assert receipt["run_id"] == completed.id
+    assert receipt["run_usage"]["total_tokens"] == 15
+
+
+def test_format_run_usage_summary_for_cli_surfaces():
+    from hermes_cli import kanban
+
+    text = kanban._format_run_usage_summary({
+        "provider": "openrouter",
+        "model": "anthropic/claude-sonnet-4",
+        "runtime_seconds": 30,
+        "prompt_tokens": 10,
+        "completion_tokens": 5,
+        "cache_read_tokens": 2,
+        "cache_write_tokens": 1,
+        "total_tokens": 18,
+        "estimated_cost_usd": 0.0123,
+        "cost_status": "estimated",
+    })
+
+    assert "openrouter" in text
+    assert "anthropic/claude-sonnet-4" in text
+    assert "30s" in text
+    assert "tokens 18" in text
+    assert "in 10" in text
+    assert "out 5" in text
+    assert "cache r/w 2/1" in text
+    assert "$0.0123 estimated" in text
+
+
+def test_branch_name_requires_worktree_workspace(kanban_home):
+    with kb.connect() as conn, pytest.raises(ValueError, match="worktree"):
+        kb.create_task(
+            conn,
+            title="bad branch",
+            workspace_kind="scratch",
+            branch_name="wt/bad",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -522,6 +657,36 @@ def test_delete_task_removes_task_and_cascades(kanban_home):
 
 
 
+def test_complete_task_keeps_scratch_workspace_outside_root(kanban_home, tmp_path):
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    marker = project_dir / "keep.txt"
+    marker.write_text("do not delete")
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="legacy explicit scratch path",
+            workspace_kind="scratch",
+            workspace_path=str(project_dir),
+        )
+        assert kb.complete_task(conn, tid)
+
+    assert project_dir.is_dir()
+    assert marker.read_text() == "do not delete"
+
+
+def test_dir_workspace_honors_given_path(kanban_home, tmp_path):
+    target = tmp_path / "my-vault"
+    with kb.connect() as conn:
+        t = kb.create_task(
+            conn, title="biz", workspace_kind="dir", workspace_path=str(target)
+        )
+        task = kb.get_task(conn, t)
+        assert task is not None
+        ws = kb.resolve_workspace(task)
+    assert ws == target
+    assert ws.exists()
 
 
 
@@ -568,6 +733,346 @@ def test_worktree_workspace_explicit_target_materializes_linked_worktree(kanban_
     ).stdout
     assert f"worktree {target}" in listed
     assert f"branch refs/heads/{branch}" in listed
+
+
+def test_dispatch_worktree_task_persists_materialized_workspace_and_branch(kanban_home, tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    kb.create_board("worktree-board", default_workdir=str(repo))
+    import hermes_cli.profiles as profiles
+    monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
+    spawns: list[tuple[str, str]] = []
+
+    def fake_spawn(task, workspace, board=None):
+        spawns.append((task.id, workspace))
+        return None
+
+    with kb.connect(board="worktree-board") as conn:
+        tid = kb.create_task(
+            conn,
+            title="ship",
+            assignee="sentinel",
+            workspace_kind="worktree",
+            board="worktree-board",
+        )
+        result = kb.dispatch_once(conn, spawn_fn=fake_spawn, board="worktree-board")
+        task = kb.get_task(conn, tid)
+
+    expected = repo / ".worktrees" / tid
+    assert result.spawned == [(tid, "sentinel", str(expected))]
+    assert spawns == [(tid, str(expected))]
+    assert task is not None
+    assert task.workspace_path == str(expected)
+    assert task.branch_name == f"wt/{tid}"
+    listed = subprocess.run(
+        ["git", "-C", str(repo), "worktree", "list", "--porcelain"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert f"worktree {expected}" in listed
+    assert f"branch refs/heads/wt/{tid}" in listed
+
+
+def test_dispatch_skips_only_assignees_rejected_by_the_admission_predicate(kanban_home):
+    """A profile-scoped pause must leave that task ready without blocking peers."""
+    (kanban_home / "profiles" / "worker").mkdir(parents=True)
+    spawned: list[str] = []
+
+    with kb.connect() as conn:
+        default_task = kb.create_task(conn, title="default", assignee="default")
+        paused_task = kb.create_task(conn, title="paused", assignee="worker")
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda task, *_args: spawned.append(task.id),
+            dispatch_allowed=lambda assignee: assignee != "worker",
+        )
+
+        assert kb.get_task(conn, default_task).status == "running"
+        assert kb.get_task(conn, paused_task).status == "ready"
+
+    assert spawned == [default_task]
+    assert [task_id for task_id, *_rest in result.spawned] == [default_task]
+
+
+def test_dispatch_skips_review_assignees_rejected_by_the_admission_predicate(kanban_home):
+    """A profile-scoped pause must also leave review work unclaimed."""
+    (kanban_home / "profiles" / "worker").mkdir(parents=True)
+    spawned: list[str] = []
+
+    with kb.connect() as conn:
+        review_task = kb.create_task(conn, title="review", assignee="worker")
+        _set_task_status(conn, review_task, "review")
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda task, *_args: spawned.append(task.id),
+            dispatch_allowed=lambda assignee: assignee != "worker",
+        )
+
+        assert kb.get_task(conn, review_task).status == "review"
+
+    assert spawned == []
+    assert result.spawned == []
+
+
+def test_dispatch_worktree_task_rerun_reuses_existing_linked_worktree_and_branch(kanban_home, tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    kb.create_board("worktree-rerun-board", default_workdir=str(repo))
+    import hermes_cli.profiles as profiles
+    monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
+    spawns: list[tuple[str, str]] = []
+
+    def fake_spawn(task, workspace, board=None):
+        spawns.append((task.id, workspace))
+        return None
+
+    with kb.connect(board="worktree-rerun-board") as conn:
+        tid = kb.create_task(
+            conn,
+            title="ship",
+            assignee="sentinel",
+            workspace_kind="worktree",
+            board="worktree-rerun-board",
+        )
+        first = kb.dispatch_once(conn, spawn_fn=fake_spawn, board="worktree-rerun-board")
+        first_task = kb.get_task(conn, tid)
+        assert first_task is not None
+        expected = repo / ".worktrees" / tid
+        assert first_task.workspace_path == str(expected)
+        assert first_task.branch_name == f"wt/{tid}"
+
+        conn.execute(
+            "UPDATE tasks SET status='ready', claim_lock=NULL, claim_expires=NULL, worker_pid=NULL WHERE id=?",
+            (tid,),
+        )
+        conn.commit()
+
+        second = kb.dispatch_once(conn, spawn_fn=fake_spawn, board="worktree-rerun-board")
+        second_task = kb.get_task(conn, tid)
+
+    assert first.spawned == [(tid, "sentinel", str(expected))]
+    assert second.spawned == [(tid, "sentinel", str(expected))]
+    assert spawns == [(tid, str(expected)), (tid, str(expected))]
+    assert second_task is not None
+    assert second_task.workspace_path == str(expected)
+    actual_branch = subprocess.run(
+        ["git", "-C", str(expected), "branch", "--show-current"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert actual_branch == f"wt/{tid}"
+    assert second_task.branch_name == actual_branch
+    listed = subprocess.run(
+        ["git", "-C", str(repo), "worktree", "list", "--porcelain"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert listed.count(f"worktree {expected}\n") == 1
+    assert f"worktree {expected}/.worktrees/{tid}" not in listed
+    assert f"branch refs/heads/{actual_branch}" in listed
+
+
+def _git(cwd: Path, *args: str) -> str:
+    res = subprocess.run(
+        ["git", *args],
+        cwd=str(cwd),
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    return res.stdout.strip()
+
+
+def _make_repo_with_worktree(tmp_path: Path) -> tuple[Path, Path]:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.email", "kanban-test@example.com")
+    _git(repo, "config", "user.name", "Kanban Test")
+    (repo / "README.md").write_text("seed\n")
+    _git(repo, "add", "README.md")
+    _git(repo, "commit", "-q", "-m", "seed")
+    worktree = tmp_path / ".worktrees" / "task-wt"
+    _git(repo, "worktree", "add", "-q", "-b", "wt/task-wt", str(worktree), "HEAD")
+    return repo, worktree
+
+
+def test_dispatch_blocks_missing_worktree_before_spawn(
+    kanban_home, tmp_path, all_assignees_spawnable
+):
+    missing = tmp_path / ".worktrees" / "missing"
+    spawns: list[str] = []
+
+    def fake_spawn(task, workspace):
+        spawns.append(workspace)
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="missing wt",
+            assignee="alice",
+            workspace_kind="worktree",
+            workspace_path=str(missing),
+            branch_name="wt/missing",
+        )
+        res = kb.dispatch_once(conn, spawn_fn=fake_spawn, failure_limit=1)
+        task = kb.get_task(conn, tid)
+        runs = kb.list_runs(conn, tid)
+
+    assert spawns == []
+    assert res.auto_blocked == [tid]
+    assert task is not None
+    assert task.status == "blocked"
+    assert runs[-1].error is not None
+    assert runs[-1].metadata is not None
+    if "workspace_preflight" in runs[-1].metadata:
+        assert runs[-1].metadata["workspace_preflight"]["result"] == "block"
+    else:
+        # Upstream linked-worktree materialization can fail before dispatcher
+        # preflight runs; the key guardrail is still no spawn + auto-block.
+        assert "workspace" in (runs[-1].error or "")
+    assert (
+        "worktree path does not exist" in runs[-1].error
+        or "is not inside a git repo" in runs[-1].error
+    )
+    assert str(missing) in runs[-1].error
+
+
+def test_dispatch_blocks_main_checkout_when_worktree_requested(
+    kanban_home, tmp_path, all_assignees_spawnable
+):
+    repo, _worktree = _make_repo_with_worktree(tmp_path)
+    spawns: list[str] = []
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="main masquerade",
+            assignee="alice",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+            branch_name=_git(repo, "branch", "--show-current"),
+        )
+        res = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda task, workspace: spawns.append(workspace),
+            failure_limit=1,
+        )
+        task = kb.get_task(conn, tid)
+        run = kb.list_runs(conn, tid)[-1]
+
+    assert spawns == []
+    assert res.auto_blocked == [tid]
+    assert task is not None
+    assert task.status == "blocked"
+    assert run.error is not None
+    assert (
+        "workspace=worktree points at a main checkout" in run.error
+        or "git worktree add failed" in run.error
+    )
+
+
+def test_dispatch_blocks_worktree_branch_mismatch_before_spawn(
+    kanban_home, tmp_path, all_assignees_spawnable
+):
+    _repo, worktree = _make_repo_with_worktree(tmp_path)
+    spawns: list[str] = []
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="wrong branch wt",
+            assignee="alice",
+            workspace_kind="worktree",
+            workspace_path=str(worktree),
+            branch_name="wt/expected-other-branch",
+        )
+        res = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda task, workspace: spawns.append(workspace),
+            failure_limit=1,
+        )
+        task = kb.get_task(conn, tid)
+        run = kb.list_runs(conn, tid)[-1]
+
+    assert spawns == []
+    assert res.auto_blocked == [tid]
+    assert task is not None
+    assert task.status == "blocked"
+    assert run.error is not None
+    assert "worktree branch mismatch" in run.error
+    assert "expected wt/expected-other-branch" in run.error
+    assert "found wt/task-wt" in run.error
+    assert run.metadata is not None
+    preflight = run.metadata["workspace_preflight"]
+    assert preflight["result"] == "block"
+    assert preflight["actual"]["branch"] == "wt/task-wt"
+
+
+def test_dispatch_blocks_dirty_worktree_before_spawn(
+    kanban_home, tmp_path, all_assignees_spawnable
+):
+    _repo, worktree = _make_repo_with_worktree(tmp_path)
+    (worktree / "dirty.txt").write_text("uncommitted\n")
+    spawns: list[str] = []
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="dirty wt",
+            assignee="alice",
+            workspace_kind="worktree",
+            workspace_path=str(worktree),
+            branch_name="wt/task-wt",
+        )
+        res = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda task, workspace: spawns.append(workspace),
+            failure_limit=1,
+        )
+        task = kb.get_task(conn, tid)
+        run = kb.list_runs(conn, tid)[-1]
+
+    assert spawns == []
+    assert res.auto_blocked == [tid]
+    assert task is not None
+    assert task.status == "blocked"
+    assert run.error is not None
+    assert "worktree checkout is dirty" in run.error
+    assert run.metadata is not None
+    preflight = run.metadata["workspace_preflight"]
+    assert preflight["result"] == "block"
+    assert preflight["actual"]["dirty"] is True
+
+
+def test_dispatch_records_workspace_preflight_metadata_for_valid_worktree(
+    kanban_home, tmp_path, all_assignees_spawnable
+):
+    _repo, worktree = _make_repo_with_worktree(tmp_path)
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="valid wt",
+            assignee="alice",
+            workspace_kind="worktree",
+            workspace_path=str(worktree),
+            branch_name="wt/task-wt",
+        )
+        res = kb.dispatch_once(conn, spawn_fn=lambda task, workspace: None)
+        run = kb.list_runs(conn, tid)[-1]
+
+    assert res.spawned == [(tid, "alice", str(worktree))]
+    assert run.metadata is not None
+    preflight = run.metadata["workspace_preflight"]
+    assert preflight["result"] == "pass"
+    assert preflight["intended"]["kind"] == "worktree"
+    assert preflight["actual"]["git_toplevel"] == str(worktree)
+    assert preflight["actual"]["branch"] == "wt/task-wt"
+    assert preflight["actual"]["separate_worktree"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -652,6 +1157,14 @@ def test_dir_child_completion_unblocks_deferred_scratch_parent(kanban_home, tmp_
     assert child_dir.exists(), "Non-scratch 'dir' child workspace is never deleted"
 
 
+
+
+def test_is_managed_scratch_path_rejects_real_source_tree(kanban_home, tmp_path):
+    """A real Dropbox/DEV checkout outside managed scratch roots is never disposable."""
+    real_checkout = tmp_path / "Dropbox" / "DEV" / "my-project"
+    real_checkout.mkdir(parents=True)
+
+    assert not kb._is_managed_scratch_path(real_checkout)
 
 
 def test_is_managed_scratch_path_rejects_kanban_metadata_subtrees(kanban_home):
@@ -827,7 +1340,7 @@ class TestSharedBoardPaths:
 
         task = kb.Task(
             id="t_dispatch_env",
-            title="x",
+            title="Investigate menu rings",
             body=None,
             assignee="coder",
             status="ready",
@@ -842,6 +1355,7 @@ class TestSharedBoardPaths:
             claim_expires=None,
             tenant=None,
             branch_name="wt/t_dispatch_env",
+            model_override="openai-codex/gpt-5.5",
         )
         kb._default_spawn(task, str(tmp_path / "ws"))
 
@@ -851,6 +1365,10 @@ class TestSharedBoardPaths:
             default_home / "kanban" / "workspaces"
         )
         assert env["HERMES_KANBAN_TASK"] == "t_dispatch_env"
+        assert env["HERMES_KANBAN_TASK_TITLE"] == "Investigate menu rings"
+        assert env["HERMES_PROFILE"] == "coder"
+        assert env["HERMES_MODEL"] == "openai-codex/gpt-5.5"
+        assert env["HERMES_INFERENCE_MODEL"] == "openai-codex/gpt-5.5"
         assert env["HERMES_KANBAN_BRANCH"] == "wt/t_dispatch_env"
         for key in sc._VAR_MAP:
             if key == "HERMES_SESSION_SOURCE":
@@ -1272,6 +1790,60 @@ def _make_task(**overrides) -> "kb.Task":
 # ---------------------------------------------------------------------------
 
 
+def test_create_task_scratch_without_workspace_ignores_board_default_workdir(kanban_home, monkeypatch):
+    """Scratch tasks must NOT inherit board.default_workdir — would point auto-cleanup
+    at the user's source tree on completion (#28818)."""
+    default_wd = "/home/user/project"
+    kb.create_board("work-proj", default_workdir=default_wd)
+
+    with kb.connect(board="work-proj") as conn:
+        tid = kb.create_task(conn, title="scratch-task", board="work-proj")
+        t = kb.get_task(conn, tid)
+    assert t is not None
+    assert t.workspace_kind == "scratch"
+    assert t.workspace_path is None
+
+
+def test_create_task_dir_without_workspace_inherits_board_default_workdir(kanban_home, monkeypatch):
+    """Board default_workdir is for persistent dir/worktree workspaces, not scratch."""
+    default_wd = "/home/user/project"
+    kb.create_board("work-proj-dir", default_workdir=default_wd)
+
+    with kb.connect(board="work-proj-dir") as conn:
+        tid = kb.create_task(
+            conn,
+            title="inherited",
+            workspace_kind="dir",
+            board="work-proj-dir",
+        )
+        t = kb.get_task(conn, tid)
+    assert t is not None
+    assert t.workspace_path == default_wd
+    assert t.workspace_kind == "dir"
+
+
+def test_create_task_without_workspace_no_default_stays_none(kanban_home):
+    """Board without default_workdir → create_task without workspace_path → stays None."""
+    kb.create_board("empty-board")
+
+    with kb.connect(board="empty-board") as conn:
+        tid = kb.create_task(conn, title="none", board="empty-board")
+        t = kb.get_task(conn, tid)
+    assert t is not None
+    assert t.workspace_path is None
+
+
+def test_create_task_with_explicit_workspace_ignores_board_default(kanban_home):
+    """create_task with explicit workspace_path → ignores board default."""
+    kb.create_board("custom-ws-board", default_workdir="/board/default")
+
+    explicit = "/my/explicit/path"
+    with kb.connect(board="custom-ws-board") as conn:
+        tid = kb.create_task(conn, title="explicit", workspace_path=explicit, board="custom-ws-board")
+        t = kb.get_task(conn, tid)
+    assert t is not None
+    assert t.workspace_path == explicit
+    assert t.workspace_path != "/board/default"
 
 
 # ---------------------------------------------------------------------------

@@ -23,7 +23,7 @@ import threading
 import time
 import unicodedata
 import uuid
-from typing import Optional
+from typing import Callable, Optional
 from hermes_cli.config import cfg_get
 
 from tools.interrupt import is_interrupted
@@ -2834,7 +2834,8 @@ class _ApprovalEntry:
 
 
 _gateway_queues: dict[str, list] = {}        # session_key → [_ApprovalEntry, …]
-_gateway_notify_cbs: dict[str, object] = {}  # session_key → callable(approval_data)
+_gateway_notify_cbs: dict[str, Callable[[dict], None]] = {}  # session_key → callable(approval_data)
+_gateway_resume_cbs: dict[str, Callable[[], None]] = {}  # session_key → callable()
 
 
 def register_gateway_notify(session_key: str, cb) -> None:
@@ -2857,9 +2858,38 @@ def unregister_gateway_notify(session_key: str) -> None:
     """
     with _lock:
         _gateway_notify_cbs.pop(session_key, None)
+        _gateway_resume_cbs.pop(session_key, None)
         entries = _gateway_queues.pop(session_key, [])
     for entry in entries:
         entry.event.set()
+
+
+def register_gateway_resume(session_key: str, cb) -> None:
+    """Register a per-session callback fired when approval unblocks the agent.
+
+    Platform button/API handlers and text commands all resolve through
+    ``resolve_gateway_approval``; this hook keeps approval light-cue lifecycle
+    handling centralized rather than duplicated across every gateway adapter.
+    """
+    with _lock:
+        _gateway_resume_cbs[session_key] = cb
+
+
+def unregister_gateway_resume(session_key: str) -> None:
+    """Unregister the per-session approval-resume callback."""
+    with _lock:
+        _gateway_resume_cbs.pop(session_key, None)
+
+
+def _fire_gateway_resume(session_key: str) -> None:
+    """Best-effort callback for when a gateway approval wait unblocks."""
+    with _lock:
+        resume_cb = _gateway_resume_cbs.get(session_key)
+    if resume_cb is not None:
+        try:
+            resume_cb()
+        except Exception as e:
+            logger.debug("Gateway approval resume callback failed: %s", e)
 
 
 def resolve_gateway_approval(session_key: str, choice: str,
@@ -2901,7 +2931,10 @@ def resolve_gateway_approval(session_key: str, choice: str,
         if reason:
             entry.reason = reason
         entry.event.set()
-    return len(targets)
+    count = len(targets)
+    if count:
+        _fire_gateway_resume(session_key)
+    return count
 
 
 def list_gateway_approvals(session_key: str) -> list[dict]:
@@ -3000,6 +3033,8 @@ def clear_session(session_key: str) -> None:
         _session_approved.pop(session_key, None)
         _session_yolo.discard(session_key)
         _pending.pop(session_key, None)
+        _gateway_notify_cbs.pop(session_key, None)
+        _gateway_resume_cbs.pop(session_key, None)
         entries = _gateway_queues.pop(session_key, [])
     for entry in entries:
         # Session-boundary cleanup should cancel any blocked approval waits
@@ -4708,6 +4743,8 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
                 touch_activity_if_due(_activity_state, "waiting for user approval")
 
     _drop_entry()
+    if not resolved:
+        _fire_gateway_resume(session_key)
 
     choice = entry.result
     # Normalize outcome for the post hook. Unresolved (timeout) and None both

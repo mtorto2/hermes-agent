@@ -459,7 +459,9 @@ def _(rid, params: dict) -> dict:
     while True:
         busy_transport = None
         with session["history_lock"]:
-            if session.get("running"):
+            if session.get("_closing"):
+                return _err(rid, 4009, "session is closing")
+            if not _claim_turn_locked(session):
                 if internal_hosted_submit:
                     return _err(rid, 4091, "hosted room member session is busy")
                 # Don't reject a mid-turn prompt — queue it (and, by default,
@@ -468,6 +470,7 @@ def _(rid, params: dict) -> dict:
                 # released: a non-interruptible tool may keep it waiting.
                 busy_transport = t or session.get("transport")
             else:
+                session["_turn_cancel_requested"] = False
                 break
         busy_response = _handle_busy_submit(
             rid, sid, session, text, busy_transport,
@@ -479,6 +482,26 @@ def _(rid, params: dict) -> dict:
         # claim so this prompt starts normally instead of being stranded in a
         # queue whose drain already ran.
 
+    handed_off = False
+    try:
+        response = _submit_claimed_prompt(
+            rid, sid, session, text, params, truncate_user_ordinal,
+            internal_hosted_submit, hosted_task, turn_isolation, display_kind,
+            hosted_terminal_callback,
+        )
+        handed_off = "error" not in response
+        return response
+    finally:
+        if not handed_off:
+            _release_turn_claim(rid, sid, session)
+
+
+def _submit_claimed_prompt(
+    rid, sid, session, text, params, truncate_user_ordinal,
+    internal_hosted_submit, hosted_task, turn_isolation, display_kind,
+    hosted_terminal_callback,
+):
+    """Prepare/persist the claimed request; the caller rolls back RPC failures."""
     # Filled when this submit performed a truncation against a durable session:
     # the fresh post-rewrite row ids of the surviving user turns, for client
     # rowId rebinding (see comment at the assignment site).
@@ -905,8 +928,6 @@ def _(rid, params: dict) -> dict:
                             )
             session["history"] = truncated
             session["history_version"] = int(session.get("history_version", 0)) + 1
-        session["running"] = True
-        session["_turn_cancel_requested"] = False
         session["last_active"] = time.time()
         if internal_hosted_submit:
             session["_hosted_room_task"] = dict(hosted_task)
@@ -954,10 +975,6 @@ def _(rid, params: dict) -> dict:
     except Exception as exc:
         from hermes_state import is_disk_full_error
 
-        with session["history_lock"]:
-            session["running"] = False
-            session["last_active"] = time.time()
-            _clear_inflight_turn(session)
         if is_disk_full_error(exc):
             return _err(
                 rid,
@@ -972,64 +989,10 @@ def _(rid, params: dict) -> dict:
         )
     _start_agent_build(sid, session)
 
-    def run_after_agent_ready() -> None:
-        # Patient wait (#63078): the user's message is already the accepted
-        # in-flight turn, so a slow deferred build must not eat it. The wait
-        # delivers the prompt when the still-running build completes, honors a
-        # cancel promptly, notices the user once past the slow threshold, and
-        # only errors when the build itself fails or the bounded cap expires.
-        err = _wait_agent_for_prompt(session, rid, sid)
-        if err:
-            # Terminal frame + retained snapshot (not a bare "error" event +
-            # cleared inflight): if the client is disconnected right now, the
-            # retained snapshot is the only way resume can show this failure.
-            _emit_terminal_turn_error(
-                sid,
-                session,
-                (err.get("error") or {}).get("message", "agent initialization failed"),
-                # Agent construction never reached the provider: this is a
-                # local-runtime failure (env/config/venv), not an API error.
-                error_surface={"layer": "runtime", "code": "agent_init_failed", "retryable": True},
-            )
-            with session["history_lock"]:
-                session["running"] = False
-                session["last_active"] = time.time()
-            _emit("session.info", sid, _session_info(session.get("agent"), session))
-            return
-        with session["history_lock"]:
-            if session.get("_turn_cancel_requested") or not session.get("running"):
-                session["running"] = False
-                _clear_inflight_turn(session)
-                # Surface the cancellation to the client. Without this emit the
-                # turn vanishes silently — the Desktop sees `prompt.submit`
-                # return `{"status": "streaming"}` but never receives a
-                # `message.start` or `error` event, so the composer shows no
-                # feedback (issue #63078 server-side half). Match the
-                # `_wait_agent` error branch above: emit, then bail.
-                _emit(
-                    "error",
-                    sid,
-                    {
-                        "message": "Turn cancelled before the agent was ready"
-                        if session.get("_turn_cancel_requested")
-                        else "Session no longer running before the agent was ready"
-                    },
-                )
-                return
-        _run_prompt_submit(
-            rid,
-            sid,
-            session,
-            text,
-            display_kind=display_kind,
-            terminal_callback=hosted_terminal_callback,
-        )
-
-    run_thread = threading.Thread(target=run_after_agent_ready, daemon=True)
-    # Keep a handle so session.interrupt can tell a live turn from a stuck
-    # `running` flag (a turn that died without clearing it) and recover the latter.
-    session["_run_thread"] = run_thread
-    run_thread.start()
+    _start_claimed_prompt_worker(
+        rid, sid, session, text, display_kind=display_kind,
+        terminal_callback=hosted_terminal_callback,
+    )
     return _ok(
         rid,
         {
@@ -1889,6 +1852,7 @@ def register(server) -> None:
     # sites) resolve the same free names after the split.
     g = vars(server)
     for helper in (
+        _submit_claimed_prompt,
         _history_user_indices,
         _message_row_id,
         _mem_db_pair_agrees,

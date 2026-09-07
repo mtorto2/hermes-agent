@@ -141,6 +141,19 @@ except Exception:
 
 from tui_gateway.render import make_stream_renderer, render_diff, render_message
 
+
+def _build_nah_instruction(style: str = "") -> str:
+    style = (style or "").strip()
+    instruction = (
+        "Summarize your immediately previous assistant reply into the shortest useful TL;DR. "
+        "Do not mention this instruction or any skill. Do not re-answer the original task. "
+        "No tools. Default to 1-3 bullets unless one sentence is enough."
+    )
+    if style:
+        instruction += f" Extra style request: {style}"
+    return instruction
+
+
 _sessions: dict[str, dict] = {}
 _methods: dict[str, callable] = {}
 _pending: dict[str, tuple[str, threading.Event]] = {}
@@ -906,6 +919,24 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
     stop_event = session.get("_notif_stop")
     if stop_event is not None:
         stop_event.set()
+    notif_thread = session.get("_notif_thread")
+    if notif_thread is not None and notif_thread is not threading.current_thread():
+        try:
+            notif_thread.join(timeout=1.0)
+        except Exception:
+            pass
+    # Serialize against startup so a retry worker cannot be attached after
+    # this finalized session has already performed its stop/join pass.
+    with _tui_light_slot_retry_start_lock:
+        slot_retry_stop = session.get("_light_slot_retry_stop")
+        if slot_retry_stop is not None:
+            slot_retry_stop.set()
+        slot_retry_thread = session.get("_light_slot_retry_thread")
+        if slot_retry_thread is not None and slot_retry_thread is not threading.current_thread():
+            try:
+                slot_retry_thread.join(timeout=1.0)
+            except Exception:
+                pass
 
     agent = session.get("agent")
     lock = session.get("history_lock")
@@ -1231,7 +1262,8 @@ def _ws_session_is_orphaned(session: dict | None) -> bool:
 
 
 def _interrupt_session_turn(
-    sid: str, session: dict, *, request_id: str | None = None
+    sid: str, session: dict, *, request_id: str | None = None,
+    expected_turn_id: str | None = None,
 ) -> bool:
     """Apply the shared ``session.interrupt`` contract to one claimed session.
 
@@ -1241,32 +1273,32 @@ def _interrupt_session_turn(
     explicit user interrupt.
     """
     use_compute_host = _session_uses_compute_host(session)
-    should_interrupt = bool(session.get("running"))
-    run_thread_alive = False
-
-    if use_compute_host:
-        # The host owns the live turn. Parent `running` is only a mirror and
-        # can lag behind a blocked interactive tool (a clarify parked on its
-        # Event keeps the host turn alive after the parent flag went stale),
-        # so let the host decide whether there is work to interrupt.
-        # Gate on `_compute_host_active` too: `_session_uses_compute_host`
-        # is also true for lazy sessions that never ran a hosted turn, and
-        # `HostSupervisor.interrupt()` calls `start()` — forwarding
-        # unconditionally would spawn a compute-host child just to deliver
-        # an interrupt no session ever submitted work to.
-        if should_interrupt or session.get("_compute_host_active"):
-            _get_compute_host_supervisor().interrupt(sid, request_id=request_id)
-    else:
-        run_thread = session.get("_run_thread")
-        run_thread_alive = run_thread is not None and run_thread.is_alive()
-
     with session["history_lock"]:
+        if expected_turn_id is not None and expected_turn_id != session.get("_compute_turn_id"):
+            return False
+        should_interrupt = bool(session.get("running"))
+        target_turn_id = session.get("_compute_turn_id") or session.get("_compute_last_turn_id")
+        host_active = session.get("_compute_host_active")
+        dispatch_lock = session.setdefault("_compute_dispatch_lock", threading.RLock()) if use_compute_host else None
         session["_turn_cancel_requested"] = True
         session["queued_prompt"] = None
         session.pop("queued_prompts", None)
+        session.pop("_deferred_turns", None)
+        session.pop("_compute_followup", None)
         session["_queued_prompt_generation"] = int(
             session.get("_queued_prompt_generation", 0)
         ) + 1
+    run_thread = session.get("_run_thread")
+    run_thread_alive = run_thread is not None and run_thread.is_alive()
+    if use_compute_host and (target_turn_id or host_active
+                             or (should_interrupt and not session.get("_turn_claimed"))):
+        # Snapshot cancellation before transport I/O. A user accepted while
+        # the write blocks belongs to the new generation, not this Stop.
+        with dispatch_lock:
+            _get_compute_host_supervisor().interrupt(
+                sid, request_id=request_id,
+                **({"target_turn_id": target_turn_id} if target_turn_id else {}),
+            )
 
     if not use_compute_host:
         if should_interrupt:
@@ -1275,9 +1307,9 @@ def _interrupt_session_turn(
             request_hard_interrupt(session.get("agent"))
         if not run_thread_alive:
             with session["history_lock"]:
-                if session.get("running"):
-                    session["running"] = False
-                    _clear_inflight_turn(session)
+                recover_orphan = session.get("running") and not session.get("_turn_claimed")
+            if recover_orphan:
+                _release_turn_claim("__interrupt__", sid, session)
 
     _clear_pending(sid)
     try:
@@ -1286,6 +1318,7 @@ def _interrupt_session_turn(
         resolve_gateway_approval(session["session_key"], "deny", resolve_all=True)
     except Exception:
         pass
+    _reconcile_pending_idle(sid, session)
     return use_compute_host
 
 
@@ -2662,6 +2695,31 @@ def _metadata_mirror(session: dict | None) -> dict:
 def _relay_compute_host_rpc(message: dict) -> bool:
     """Relay host events while retaining the clarify snapshot needed on resume."""
     params = message.get("params") if isinstance(message, dict) else None
+    if isinstance(params, dict):
+        params = dict(params)
+        turn_id = params.pop("compute_turn_id", None)
+        message = {**message, "params": params}
+        session = _sessions.get(str(params.get("session_id") or ""))
+        if session is not None and params.get("type") in {
+                "compute.notification", "compute.notification.accepted"}:
+            _receive_compute_notification(str(params["session_id"]), session,
+                                          params["type"], params.get("payload") or {}, turn_id)
+            return True  # Private session-scoped protocol, independent of the producing turn.
+        if session is not None:
+            with session["history_lock"]:
+                active = session.get("_compute_turn_id")
+                if turn_id is not None and turn_id != active:
+                    return True  # An old worker cannot publish into its successor.
+                terminal = params.get("type") == "message.complete"
+                idle = (params.get("type") == "session.info"
+                        and (params.get("payload") or {}).get("running") is False)
+                if active and (terminal or idle):
+                    if turn_id is None:
+                        return True  # First-worker initialization is metadata, not a terminal edge.
+                    session["_turn_settling"] = True
+                    if terminal:
+                        session.setdefault("_compute_terminal", params.get("payload") or {})
+                    return True  # turn.end publishes under the parent's barrier.
     if isinstance(params, dict) and params.get("type") == "clarify.request":
         sid = str(params.get("session_id") or "")
         payload = params.get("payload")
@@ -2774,33 +2832,46 @@ def _apply_compute_host_metadata_mirror(session: dict, frame: dict | None) -> No
 
 
 def _on_compute_host_turn_done(rid: str, sid: str, session: dict, frame: dict) -> None:
-    is_error = frame.get("type") == "turn.error"
     with session["history_lock"]:
-        if frame.get("session_key"):
-            session["session_key"] = str(frame.get("session_key"))
-        if frame.get("history_version") is not None:
-            try:
-                session["history_version"] = max(
-                    int(session.get("history_version", 0)),
-                    int(frame.get("history_version") or 0),
-                )
-            except Exception:
-                pass
-        session["running"] = False
-        session["last_active"] = time.time()
-        _clear_inflight_turn(session)
+        active = session.get("_compute_turn_id")
+        if active and frame.get("request_id") != active:
+            return
+        session["_turn_settling"] = True
+        terminal = session.pop("_compute_terminal", None)
+        session.pop("_compute_turn_id", None)
+        notification_id = session.pop("_compute_notification_inflight", None)
+        if notification_id in (session.get("_compute_notification_proposals") or {}):
+            session["_compute_notification_retry_blocked"] = notification_id
         session.pop("_compute_host_pending_clarify", None)
-    if is_error:
-        message = str(frame.get("message") or "compute host turn failed")
-        _emit("message.complete", sid, {"text": f"Error: {message}", "status": "error"})
+        _clear_inflight_turn(session)
+        # A queued user supersedes the old goal proposal; its judge re-evaluates.
+        worker_queue = [] if session.get("_turn_cancel_requested") else frame.get("queued_prompts") or []
+        for queued in worker_queue:
+            _enqueue_prompt(session, queued["text"], session.get("transport"),
+                            image_paths=queued.get("image_paths"))
+        followup = frame.get("followup")
+        if session.get("queued_prompt") or session.get("_turn_cancel_requested"):
+            followup = None
+        session["_compute_followup"] = followup
     _apply_compute_host_metadata_mirror(session, frame)
-    try:
-        info = _session_info(session.get("agent"), session)
-    except TypeError:
-        info = _session_info(session.get("agent"))
-    if not frame.get("session_info_emitted"):
-        _emit("session.info", sid, info)
-    _drain_queued_prompt(rid, sid, session)
+    if terminal is None:
+        message = str(frame.get("message") or "compute host turn ended without a terminal payload")
+        terminal = {"text": f"Error: {message}", "status": "error"}
+    _emit("message.complete", sid, terminal)
+    _settle_turn(rid, sid, session, drain=False)
+    with session["history_lock"]:
+        followup = session.pop("_compute_followup", None)
+    if _drain_turn_work(rid, sid, session):
+        return  # A user arriving during publication also supersedes this goal.
+    if followup:
+        with session["history_lock"]:
+            if (session.get("_turn_cancel_requested")
+                    or not _claim_turn_locked(session, autonomous=True)):
+                return
+        response = _submit_prompt_to_compute_host(rid, sid, session, followup)
+        if response.get("error"):
+            _emit_terminal_turn_error(sid, session, response["error"]["message"])
+            _settle_turn(rid, sid, session)
 
 
 def _submit_prompt_to_compute_host(
@@ -2811,6 +2882,7 @@ def _submit_prompt_to_compute_host(
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
     display_kind: str | None = None,
+    notification_id: str | None = None,
 ) -> dict:
     cfg = _load_dashboard_process_isolation_config()
     frame = _compute_host_turn_frame(
@@ -2823,6 +2895,14 @@ def _submit_prompt_to_compute_host(
         display_kind=display_kind,
     )
 
+    if notification_id:
+        frame["notification_id"] = notification_id
+
+    # Serialize the pipe write with Stop. Cancellation itself is recorded
+    # before waiting for this lock, so an unsent cancelled claim cannot start.
+    with session["history_lock"]:
+        dispatch_lock = session.setdefault("_compute_dispatch_lock", threading.RLock())
+
     def _complete(done: dict) -> None:
         # submit_turn reports a synchronous pipe failure through the callback
         # before re-raising. Leave the parent session untouched so prompt.submit
@@ -2832,14 +2912,30 @@ def _submit_prompt_to_compute_host(
             return
         _on_compute_host_turn_done(rid, sid, session, done)
 
-    try:
-        _get_compute_host_supervisor(cfg).submit_turn(frame, on_complete=_complete)
-    except Exception as exc:
-        return _err(rid, 5019, f"compute-host dispatch failed: {exc}")
-    with session["history_lock"]:
-        session["_compute_host_active"] = True
-        if image_paths is None:
-            session["attached_images"] = []
+    with dispatch_lock:
+        with session["history_lock"]:
+            if (session.get("_turn_cancel_requested") or session.get("_closing")
+                    or (queued_prompt_generation is not None and queued_prompt_generation
+                        != int(session.get("_queued_prompt_generation", 0)))):
+                return _err(rid, 4009, "turn cancelled before compute dispatch")
+            # RPC ids may be reused while draining. Turn identities cannot be.
+            frame["request_id"] = uuid.uuid4().hex
+            session["_compute_turn_id"] = frame["request_id"]
+            session["_compute_last_turn_id"] = frame["request_id"]
+            if notification_id:
+                session.setdefault("_compute_notification_admissions", {}).setdefault(notification_id, set()).add(frame["request_id"])
+            was_active = session.get("_compute_host_active", False)
+            session["_compute_host_active"] = True
+        try:
+            _get_compute_host_supervisor(cfg).submit_turn(frame, on_complete=_complete)
+        except Exception as exc:
+            with session["history_lock"]:
+                session.pop("_compute_turn_id", None)
+                session["_compute_host_active"] = was_active
+            return _err(rid, 5019, f"compute-host dispatch failed: {exc}")
+        with session["history_lock"]:
+            if image_paths is None:
+                session["attached_images"] = []
     return _ok(rid, {"status": "streaming", "turn_isolation": True})
 
 
@@ -2955,6 +3051,163 @@ def _status_update(sid: str, kind: str, text: str | None = None):
         if is_compaction_progress_status(body):
             out_kind = "compacting"
     _emit("status.update", sid, {"kind": out_kind, "text": body})
+
+
+def _get_tui_light_cue_service(session: dict | None):
+    """Return the shared light cue service for a TUI session.
+
+    TUI runs through ``tui_gateway`` instead of ``cli.py``, so classic CLI's
+    terminal light-cue hooks are not available here.  Keep this helper lazy and
+    best-effort: light cues are a convenience notifier and must never break the
+    JSON-RPC bridge or prompt execution.
+    """
+    if session is None:
+        session = {}
+    try:
+        from agent.light_cues import LightCueService, build_light_cue_service_from_config
+
+        service = session.get("_light_cue_service")
+        if not isinstance(service, LightCueService):
+            service = build_light_cue_service_from_config(_load_cfg(), auto_assign_slot=True)
+            session["_light_cue_service"] = service
+        return service
+    except Exception:
+        logger.debug("TUI light cue service unavailable", exc_info=True)
+        return None
+
+
+_TUI_LIGHT_SLOT_RETRY_INTERVAL_S = 30.0
+
+
+def _retry_tui_light_slot_registration(session: dict | None) -> bool:
+    """Backfill a slot for an idle TUI that started while capacity was full."""
+    if not session:
+        return False
+    service = session.get("_light_cue_service")
+    retry = getattr(service, "retry_slot_registration", None)
+    if not callable(retry):
+        return False
+    try:
+        return bool(retry())
+    except Exception:
+        logger.debug("TUI Agent Lights slot retry failed", exc_info=True)
+        return False
+
+
+_tui_light_slot_retry_start_lock = threading.Lock()
+
+
+def _tui_light_slot_retry_loop(stop_event: threading.Event, session: dict) -> None:
+    """Claim a freed Agent Lights slot for a session that started without one.
+
+    Dedicated supervision thread: the notification poller also retries, but
+    its liveness is tied to process-notification plumbing, and a session whose
+    poller never started (or exited) must still recover a slot. Stands down
+    once the service holds a backend, and checks ``_finalized`` before every
+    retry so a finalizing session can't be written to after shutdown.
+    """
+    while not stop_event.wait(_TUI_LIGHT_SLOT_RETRY_INTERVAL_S):
+        if session.get("_finalized"):
+            return
+        if _retry_tui_light_slot_registration(session):
+            return
+        service = session.get("_light_cue_service")
+        if service is not None and getattr(service, "slot_status_backend", None) is not None:
+            return
+
+
+def _start_tui_light_slot_retry(session: dict | None) -> None:
+    """Start slot-retry supervision for a session. Idempotent per session."""
+    if not session:
+        return
+    with _tui_light_slot_retry_start_lock:
+        if session.get("_finalized"):
+            return
+        existing = session.get("_light_slot_retry_thread")
+        if existing is not None and existing.is_alive():
+            return
+        stop = threading.Event()
+        thread = threading.Thread(
+            target=_tui_light_slot_retry_loop,
+            args=(stop, session),
+            daemon=True,
+        )
+        session["_light_slot_retry_stop"] = stop
+        session["_light_slot_retry_thread"] = thread
+        thread.start()
+
+
+def _publish_tui_slot_online(session: dict | None) -> None:
+    """Publish a session's Agent Lights slot at startup, best-effort.
+
+    When the mark fails because no backend could be registered (capacity was
+    full), leave a supervisor behind so the session adopts a normal slot once
+    one frees up.
+    """
+    if not session:
+        return
+    try:
+        service = _get_tui_light_cue_service(session)
+        if service is None:
+            return
+        if not service.mark_slot_online() and getattr(service, "slot_status_backend", None) is None:
+            _start_tui_light_slot_retry(session)
+    except Exception:
+        logger.debug("TUI startup slot idle mark failed", exc_info=True)
+
+
+def _emit_tui_light_cue(sid: str, event: Any) -> bool:
+    """Best-effort TUI prompt lifecycle light cue emission."""
+    try:
+        service = _get_tui_light_cue_service(_sessions.get(sid))
+        if service is None:
+            return False
+        return bool(service.emit(event))
+    except Exception:
+        logger.debug("TUI light cue emission failed", exc_info=True)
+        return False
+
+
+def _register_tui_approval_callbacks(sid: str, session_key: str) -> bool:
+    """Register TUI approval callbacks and mirror approval lifecycle to lights."""
+    try:
+        from tools.approval import (
+            load_permanent_allowlist,
+            register_gateway_notify,
+            register_gateway_resume,
+        )
+    except Exception:
+        logger.debug("TUI approval callback registration unavailable", exc_info=True)
+        return False
+
+    def _approval_request(data):
+        try:
+            from agent.light_cues import LightCueEvent
+
+            _emit_tui_light_cue(sid, LightCueEvent.HUMAN_INTERVENTION)
+        except Exception:
+            logger.debug("TUI approval request light cue failed", exc_info=True)
+        _emit_approval_request(sid, data)
+
+    def _approval_resume():
+        try:
+            from agent.light_cues import LightCueEvent
+
+            _emit_tui_light_cue(sid, LightCueEvent.WORKING)
+        except Exception:
+            logger.debug("TUI approval resume light cue failed", exc_info=True)
+
+    try:
+        register_gateway_notify(session_key, _approval_request)
+        register_gateway_resume(session_key, _approval_resume)
+    except Exception:
+        logger.debug("TUI approval callback registration failed", exc_info=True)
+        return False
+    try:
+        load_permanent_allowlist()
+    except Exception:
+        logger.debug("TUI approval allowlist preload failed", exc_info=True)
+    return True
 
 
 def _estimate_image_tokens(width: int, height: int) -> int:
@@ -3381,21 +3634,13 @@ def _start_agent_build(sid: str, session: dict) -> None:
             # never reaped, so with the desktop app open for days those
             # fleets accumulate until the OS refuses new process spawns.
 
-            try:
-                from tools.approval import (
-                    register_gateway_notify,
-                    load_permanent_allowlist,
-                )
-
-                register_gateway_notify(
-                    key, lambda data: _emit_approval_request(sid, data)
-                )
-                notify_registered = True
-                load_permanent_allowlist()
-            except Exception:
-                pass
+            notify_registered = _register_tui_approval_callbacks(sid, key)
 
             _wire_callbacks(sid)
+
+            _publish_tui_slot_online(current)
+
+
             # Surface the self-improvement review's "💾 …" summary as an event
             # the TUI/desktop render in-transcript, honoring
             # display.memory_notifications. _init_session wires this for the
@@ -3409,6 +3654,7 @@ def _start_agent_build(sid: str, session: dict) -> None:
                 agent.memory_notifications = _load_memory_notifications()
             except Exception:
                 pass
+
             # Hydrate credits notices at session OPEN (not just on the first
             # message), so depletion / usage-band warnings show at "ready". Runs
             # off the build thread, after the notice_callback is wired. Fail-open.
@@ -3862,6 +4108,104 @@ def _reconcile_session_cwd_from_terminal(session: dict | None) -> bool:
     return True
 
 
+def _claim_turn_locked(session: dict, *, autonomous: bool = False) -> bool:
+    """The sole turn admission authority. Caller must hold history_lock.
+
+    No I/O belongs here: inspection and ownership transfer are one operation.
+    Autonomous work also yields to accepted user work.
+    """
+    if (session.get("_closing") or session.get("running")
+            or session.get("_turn_settling")
+            or (autonomous and (session.get("queued_prompt")
+                                or session.get("_parent_owned_turns")))):
+        return False
+    session["running"] = True
+    session["_turn_claimed"] = True
+    session["_turn_cancel_requested"] = False
+    return True
+
+
+def _drain_turn_work(rid, sid: str, session: dict) -> bool:
+    """Drain users first, then a deferred autonomous dispatcher, outside locks."""
+    if session.get("_parent_owned_turns"):
+        return False  # Only a parent turn.start may admit work in a worker.
+    if _drain_queued_prompt(rid, sid, session):
+        return True
+    with session["history_lock"]:
+        if (session.get("_closing") or session.get("running")
+                or session.get("_turn_settling") or session.get("queued_prompt")):
+            return False
+        pending = session.get("_deferred_turns") or []
+        callback = pending.pop(0) if pending else None
+    if callback is not None:
+        callback()
+        return True
+    return _drain_compute_notification(rid, sid, session)
+
+
+def _settle_turn(rid, sid: str, session: dict, *, drain: bool = True) -> bool:
+    """Release ownership only after terminal delivery and old-turn cleanup.
+
+    The idle publication owns the barrier through cwd/transport work. If that
+    publication raises, retain the barrier: a successor cannot overtake it.
+    Worker idle frames are private; the parent publishes the isolated edge.
+    """
+    with session["history_lock"]:
+        session["running"] = False
+        session.pop("_turn_claimed", None)
+        session["_turn_settling"] = True
+        session["last_active"] = time.time()
+    _emit_settled_session_info(sid, session, session.get("agent"))
+    with session["history_lock"]:
+        session.pop("_turn_settling", None)
+    _reconcile_pending_idle(sid, session)
+    return _drain_turn_work(rid, sid, session) if drain else False
+
+
+def _start_claimed_prompt_worker(rid, sid: str, session: dict, text, **kwargs) -> None:
+    """Wait for construction without dropping an accepted claim or its queue."""
+    def after_ready():
+        try:
+            err = _wait_agent_for_prompt(session, rid, sid)
+        except Exception as exc:
+            err = {"error": {"message": str(exc)}}
+        if err:
+            _emit_terminal_turn_error(
+                sid, session,
+                (err.get("error") or {}).get("message", "agent initialization failed"),
+                error_surface={"layer": "runtime", "code": "agent_init_failed", "retryable": True},
+            )
+            _settle_turn(rid, sid, session)
+            return
+        with session["history_lock"]:
+            cancelled = session.get("_turn_cancel_requested")
+            running = session.get("running")
+            closing = session.get("_closing")
+        if cancelled or not running or closing:
+            _emit("error", sid, {"message":
+                "Turn cancelled before the agent was ready" if cancelled or closing
+                else "Session no longer running before the agent was ready"})
+            _release_turn_claim(rid, sid, session)
+            return
+        try:
+            _run_prompt_submit(rid, sid, session, text, **kwargs)
+        except Exception as exc:
+            _emit_terminal_turn_error(sid, session, exc)
+            _settle_turn(rid, sid, session)
+
+    worker = threading.Thread(target=after_ready, daemon=True)
+    session["_run_thread"] = worker
+    worker.start()
+
+
+def _release_turn_claim(rid, sid: str, session: dict) -> None:
+    """Roll back an admission that never became a live turn (no completion)."""
+    with session["history_lock"]:
+        session["_turn_settling"] = True
+        _clear_inflight_turn(session)
+    _settle_turn(rid, sid, session)
+
+
 def _emit_settled_session_info(sid: str, session: dict, agent) -> None:
     """Emit end-of-turn ``session.info``, reconciling a settled cwd first.
 
@@ -3875,7 +4219,54 @@ def _emit_settled_session_info(sid: str, session: dict, agent) -> None:
         _reconcile_session_cwd_from_terminal(session)
     except Exception:
         logger.debug("failed to reconcile settled session cwd", exc_info=True)
-    _emit("session.info", sid, _session_info(agent, session))
+    try:
+        info = _session_info(agent, session)
+    except Exception:
+        logger.warning("settled session metadata unavailable", exc_info=True)
+        info = {"running": False}
+    info["running"] = False
+    # Standalone settled-CWD callers need not carry the runtime session lock.
+    history_lock = session.get("history_lock", contextlib.nullcontext())
+    with history_lock:
+        pending = _pending_turn_locked(session)
+    if pending:
+        info["pending_turn"] = True
+    _emit("session.info", sid, info)
+    with history_lock:
+        session["_published_pending_turn"] = pending
+
+
+def _pending_turn_locked(session: dict) -> bool:
+    return bool(session.get("queued_prompt") or session.get("_deferred_turns")
+                or session.get("_compute_followup")
+                or session.get("_compute_notification_proposals"))
+
+
+def _reconcile_pending_idle(sid: str, session: dict, *, claimed: bool = False) -> None:
+    """Correct idle metadata before dispatch, never under I/O locks.
+
+    Only the queued drain owning an undispatched claim may pass ``claimed``.
+    """
+    while True:
+        with session["history_lock"]:
+            pending = _pending_turn_locked(session)
+            pending = pending or (claimed and not session.get("_turn_cancel_requested"))
+            # Reserve the queued head before correction I/O, so reentrant
+            # submissions see its inflight identity instead of merging into it.
+            if ((session.get("running") and not claimed) or session.get("_turn_settling")
+                    or (session.get("queued_prompt") and not claimed)
+                    or "_published_pending_turn" not in session
+                    or pending == session["_published_pending_turn"]):
+                return
+            session["_turn_settling"] = True
+        try:
+            _emit("session.info", sid, {"running": False, "pending_turn": pending})
+        except Exception:
+            # As with settlement, failed publication must not admit a successor.
+            raise
+        with session["history_lock"]:
+            session["_published_pending_turn"] = pending
+            session.pop("_turn_settling", None)
 
 
 def _session_source(session: dict | None) -> str:
@@ -4879,6 +5270,27 @@ def _tour_request(sid: str, payload: dict) -> str:
         session["tour_bridge"] = "unanswered"
 
     return answer or _TOUR_BRIDGE_UNAVAILABLE
+
+
+def _block_with_light_cue(
+    event: str, sid: str, payload: dict, timeout: float | None = 300
+) -> str:
+    try:
+        from agent.light_cues import LightCueEvent
+
+        _emit_tui_light_cue(sid, LightCueEvent.HUMAN_INTERVENTION)
+    except Exception:
+        pass
+    try:
+        result = _block(event, sid, payload, timeout=timeout)
+    finally:
+        try:
+            from agent.light_cues import LightCueEvent
+
+            _emit_tui_light_cue(sid, LightCueEvent.WORKING)
+        except Exception:
+            pass
+    return result
 
 
 def _clear_pending(sid: str | None = None) -> None:
@@ -6155,6 +6567,14 @@ def _load_enabled_toolsets(platform: str | None = None) -> list[str] | None:
         return sorted(enabled | _gui_surface_toolsets(session_platform))
     except Exception:
         if fallback_notice is not None:
+            try:
+                cfg = cfg if cfg is not None else load_config()
+                cli_tools = set(((cfg.get("platform_toolsets") or {}).get("cli") or []))
+                if cli_tools:
+                    print(fallback_notice, file=sys.stderr, flush=True)
+                    return sorted(cli_tools | {"apple_calendar", "kanban", "project"})
+            except Exception:
+                pass
             print(
                 "[tui] no valid HERMES_TUI_TOOLSETS entries and configured CLI toolsets could not be loaded; enabling all toolsets",
                 file=sys.stderr,
@@ -7219,7 +7639,6 @@ def _sync_session_key_after_compress(
             disable_session_yolo,
             enable_session_yolo,
             is_session_yolo_enabled,
-            register_gateway_notify,
             unregister_gateway_notify,
         )
 
@@ -7238,13 +7657,7 @@ def _sync_session_key_after_compress(
                 disable_session_yolo(old_key)
             except Exception:
                 pass
-        try:
-            register_gateway_notify(
-                new_session_id,
-                lambda data: _emit_approval_request(sid, data),
-            )
-        except Exception:
-            pass
+        _register_tui_approval_callbacks(sid, new_session_id)
     except Exception:
         # Even if the approval module fails to import, still anchor the
         # session_key on the new continuation id so downstream lookups
@@ -8264,8 +8677,31 @@ def _agent_cbs(sid: str) -> dict:
         "notice_clear_callback": lambda key: _emit(
             "notification.clear", sid, {"key": key}
         ),
+        # Green batch/multi-question clarify keeps its full lifecycle via
+        # _clarify_block (wire-shaping, batch_qids accumulation, .expire on
+        # timeout). Single-question clarify additionally rides Blue's
+        # _block_with_light_cue so Agent Lights shows HUMAN_INTERVENTION while
+        # blocked and is guaranteed (try/finally) to fall back to WORKING; the
+        # single-question _block call is otherwise identical to the one
+        # _clarify_block would make.
         "clarify_callback": lambda q, c, multi_select=False, questions=None: (
             _clarify_block(sid, q, c, multi_select=multi_select, questions=questions)
+            if questions
+            else _block_with_light_cue(
+                "clarify.request",
+                sid,
+                # multi_select is a pass-through hint: renderers with checkbox
+                # support can honor it; older renderers ignore the extra field
+                # and stay single-select (a single answer still parses as a
+                # one-element list on the tool side). Only emitted when True so
+                # single-select payloads keep the exact pre-multi-select shape.
+                (
+                    {"question": q, "choices": c, "multi_select": True}
+                    if multi_select
+                    else {"question": q, "choices": c}
+                ),
+                timeout=_clarify_timeout_seconds(),
+            )
         ),
         # read_terminal tool (desktop GUI): same blocking bridge as clarify — the
         # renderer answers terminal.read.respond with the serialized buffer.
@@ -8404,14 +8840,15 @@ def _wire_callbacks(sid: str):
     from tools.skills_tool import set_secret_capture_callback
     from tools.project_tools import set_project_workspace_callback
 
-    set_sudo_password_callback(lambda: _block("sudo.request", sid, {}, timeout=120))
+    set_sudo_password_callback(lambda: _block_with_light_cue("sudo.request", sid, {}, timeout=120))
     set_project_workspace_callback(_apply_project_workspace)
+
 
     def secret_cb(env_var, prompt, metadata=None):
         pl = {"prompt": prompt, "env_var": env_var}
         if metadata:
             pl["metadata"] = metadata
-        val = _block("secret.request", sid, pl)
+        val = _block_with_light_cue("secret.request", sid, pl)
         if not val:
             return {
                 "success": True,
@@ -9160,6 +9597,7 @@ def _init_session(
             "created_at": now,
             "last_active": now,
             "running": False,
+            "_parent_owned_turns": _inside_compute_host_child(),
             "attached_images": [],
             "image_counter": 0,
             "cwd": cwd or _completion_cwd(),
@@ -9236,10 +9674,7 @@ def _init_session(
     # deferred-build path in _start_agent_build for the full rationale
     # (per-worker MCP fleets accumulating across retained sessions).
     try:
-        from tools.approval import register_gateway_notify, load_permanent_allowlist
-
-        register_gateway_notify(key, lambda data: _emit_approval_request(sid, data))
-        load_permanent_allowlist()
+        _register_tui_approval_callbacks(sid, key)
     except Exception:
         pass
     # Surface the self-improvement background review's "💾 …" summary as a
@@ -9260,6 +9695,7 @@ def _init_session(
         # session startup resilient).
         pass
     _wire_callbacks(sid)
+    _publish_tui_slot_online(_sessions.get(sid))
     with _sessions_lock:
         if sid in _sessions:
             _sessions[sid]["_notif_stop"] = _start_notification_poller(sid, _sessions[sid])
@@ -9983,12 +10419,15 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> 
             session["_auto_continue_scheduled"] = False
             return
         with session["history_lock"]:
-            if session.get("running") or session.get("_turn_cancel_requested") or session.get("_finalized"):
+            if session.get("_turn_settling"):
+                session.setdefault("_deferred_turns", []).append(kickoff)
+                return
+            if (session.get("_turn_cancel_requested") or session.get("_finalized")
+                    or not _claim_turn_locked(session, autonomous=True)):
                 # A real user prompt beat us to it — their turn wins, and its
                 # own conclusion clears the marker.
                 session["_auto_continue_scheduled"] = False
                 return
-            session["running"] = True
             session["last_active"] = time.time()
             # Hand this turn its own marker inputs (read back by
             # _run_prompt_submit): count the attempt so a crash during the
@@ -10004,7 +10443,6 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> 
                 sid,
                 {"kind": "process", "text": "Resuming interrupted turn…"},
             )
-            _emit("message.start", sid)
             _run_prompt_submit(rid, sid, session, text, display_kind="auto_continue")
         except Exception as exc:
             print(
@@ -10012,8 +10450,8 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> 
                 f"{type(exc).__name__}: {exc}",
                 file=sys.stderr,
             )
-            with session["history_lock"]:
-                session["running"] = False
+            _emit_terminal_turn_error(sid, session, exc)
+            _settle_turn(rid, sid, session)
 
     threading.Thread(target=kickoff, daemon=True).start()
     logger.info(
@@ -10168,8 +10606,12 @@ def _interrupt_busy_session(sid: str, session: dict, agent: Any) -> None:
         return
 
     with session["history_lock"]:
-        if session.get("_busy_interrupt_pending"):
+        if session.get("_busy_interrupt_pending") or session.get("_turn_settling"):
             return
+        target_turn_id = session.get("_compute_turn_id")
+        if use_compute_host and not target_turn_id:
+            return
+        dispatch_lock = session.setdefault("_compute_dispatch_lock", threading.RLock()) if use_compute_host else None
         session["_busy_interrupt_pending"] = True
 
     def interrupt() -> None:
@@ -10177,7 +10619,8 @@ def _interrupt_busy_session(sid: str, session: dict, agent: Any) -> None:
             if use_agent:
                 agent.interrupt()
             else:
-                _get_compute_host_supervisor().interrupt(sid)
+                with dispatch_lock:
+                    _get_compute_host_supervisor().interrupt(sid, target_turn_id=target_turn_id)
         except Exception:
             pass
         finally:
@@ -10209,16 +10652,19 @@ def _handle_busy_submit(
     unwinding the turn) redirected the live turn with next-turn text — queue
     semantics betrayed by a millisecond race the user can't see.
     """
-    mode = "queue" if queued else _load_busy_input_mode()
+    mode = "queue" if queued or session.get("_turn_settling") else _load_busy_input_mode()
     agent = session.get("agent")
     with session["history_lock"]:
-        if not session.get("running"):
+        if not session.get("running") and not session.get("_turn_settling"):
             # The turn ended between prompt.submit's first busy check and this
             # helper. Let the caller retry and claim the now-idle session.
             return None
     with session["history_lock"]:
-        if not session.get("running"):
+        if not session.get("running") and not session.get("_turn_settling"):
             return None
+        # Idle publication still owns admission until its transport write ends.
+        if session.get("_turn_settling"):
+            mode = "queue"
         image_paths = list(session.get("attached_images", []))
         if image_paths:
             # Claim at submission time. A later paste must not be consumed by
@@ -10262,7 +10708,7 @@ def _handle_busy_submit(
     # provider or compute-host method while holding history_lock: an interrupt
     # can wait behind the very operation it is trying to cancel.
     with session["history_lock"]:
-        if not session.get("running"):
+        if not session.get("running") and not session.get("_turn_settling"):
             if image_paths:
                 session["attached_images"] = image_paths + list(session.get("attached_images", []))
             return None
@@ -10296,19 +10742,19 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
         if session.get("_closing"):
             return False
         queued = session.get("queued_prompt")
-        if not queued or session.get("running"):
+        if not queued or not _claim_turn_locked(session):
             return False
         queue_generation = int(session.get("_queued_prompt_generation", 0))
         queued_prompts = session.get("queued_prompts") or []
         session["queued_prompt"] = queued_prompts.pop(0) if queued_prompts else None
         if not queued_prompts:
             session.pop("queued_prompts", None)
-        session["running"] = True
         if queued.get("transport") is not None:
             session["transport"] = queued["transport"]
     use_compute_host = _session_uses_compute_host(session)
     with session["history_lock"]:
-        if int(session.get("_queued_prompt_generation", 0)) != queue_generation:
+        generation_changed = int(session.get("_queued_prompt_generation", 0)) != queue_generation
+        if generation_changed:
             # Generation cancelled the claim (Stop, compress re-anchor, …).
             # Do not dispatch — but put the claimed envelope back so a
             # legitimate follow-up is not silently dropped. Order: claimed
@@ -10324,10 +10770,28 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
                 session["queued_prompts"] = rest
             else:
                 session.pop("queued_prompts", None)
-            session["running"] = False
-            return True
-    dispatch_failed = False
+    if generation_changed:
+        _settle_turn(rid, sid, session, drain=False)
+        return True
+    with session["history_lock"]:
+        _start_inflight_turn(session, queued["text"])
+    _reconcile_pending_idle(sid, session, claimed=True)
+    dispatch_error = None
     try:
+        if not use_compute_host:
+            # A previous admission may have failed before creating the first
+            # row/branch seed. The queued user still owns first-message setup.
+            if _ensure_session_db_row(session) is False:
+                raise RuntimeError("session storage unavailable; queued message was not saved")
+            _persist_branch_seed(session)
+        if not use_compute_host and session.get("agent") is None:
+            _start_agent_build(sid, session)
+            _start_claimed_prompt_worker(
+                rid, sid, session, queued["text"],
+                image_paths=queued.get("image_paths"),
+                queued_prompt_generation=queue_generation,
+            )
+            return True
         if use_compute_host:
             if queued.get("image_paths"):
                 resp = _submit_prompt_to_compute_host(
@@ -10344,11 +10808,8 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
                 )
             if resp.get("error"):
                 message = str(((resp.get("error") or {}).get("message")) or "queued prompt failed")
-                with session["history_lock"]:
-                    session["running"] = False
-                    _clear_inflight_turn(session)
                 _emit("error", sid, {"message": message})
-                dispatch_failed = True
+                dispatch_error = message
         else:
             if queued.get("image_paths"):
                 _run_prompt_submit(
@@ -10373,16 +10834,10 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
             f"{type(exc).__name__}: {exc}",
             file=sys.stderr,
         )
-        with session["history_lock"]:
-            session["running"] = False
-        dispatch_failed = True
-    if dispatch_failed:
-        with session["history_lock"]:
-            drain_next = bool(session.get("queued_prompt")) and not session.get(
-                "_turn_cancel_requested"
-            )
-        if drain_next:
-            _drain_queued_prompt(rid, sid, session)
+        dispatch_error = exc
+    if dispatch_error is not None:
+        _emit_terminal_turn_error(sid, session, dispatch_error)
+        _settle_turn(rid, sid, session)
     return True
 
 
@@ -10467,6 +10922,7 @@ def _emit_terminal_turn_error(
         except Exception:
             error_surface = None
     with session["history_lock"]:
+        session["_turn_settling"] = True
         _fail_inflight_turn(session, error, error_surface=error_surface)
         turn = session.get("inflight_turn") or {}
         message = str(turn.get("error") or "turn failed")
@@ -10527,6 +10983,295 @@ def _queued_prompt_snapshot(session: dict) -> dict | None:
 
 
 # ── Methods: session ─────────────────────────────────────────────────
+
+
+@method("session.create")
+def _(rid, params: dict) -> dict:
+    sid = uuid.uuid4().hex[:8]
+    key = _new_session_key()
+    cols = int(params.get("cols", 80))
+    history = _coerce_seed_history(params.get("messages"))
+    title = str(params.get("title") or "").strip()
+    # When set, this is a branch: the new chat copies an existing conversation's
+    # history and links back to it so list_sessions_rich keeps it visible and the
+    # sidebar can nest it under its parent. Mirrors the TUI /branch marker.
+    parent_session_id = str(params.get("parent_session_id") or "").strip() or None
+    # Did the client pick a workspace, or are we falling back to the gateway's
+    # launch directory? Only an explicit choice is persisted as the session's
+    # workspace (see _ensure_session_db_row); otherwise it lands in "No
+    # workspace" instead of whatever folder the desktop launched in.
+    raw_cwd = str(params.get("cwd") or "").strip()
+    try:
+        explicit_cwd = bool(raw_cwd) and os.path.isdir(os.path.abspath(os.path.expanduser(raw_cwd)))
+    except Exception:
+        explicit_cwd = False
+    resolved_cwd = _completion_cwd(params)
+    source = _resolve_session_source(str(params.get("source") or "").strip() or None)
+    _enable_gateway_prompts()
+
+    # ``profile`` (app-global remote mode): a new chat started under a non-launch
+    # profile must build its agent + persist against THAT profile's home/state.db,
+    # not the dashboard's launch profile. Stored on the session so _start_agent_build
+    # and each turn re-bind HERMES_HOME. None/own profile → launch (unchanged).
+    profile = (params.get("profile") or "").strip() or None
+    profile_home = _profile_home(profile)
+
+    # The desktop composer owns its model/effort/fast as plain UI state and ships
+    # it on every session.create. Honor each as a PER-SESSION override (built into
+    # the agent below) — never a global config write, so picking a model/effort
+    # for a new chat can't mutate the profile default. provider is optional
+    # (resolved at build).
+    create_model = str(params.get("model") or "").strip()
+    session_model_override = (
+        {"model": create_model, "provider": str(params.get("provider") or "").strip() or None}
+        if create_model
+        else None
+    )
+    create_reasoning_override = None
+    if effort := str(params.get("reasoning_effort") or "").strip():
+        try:
+            from hermes_constants import parse_reasoning_effort
+
+            create_reasoning_override = parse_reasoning_effort(effort)
+        except Exception:
+            create_reasoning_override = None
+    # Presence is part of the contract: omitted means inherit the profile,
+    # true pins priority, and false pins normal. Empty string is the internal
+    # explicit-normal sentinel because _make_agent uses None for inheritance.
+    create_service_tier_override = None
+    if "fast" in params:
+        create_service_tier_override = (
+            "priority" if is_truthy_value(params.get("fast")) else ""
+        )
+
+    ready = threading.Event()
+    now = time.time()
+    lease, limit_message = _claim_active_session_slot(
+        key, live_session_id=sid, surface=source
+    )
+    if limit_message is not None:
+        return _err(rid, 4090, limit_message)
+
+    with _sessions_lock:
+        _sessions[sid] = {
+            "agent": None,
+            "agent_error": None,
+            "agent_ready": ready,
+            "attached_images": [],
+            "close_on_disconnect": is_truthy_value(params.get("close_on_disconnect", False)),
+            "active_session_lease": lease,
+            "cols": cols,
+            "created_at": now,
+            "edit_snapshots": {},
+            "explicit_cwd": explicit_cwd,
+            "history": history,
+            "history_lock": threading.Lock(),
+            "history_version": 0,
+            "image_counter": 0,
+            "cwd": resolved_cwd,
+            "inflight_turn": None,
+            "last_active": now,
+            "model_override": session_model_override,
+            "create_reasoning_override": create_reasoning_override,
+            "create_service_tier_override": create_service_tier_override,
+            "parent_session_id": parent_session_id,
+            "pending_title": title or None,
+            "profile_home": str(profile_home) if profile_home is not None else None,
+            "running": False,
+            "session_key": key,
+            "show_reasoning": _load_show_reasoning(),
+            "source": source,
+            "slash_worker": None,
+            "tool_progress_mode": _load_tool_progress_mode(),
+            "tool_started_at": {},
+            "transport": current_transport() or _stdio_transport,
+        }
+        _register_session_cwd(_sessions[sid])
+
+    # NOTE: we intentionally do NOT persist a DB row here. Every TUI/desktop
+    # launch (and every "New agent" / draft) opens a session here just to paint
+    # the composer, so eagerly creating a row left an "Untitled" empty session
+    # behind for every launch the user never typed into. The row is now created
+    # lazily on the first prompt (see _ensure_session_db_row + prompt.submit),
+    # and the AIAgent's own INSERT-OR-IGNORE persists it on the first turn too.
+
+    # Publish the slot immediately for menu-bar surfaces. This is intentionally
+    # independent of AIAgent construction so a new `HERMES_SLOT=N hermes --tui`
+    # shows as idle/gray as soon as the TUI session comes online.
+    _publish_tui_slot_online(_sessions.get(sid))
+
+    # Return the lightweight session immediately so Ink can paint the composer
+    # + skeleton panel, then build the real AIAgent just after this response is
+    # flushed.  This keeps startup responsive while still hydrating tools/skills
+    # without requiring the user to submit a first prompt.
+    _schedule_agent_build(sid)
+    _schedule_session_cap_enforcement()  # trim detached idle sessions over the cap
+
+    return _ok(
+        rid,
+        {
+            "session_id": sid,
+            "stored_session_id": key,
+            "message_count": len(history),
+            "messages": _history_to_messages(history),
+            "info": {
+                # Reflect the per-session model override (desktop composer pick)
+                # in the immediate response so the client doesn't briefly clobber
+                # its sticky pick with the global default before the deferred
+                # build's session.info lands.
+                "model": (
+                    session_model_override.get("model")
+                    if session_model_override
+                    else _resolve_model()
+                ),
+                **(
+                    {"provider": session_model_override["provider"]}
+                    if session_model_override and session_model_override.get("provider")
+                    else {}
+                ),
+                "tools": {},
+                "skills": {},
+                "cwd": _sessions[sid]["cwd"],
+                "branch": _git_branch_for_cwd(_sessions[sid]["cwd"]),
+                "project": _project_info_for_cwd(_sessions[sid]["cwd"]),
+                "lazy": True,
+                "desktop_contract": DESKTOP_BACKEND_CONTRACT,
+                "profile_name": _response_profile_name(profile),
+            },
+        },
+    )
+
+
+@method("session.list")
+def _(rid, params: dict) -> dict:
+    db = _get_db()
+    if db is None:
+        return _db_unavailable_error(rid, code=5006)
+    try:
+        # Resume picker should surface human conversation sessions from every
+        # user-facing surface — CLI, TUI, all gateway platforms (including new
+        # ones not enumerated here), ACP adapter clients, webhook sessions,
+        # custom `HERMES_SESSION_SOURCE` values, and older installs with
+        # different source labels. We deny-list only the noisy internal
+        # sources (``tool`` sub-agent runs) rather than allow-listing a
+        # fixed set of platform names that goes stale whenever a new
+        # platform is added or a user names their own source.
+        deny = frozenset({"tool"})
+
+        limit = int(params.get("limit", 200) or 200)
+        # Over-fetch modestly so per-source filtering doesn't leave us
+        # short; the compression-tip projection in ``list_sessions_rich``
+        # can also merge rows.
+        fetch_limit = max(limit * 2, 200)
+        rows = [
+            s
+            for s in db.list_sessions_rich(source=None, limit=fetch_limit, order_by_last_active=True, compact_rows=True)
+            if (s.get("source") or "").strip().lower() not in deny
+        ][:limit]
+        return _ok(
+            rid,
+            {
+                "sessions": [
+                    {
+                        "id": s["id"],
+                        "title": s.get("title") or "",
+                        "preview": s.get("preview") or "",
+                        "started_at": s.get("started_at") or 0,
+                        "message_count": s.get("message_count") or 0,
+                        "source": s.get("source") or "",
+                    }
+                    for s in rows
+                ]
+            },
+        )
+    except Exception as e:
+        return _err(rid, 5006, str(e))
+
+
+@method("session.most_recent")
+def _(rid, params: dict) -> dict:
+    """Return the most recent human-facing session id, or ``None``.
+
+    Mirrors ``session.list``'s deny-list behaviour (drops ``tool``
+    sub-agent rows).  Used by TUI auto-resume when
+    ``display.tui_auto_resume_recent`` is on; the field is also handy
+    for any CLI tooling that wants "latest session" without paginating
+    the full list.
+
+    Contract: a ``{"session_id": null}`` result means "no eligible
+    session found right now".  Errors are also folded into that
+    null-result shape (and logged) so callers don't have to special-
+    case JSON-RPC error envelopes for what is a normal "no answer".
+    """
+    db = _get_db()
+    if db is None:
+        return _ok(rid, {"session_id": None})
+    try:
+        deny = frozenset({"tool"})
+        # Over-fetch by a generous bounded amount so heavy sub-agent
+        # users (lots of recent ``tool`` rows) don't get a false
+        # "no eligible session" answer.  ``session.list`` uses a
+        # similar over-fetch strategy.
+        rows = db.list_sessions_rich(source=None, limit=200, order_by_last_active=True, compact_rows=True)
+        for row in rows:
+            src = (row.get("source") or "").strip().lower()
+            if src in deny:
+                continue
+            return _ok(
+                rid,
+                {
+                    "session_id": row.get("id"),
+                    "title": row.get("title") or "",
+                    "started_at": row.get("started_at") or 0,
+                    "source": row.get("source") or "",
+                },
+            )
+        return _ok(rid, {"session_id": None})
+    except Exception:
+        logger.exception("session.most_recent failed")
+        return _ok(rid, {"session_id": None})
+
+
+@method("project.facts")
+def _(rid, params: dict) -> dict:
+    """Structured project facts for a cwd — manifests, package manager, the
+    exact verify commands, and context files.
+
+    The same detection the coding-context posture (#43316) bakes into the system
+    prompt, exposed so UIs (the desktop verify surface) consume it instead of
+    re-sniffing. ``{"facts": null}`` means the cwd isn't a code workspace.
+    """
+    try:
+        from agent.coding_context import project_facts_for
+
+        return _ok(rid, {"facts": project_facts_for(params.get("cwd"))})
+    except Exception:
+        logger.exception("project.facts failed")
+        return _ok(rid, {"facts": None})
+
+
+@method("verification.status")
+def _(rid, params: dict) -> dict:
+    """Best known coding verification evidence for a cwd/session.
+
+    Read-only consumer of the core ledger. It never runs checks and never
+    upgrades targeted evidence into a repository-wide guarantee.
+    """
+    try:
+        from agent.verification_evidence import verification_status
+
+        return _ok(
+            rid,
+            {
+                "verification": verification_status(
+                    session_id=params.get("session_id") or params.get("session_key"),
+                    cwd=params.get("cwd"),
+                )
+            },
+        )
+    except Exception:
+        logger.exception("verification.status failed")
+        return _ok(rid, {"verification": {"status": "unknown", "evidence": None}})
 
 
 def _lazy_resume_info(
@@ -11932,75 +12677,58 @@ def _maybe_fire_tui_loop_tick(sid: str, session: dict) -> None:
         return
 
     with session["history_lock"]:
-        if session.get("running"):
+        if not _claim_turn_locked(session, autonomous=True):
             return  # busy — stays due, next poll retries
-        session["running"] = True
 
-    wakeup = mgr.fire_tick()
-    if not wakeup:
-        with session["history_lock"]:
-            session["running"] = False
-        return
-
-    tick_no = mgr.state.ticks_fired if mgr.state else "?"
     rid = f"__loop__{int(time.time() * 1000)}"
+    owns_claim = True
     try:
-        _emit(
-            "status.update",
-            sid,
-            {"kind": "loop", "text": f"↻ /loop wakeup #{tick_no} firing…"},
-        )
+        wakeup = mgr.fire_tick()
+        if not wakeup:
+            _release_turn_claim(rid, sid, session)
+            return
+        tick_no = mgr.state.ticks_fired if mgr.state else "?"
+        _emit("status.update", sid,
+              {"kind": "loop", "text": f"↻ /loop wakeup #{tick_no} firing…"})
         if wakeup.lstrip().startswith("/"):
-            # Slash-command loop: route through the slash pipeline instead of
-            # the model. No model reply to evaluate — complete immediately.
-            with session["history_lock"]:
-                session["running"] = False
-            try:
-                parts = wakeup.lstrip()[1:].split(None, 1)
-                resp = _methods["command.dispatch"](
-                    rid,
-                    {
-                        "name": parts[0] if parts else "",
-                        "arg": parts[1] if len(parts) > 1 else "",
-                        "session_id": sid,
-                    },
-                )
-                payload = (resp or {}).get("result") or {}
-                out = str(payload.get("output") or "").strip()
-                if out:
-                    _emit("status.update", sid, {"kind": "loop", "text": out})
-                if payload.get("type") == "send" and payload.get("message"):
-                    # The command resolves to a prompt (skill command etc.) —
-                    # run it as a normal turn; the post-turn hook completes
-                    # the tick.
-                    with session["history_lock"]:
-                        if session.get("running"):
-                            mgr.abandon_tick()
-                            return
-                        session["running"] = True
-                    _emit("message.start", sid)
-                    _run_prompt_submit(rid, sid, session, payload["message"])
+            # Slash commands retain their ordinary idle-session semantics.
+            # Publish the released claim before resolving; a send result must
+            # compete for a fresh claim with queued users taking priority.
+            owns_claim = False
+            _release_turn_claim(rid, sid, session)
+            parts = wakeup.lstrip()[1:].split(None, 1)
+            resp = _methods["command.dispatch"](rid, {
+                "name": parts[0] if parts else "",
+                "arg": parts[1] if len(parts) > 1 else "",
+                "session_id": sid,
+            })
+            payload = (resp or {}).get("result") or {}
+            out = str(payload.get("output") or "").strip()
+            if out:
+                _emit("status.update", sid, {"kind": "loop", "text": out})
+            if payload.get("type") == "send" and payload.get("message"):
+                with session["history_lock"]:
+                    owns_claim = _claim_turn_locked(session, autonomous=True)
+                if not owns_claim:
+                    mgr.abandon_tick()  # stays due, including during settlement
                     return
-            except Exception:
-                pass
+                _run_prompt_submit(rid, sid, session, payload["message"])
+                return
             decision = mgr.complete_tick("")
             if decision.get("message"):
                 _emit("status.update", sid, {"kind": "loop", "text": decision["message"]})
             return
-        _emit("message.start", sid)
         _run_prompt_submit(rid, sid, session, wakeup)
     except Exception as exc:
-        print(
-            f"[tui_gateway] loop wakeup dispatch failed: "
-            f"{type(exc).__name__}: {exc}",
-            file=sys.stderr,
-        )
-        with session["history_lock"]:
-            session["running"] = False
         try:
             mgr.abandon_tick()
         except Exception:
             pass
+        if owns_claim:
+            _emit_terminal_turn_error(sid, session, exc)
+            _settle_turn(rid, sid, session)
+        else:
+            _emit("error", sid, {"message": str(exc)})
 
 
 def _format_kanban_event_text(sub: dict, task, ev, board_slug: str) -> Optional[str]:
@@ -12158,6 +12886,127 @@ def _collect_kanban_notifications(session: dict) -> list:
     return texts
 
 
+def _commit_compute_notification(session: dict, proposal_id: str) -> None:
+    """Worker delivery commit; retry bookkeeping without re-running accepted work."""
+    from tools.async_delegation import complete_event_delivery
+
+    with session.setdefault("_compute_notification_lock", threading.RLock()):
+        proposal = (session.get("_compute_notifications") or {}).get(proposal_id)
+        if proposal is None or not proposal.get("accepted_turn_id"):
+            return
+        complete_event_delivery(proposal["event"], proposal["claim"])
+        session.setdefault("_compute_notification_receipts", {})[proposal_id] = proposal["accepted_turn_id"]
+        session["_compute_notifications"].pop(proposal_id, None)
+
+
+def _export_compute_notifications(sid: str, session: dict) -> None:
+    """Export owned work, retaining proposals until a parent-admitted delivery.
+
+    Durable delivery is claimed only at admission, so a long user queue cannot
+    age out a claim. Stable ids survive failed writes and are retried by the
+    poller. Accepted receipts are retried until the parent confirms receipt.
+    """
+    from tools.process_registry import process_registry
+
+    lock = session.setdefault("_compute_notification_lock", threading.RLock())
+    with lock:
+        proposals = session.setdefault("_compute_notifications", {})
+        for proposal_id, proposal in list(proposals.items()):
+            if proposal.get("accepted_turn_id"):
+                try:
+                    _commit_compute_notification(session, proposal_id)
+                except Exception:
+                    logger.warning("compute notification delivery commit failed; retained for retry", exc_info=True)
+        drained = process_registry.drain_notifications(
+            session_key=session.get("session_key", ""),
+            owns_event=lambda evt: _session_owns_notification_event(sid, session, evt),
+            skip_poll_observed=False,
+        )
+        for evt, text in drained:
+            key = _notification_event_dedup_key(evt)
+            if any(p["key"] == key for p in proposals.values()):
+                continue
+            proposal_id = uuid.uuid4().hex
+            proposals[proposal_id] = {"id": proposal_id, "event": evt, "text": text, "key": key}
+        outgoing = [{k: p[k] for k in ("id", "event", "text")}
+                    for p in proposals.values()
+                    if not p.get("accepted_turn_id")
+                    and p["id"] != session.get("_compute_notification_delivering")]
+        receipts = dict(session.get("_compute_notification_receipts") or {})
+    for proposal in outgoing:
+        _emit("compute.notification", sid, proposal)
+    for proposal_id, turn_id in receipts.items():
+        _emit("compute.notification.accepted", sid, {"id": proposal_id, "turn_id": turn_id})
+
+
+def _receive_compute_notification(
+    sid: str, session: dict, kind: str, payload: dict, turn_id: str | None,
+) -> None:
+    proposal_id = str(payload.get("id") or "")
+    if not proposal_id:
+        return
+    acknowledgement = kind == "compute.notification.accepted"
+    if not acknowledgement:
+        evt = payload.get("event")
+        if (not isinstance(evt, dict) or not isinstance(payload.get("text"), str)
+                or (_notification_event_requires_owner(evt)
+                    and not _session_owns_notification_event(sid, session, evt))):
+            return
+    with session["history_lock"]:
+        pending = session.setdefault("_compute_notification_proposals", {})
+        accepted = session.setdefault("_compute_notifications_accepted", {})
+        if acknowledgement:
+            # A retried receipt can outlive its turn; match its original admission.
+            turn_id = payload.get("turn_id") or turn_id
+            admissions = (session.get("_compute_notification_admissions") or {}).get(proposal_id) or set()
+            if not turn_id or (turn_id not in admissions and turn_id != accepted.get(proposal_id)):
+                return
+            pending.pop(proposal_id, None)
+            accepted[proposal_id] = turn_id
+            session.get("_compute_notification_admissions", {}).pop(proposal_id, None)
+        else:
+            if proposal_id in accepted:
+                return
+            pending.setdefault(proposal_id, dict(payload))
+            if session.get("_compute_notification_retry_blocked") == proposal_id:
+                session.pop("_compute_notification_retry_blocked", None)
+    if acknowledgement:
+        try:
+            _get_compute_host_supervisor().ack_notification(sid, proposal_id, turn_id)
+        except Exception:
+            logger.warning("compute notification receipt confirmation failed; worker will retry", exc_info=True)
+    _reconcile_pending_idle(sid, session)
+    _drain_turn_work("__notification__", sid, session)
+
+
+def _drain_compute_notification(rid, sid: str, session: dict) -> bool:
+    """Parent admission: user queue wins; failure leaves the proposal retryable."""
+    with session["history_lock"]:
+        pending = session.get("_compute_notification_proposals") or {}
+        if (not pending or session.get("_compute_notification_inflight")
+                or next(iter(pending)) == session.get("_compute_notification_retry_blocked")
+                or not _claim_turn_locked(session, autonomous=True)):
+            return False
+        proposal_id, proposal = next(iter(pending.items()))
+        session["_compute_notification_inflight"] = proposal_id
+    try:
+        response = _submit_prompt_to_compute_host(
+            rid, sid, session, proposal["text"], notification_id=proposal_id,
+            display_kind=("async_delegation_complete"
+                          if proposal["event"].get("type") == "async_delegation" else None),
+        )
+        if response.get("error"):
+            raise RuntimeError(response["error"]["message"])
+    except Exception as exc:
+        with session["history_lock"]:
+            session.pop("_compute_notification_inflight", None)
+            session["_compute_notification_retry_blocked"] = proposal_id
+        _emit_terminal_turn_error(sid, session, exc)
+        # Do not spin retrying a broken pipe. The worker re-publishes until accepted.
+        _settle_turn(rid, sid, session, drain=False)
+    return True
+
+
 def _notification_poller_loop(
     stop_event: threading.Event, sid: str, session: dict
 ) -> None:
@@ -12179,6 +13028,7 @@ def _notification_poller_loop(
     from tools.process_registry import process_registry, format_process_notification
 
     _emitted = set()  # dedup re-queued events so same completion isn't emitted 50 times while session is busy
+    next_slot_retry_at = time.monotonic()
     _last_kanban_poll = 0.0
     _last_loop_poll = 0.0
     while not stop_event.is_set() and not session.get("_finalized"):
@@ -12197,6 +13047,13 @@ def _notification_poller_loop(
                     f"{type(_loop_exc).__name__}: {_loop_exc}",
                     file=sys.stderr,
                 )
+        # Backfill an Agent Lights slot for a session that started while
+        # capacity was full. The dedicated _tui_light_slot_retry_loop also
+        # retries, but this poller path recovers a slot even when that
+        # thread never started, keeping the light/profile mapping truthful.
+        if _now >= next_slot_retry_at:
+            _retry_tui_light_slot_registration(session)
+            next_slot_retry_at = _now + _TUI_LIGHT_SLOT_RETRY_INTERVAL_S
         if _now - _last_kanban_poll >= _KANBAN_POLL_SECONDS:
             _last_kanban_poll = _now
             try:
@@ -12218,14 +13075,12 @@ def _notification_poller_loop(
             if _pending:
                 _batch: list = []
                 with session["history_lock"]:
-                    if not session.get("running"):
-                        session["running"] = True
+                    if _claim_turn_locked(session, autonomous=True):
                         _batch = list(_pending)
                         session["_kanban_pending"] = []
                 if _batch:
                     rid = f"__notif__{int(time.time() * 1000)}"
                     try:
-                        _emit("message.start", sid)
                         _run_prompt_submit(rid, sid, session, "\n".join(_batch))
                     except Exception as exc:
                         print(
@@ -12233,12 +13088,24 @@ def _notification_poller_loop(
                             f"{type(exc).__name__}: {exc}",
                             file=sys.stderr,
                         )
-                        with session["history_lock"]:
-                            session["running"] = False
+                        _emit_terminal_turn_error(sid, session, exc)
+                        _settle_turn(rid, sid, session)
+        if session.get("_parent_owned_turns"):
+            try:
+                _export_compute_notifications(sid, session)
+            except Exception:
+                logger.warning("compute notification export failed; retained for retry", exc_info=True)
+            stop_event.wait(0.5)
+            continue
         try:
             evt = process_registry.completion_queue.get(timeout=0.5)
         except Exception:
             continue
+
+        with _sessions_lock:
+            if _sessions.get(sid) is not session:
+                process_registry.completion_queue.put(evt)
+                break
 
         # Multiple desktop sessions share this one process-wide queue. Only
         # consume events that belong to *this* session — otherwise a background
@@ -12291,11 +13158,9 @@ def _notification_poller_loop(
 
         _requeued = False
         with session["history_lock"]:
-            if session.get("running"):
+            if not _claim_turn_locked(session, autonomous=True):
                 process_registry.completion_queue.put(evt)
                 _requeued = True
-            else:
-                session["running"] = True
         if _requeued:
             # Back off before re-polling: the re-queued event keeps the queue
             # non-empty, so without a sleep this loop spins at full speed
@@ -12309,9 +13174,9 @@ def _notification_poller_loop(
         )
         _claim = claim_event_delivery(evt, "tui-poller")
         if _claim is None:
+            _release_turn_claim(rid, sid, session)
             continue
         try:
-            _emit("message.start", sid)
             if evt.get("type") == "async_delegation":
                 _run_prompt_submit(
                     rid,
@@ -12331,8 +13196,12 @@ def _notification_poller_loop(
                 f"{type(exc).__name__}: {exc}",
                 file=sys.stderr,
             )
-            with session["history_lock"]:
-                session["running"] = False
+            _emit_terminal_turn_error(sid, session, exc)
+            _settle_turn(rid, sid, session)
+
+    if session.get("_parent_owned_turns"):
+        _export_compute_notifications(sid, session)
+        return
 
     # Drain any remaining events after stop signal (process all pending
     # before exiting so nothing is lost on shutdown). Events owned by other
@@ -12376,10 +13245,9 @@ def _notification_poller_loop(
             _emitted.add(_dedup_key)
 
         with session["history_lock"]:
-            if session.get("running"):
+            if not _claim_turn_locked(session, autonomous=True):
                 process_registry.completion_queue.put(evt)
                 break
-            session["running"] = True
 
         rid = f"__notif__{int(time.time() * 1000)}"
         from tools.async_delegation import (
@@ -12387,9 +13255,9 @@ def _notification_poller_loop(
         )
         _claim = claim_event_delivery(evt, "tui-poller")
         if _claim is None:
+            _release_turn_claim(rid, sid, session)
             continue
         try:
-            _emit("message.start", sid)
             if evt.get("type") == "async_delegation":
                 _run_prompt_submit(
                     rid,
@@ -12409,8 +13277,8 @@ def _notification_poller_loop(
                 f"{type(exc).__name__}: {exc}",
                 file=sys.stderr,
             )
-            with session["history_lock"]:
-                session["running"] = False
+            _emit_terminal_turn_error(sid, session, exc)
+            _settle_turn(rid, sid, session)
 
     # Hand any other sessions' events back to the shared queue.
     for evt in deferred:
@@ -12538,6 +13406,9 @@ def _start_notification_poller(sid: str, session: dict) -> threading.Event:
         (s, th) for (s, th) in _notification_pollers if th.is_alive()
     ]
     _notification_pollers.append((stop, t))
+    # Per-session handle so _finalize_session can stop/join this poller on
+    # session close (see the _notif_thread join in _finalize_session).
+    session["_notif_thread"] = t
     t.start()
     return stop
 
@@ -12740,32 +13611,41 @@ def _run_prompt_submit(
     queued_prompt_generation: int | None = None,
     terminal_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> bool:
-    with session["history_lock"]:
-        if session.get("_closing"):
-            session["running"] = False
+    if _session_uses_compute_host(session):
+        response = _submit_prompt_to_compute_host(
+            rid, sid, session, text, image_paths=image_paths,
+            queued_prompt_generation=queued_prompt_generation, display_kind=display_kind,
+        )
+        if response.get("error"):
+            _emit_terminal_turn_error(sid, session, response["error"]["message"])
+            _settle_turn(rid, sid, session)
             return False
-        if (
+        return True
+    with session["history_lock"]:
+        cancelled = session.get("_closing") or session.get("_turn_cancel_requested") or (
             queued_prompt_generation is not None
             and int(session.get("_queued_prompt_generation", 0)) != queued_prompt_generation
-        ):
-            session["running"] = False
-            return False
-        if image_paths is None:
-            images = list(session.get("attached_images", []))
-            session["attached_images"] = []
-        else:
-            images = list(image_paths)
-        inflight = session.get("inflight_turn")
-        # A retained failed turn (see _fail_inflight_turn) is a stale leftover
-        # by the time a new turn starts — replace it, never append onto it.
-        if not isinstance(inflight, dict) or inflight.get("status") == "error":
-            _start_inflight_turn(session, text)
-        agent = session["agent"]
-        if hasattr(agent, "clear_interrupt"):
-            try:
-                agent.clear_interrupt()
-            except Exception:
-                pass
+        )
+        if not cancelled:
+            if image_paths is None:
+                images = list(session.get("attached_images", []))
+                session["attached_images"] = []
+            else:
+                images = list(image_paths)
+            inflight = session.get("inflight_turn")
+            # A retained failed turn (see _fail_inflight_turn) is a stale leftover
+            # by the time a new turn starts — replace it, never append onto it.
+            if not isinstance(inflight, dict) or inflight.get("status") == "error":
+                _start_inflight_turn(session, text)
+            agent = session["agent"]
+            if hasattr(agent, "clear_interrupt"):
+                try:
+                    agent.clear_interrupt()
+                except Exception:
+                    pass
+    if cancelled:
+        _settle_turn(rid, sid, session, drain=False)
+        return False
     # Desktop/TUI observability (#86647): this is the ONE INFO record proving
     # a Desktop/TUI prompt was accepted by THIS process, and it ties together
     # every id a rotation-mute trace needs — the UI session id, the gateway
@@ -12830,6 +13710,7 @@ def _run_prompt_submit(
                 set_current_session_key,
             )
 
+            _emit_tui_light_cue(sid, "working")
             approval_token = set_current_session_key(session["session_key"])
             session_tokens = _set_session_context(
                 session["session_key"],
@@ -12897,6 +13778,7 @@ def _run_prompt_submit(
                     context_length=ctx_len,
                 )
                 if ctx.blocked:
+                    _emit_tui_light_cue(sid, "error")
                     _emit(
                         "error",
                         sid,
@@ -13240,10 +14122,13 @@ def _run_prompt_submit(
                 )
 
                 raw = result.get("final_response", "")
+                is_error_result = bool(
+                    result.get("error") or result.get("failed") or result.get("partial")
+                )
                 status = (
                     "interrupted"
                     if result.get("interrupted")
-                    else "error" if result.get("error") else "complete"
+                    else "error" if is_error_result else "complete"
                 )
                 # When the backend produced no visible response AND reported a
                 # real error (e.g. invalid model slug → provider 4xx), surface
@@ -13309,7 +14194,17 @@ def _run_prompt_submit(
                     )
                 except Exception:
                     _error_surface = None
+
+            if status == "error":
+                _emit_tui_light_cue(sid, "error")
+            elif status == "complete" and isinstance(raw, str) and raw.strip():
+                _emit_tui_light_cue(sid, "final_answer")
+
+            # Completion is a delivery boundary, not an ownership handoff.
+            # Keep admission busy until model/callback/context cleanup finishes;
+            # completion-event sends must queue even in redirect/steer mode.
             with session["history_lock"]:
+                session["_turn_settling"] = True
                 if status == "error":
                     # Returned-error result (provider 4xx, budget, etc.): retain
                     # the failed turn for resume replay instead of clearing it.
@@ -13528,7 +14423,10 @@ def _run_prompt_submit(
             # gateway's separate in-memory history at the turn-start snapshot.
             # Keep the partial turn available to the next prompt; the durable
             # inflight record still carries the recoverable error state.
+            with session["history_lock"]:
+                session["_turn_settling"] = True
             _restore_agent_history_after_turn_error(session, agent)
+            _emit_tui_light_cue(sid, "error")
             if terminal_callback is not None and not terminal_receipt_attempted:
                 terminal_receipt_attempted = True
                 try:
@@ -13610,7 +14508,6 @@ def _run_prompt_submit(
             # this turn can't fire during a later turn on the same agent.
             agent.interim_assistant_callback = None
             with session["history_lock"]:
-                session["running"] = False
                 session["last_active"] = time.time()
                 if not turn_error_retained:
                     _clear_inflight_turn(session)
@@ -13647,7 +14544,11 @@ def _run_prompt_submit(
                 with session["history_lock"]:
                     session.pop("_hosted_room_task", None)
             session.pop("_auto_continue_scheduled", None)
-            _emit_settled_session_info(sid, session, agent)
+            _leftover_steer = result.get("pending_steer") if isinstance(result, dict) else None
+            if isinstance(_leftover_steer, str) and _leftover_steer.strip():
+                with session["history_lock"]:
+                    _enqueue_prompt(session, _leftover_steer, session.get("transport"))
+            _settle_turn(rid, sid, session, drain=False)
 
         # A user prompt that arrived mid-turn (interrupt + queue) wins over
         # every auto follow-up below — drain it first and skip them this cycle;
@@ -13658,11 +14559,12 @@ def _run_prompt_submit(
         # so it isn't silently dropped — same rule as cli.py and gateway/run.py.
         # A real queued prompt still wins: the merge in _enqueue_prompt keeps
         # both texts.
-        _leftover_steer = result.get("pending_steer") if isinstance(result, dict) else None
-        if isinstance(_leftover_steer, str) and _leftover_steer.strip():
+        if session.get("_parent_owned_turns"):
             with session["history_lock"]:
-                _enqueue_prompt(session, _leftover_steer, session.get("transport"))
-        if _drain_queued_prompt(rid, sid, session):
+                session["_compute_followup"] = goal_followup
+            _export_compute_notifications(sid, session)
+            return
+        if _drain_turn_work(rid, sid, session):
             return
 
         # Chain a goal-continuation turn if the judge said so. We do
@@ -13672,23 +14574,19 @@ def _run_prompt_submit(
         # prompt.submit sets running=True under the history_lock and
         # we check that guard before re-firing.
         if goal_followup:
-            with session["history_lock"]:
-                if session.get("running"):
-                    # User already sent something — their turn wins,
-                    # the judge will re-run on the next turn anyway.
-                    return
-                session["running"] = True
-            try:
-                _emit("message.start", sid)
-                _run_prompt_submit(rid, sid, session, goal_followup)
-            except Exception as _cont_exc:
-                print(
-                    f"[tui_gateway] goal continuation dispatch failed: "
-                    f"{type(_cont_exc).__name__}: {_cont_exc}",
-                    file=sys.stderr,
-                )
+            def continue_goal():
                 with session["history_lock"]:
-                    session["running"] = False
+                    if session.get("_turn_settling"):
+                        session.setdefault("_deferred_turns", []).append(continue_goal)
+                        return
+                    if not _claim_turn_locked(session, autonomous=True):
+                        return  # A user turn wins; its judge re-evaluates the goal.
+                try:
+                    _run_prompt_submit(rid, sid, session, goal_followup)
+                except Exception as exc:
+                    _emit_terminal_turn_error(sid, session, exc)
+                    _settle_turn(rid, sid, session)
+            continue_goal()
 
         # Drain completion notifications that arrived during this turn.
         # The background poller handles between-turn delivery; this is
@@ -13713,19 +14611,18 @@ def _run_prompt_submit(
             )
             for index, (_evt, synth) in enumerate(drained):
                 with session["history_lock"]:
-                    if session.get("running"):
+                    if not _claim_turn_locked(session, autonomous=True):
                         for pending_evt, _pending_synth in drained[index:]:
                             process_registry.completion_queue.put(pending_evt)
                         break
-                    session["running"] = True
                 from tools.async_delegation import (
                     claim_event_delivery, complete_event_delivery, release_event_delivery,
                 )
                 _claim = claim_event_delivery(_evt, "tui-post-turn")
                 if _claim is None:
+                    _release_turn_claim(rid, sid, session)
                     continue
                 try:
-                    _emit("message.start", sid)
                     _run_prompt_submit(rid, sid, session, synth)
                     complete_event_delivery(_evt, _claim)
                 except Exception as _n_exc:
@@ -13735,8 +14632,8 @@ def _run_prompt_submit(
                         f"{type(_n_exc).__name__}: {_n_exc}",
                         file=sys.stderr,
                     )
-                    with session["history_lock"]:
-                        session["running"] = False
+                    _emit_terminal_turn_error(sid, session, _n_exc)
+                    _settle_turn(rid, sid, session)
         except Exception as _drain_exc:
             print(
                 f"[tui_gateway] completion queue drain failed: "
@@ -13755,8 +14652,8 @@ def _run_prompt_submit(
             session["_run_thread"] = run_thread
             run_thread.start()
     if not can_start:
-        with session["history_lock"]:
-            session["running"] = False
+        _emit_terminal_turn_error(sid, session, "Session closed before the turn could start")
+        _settle_turn(rid, sid, session, drain=False)
     return can_start
 
 
@@ -15555,6 +16452,10 @@ _PENDING_INPUT_COMMANDS: frozenset[str] = frozenset(
         "queue",
         "q",
         "steer",
+        "nah",
+        "tldr",
+        "tl-dr",
+        "tl_dr",
         "plan",
         "goal",
         "loop",
@@ -15697,6 +16598,557 @@ def _resolve_name(name: str) -> str:
         return r.name if r else name
     except Exception:
         return name
+
+
+@method("command.dispatch")
+def _(rid, params: dict) -> dict:
+    name, arg = params.get("name", "").lstrip("/"), params.get("arg", "")
+    resolved = _resolve_name(name)
+    if resolved != name:
+        name = resolved
+    session = _sessions.get(params.get("session_id", ""))
+
+    qcmds = _load_cfg().get("quick_commands", {})
+    if name in qcmds:
+        qc = qcmds[name]
+        if qc.get("type") == "exec":
+            # Sanitize env to prevent credential leakage —
+            # quick commands run in the TUI server process which
+            # has all API keys in os.environ.
+            from tools.environments.local import build_subprocess_env
+            sanitized_env = build_subprocess_env()
+            r = subprocess.run(
+                qc.get("command", ""),
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                stdin=subprocess.DEVNULL,
+                env=sanitized_env,
+            )
+            output = (
+                (r.stdout or "")
+                + ("\n" if r.stdout and r.stderr else "")
+                + (r.stderr or "")
+            ).strip()[:4000]
+            if output:
+                from agent.redact import redact_sensitive_text
+                output = redact_sensitive_text(output)
+            if r.returncode != 0:
+                return _err(
+                    rid,
+                    4018,
+                    output or f"quick command failed with exit code {r.returncode}",
+                )
+            return _ok(rid, {"type": "exec", "output": output})
+        if qc.get("type") == "alias":
+            return _ok(rid, {"type": "alias", "target": qc.get("target", "")})
+
+    try:
+        from hermes_cli.plugins import (
+            get_plugin_command_handler,
+            resolve_plugin_command_result,
+        )
+
+        handler = get_plugin_command_handler(name)
+        if handler:
+            result = resolve_plugin_command_result(handler(arg))
+            return _ok(rid, {"type": "plugin", "output": str(result or "")})
+    except Exception:
+        pass
+
+    try:
+        from agent.skill_bundles import (
+            build_bundle_invocation_message,
+            get_skill_bundles,
+            resolve_bundle_command_key,
+        )
+
+        from hermes_cli.commands import resolve_command
+
+        bundle_key = (
+            resolve_bundle_command_key(name)
+            if resolve_command(name) is None
+            else None
+        )
+    except Exception:
+        bundle_key = None
+
+    if bundle_key is not None:
+        try:
+            bundle_result = build_bundle_invocation_message(
+                bundle_key,
+                arg,
+                task_id=session.get("session_key", "") if session else "",
+                platform=_resolve_session_platform(),
+            )
+        except Exception as exc:
+            return _err(rid, 4018, f"bundle dispatch failed: {exc}")
+
+        if not bundle_result:
+            return _err(rid, 4018, f"failed to load bundle: {bundle_key}")
+
+        msg, loaded_names, missing = bundle_result
+        bundle_info = get_skill_bundles().get(bundle_key, {})
+        bundle_name = bundle_info.get("name", bundle_key.lstrip("/"))
+        notice = f"⚡ Loading bundle: {bundle_name} ({len(loaded_names)} skills)"
+        if missing:
+            notice += f"\nSkipped missing skills: {', '.join(missing)}"
+        return _ok(
+            rid,
+            {
+                "type": "send",
+                "message": msg,
+                "notice": notice,
+            },
+        )
+
+    try:
+        from agent.skill_commands import (
+            scan_skill_commands,
+            build_skill_invocation_message,
+        )
+
+        cmds = scan_skill_commands()
+        key = f"/{name}"
+        if key in cmds:
+            msg = build_skill_invocation_message(
+                key, arg, task_id=session.get("session_key", "") if session else ""
+            )
+            if msg:
+                return _ok(
+                    rid,
+                    {
+                        "type": "skill",
+                        "message": msg,
+                        "name": cmds[key].get("name", name),
+                    },
+                )
+    except Exception:
+        pass
+
+    # ── Commands that queue messages onto _pending_input in the CLI ───
+    # In the TUI the slash worker subprocess has no reader for that queue,
+    # so we handle them here and return a structured payload.
+
+    if name in {"queue", "q"}:
+        if not arg:
+            return _err(rid, 4004, "usage: /queue <prompt>")
+        return _ok(rid, {"type": "send", "message": arg})
+
+    if name == "nah":
+        return _ok(rid, {"type": "send", "message": _build_nah_instruction(arg)})
+
+    if name == "learn":
+        # Open-ended: build the standards-guided prompt and submit it as a
+        # normal agent turn. The live agent gathers whatever the user
+        # described (dirs, URLs, this conversation, pasted text) with its own
+        # tools and authors the skill via skill_manage. Works on any backend.
+        from agent.learn_prompt import build_learn_prompt
+
+        return _ok(rid, {"type": "send", "message": build_learn_prompt(arg)})
+    if name == "moa":
+        # /moa is one-shot sugar only: run a single prompt through the default
+        # MoA preset, then restore the prior model. To *switch* to a MoA preset
+        # for the rest of the session, pick it from the model picker (MoA
+        # presets surface as a virtual "Mixture of Agents" provider).
+        try:
+            from hermes_cli.moa_config import moa_usage, normalize_moa_config
+
+            if not arg:
+                return _err(rid, 4004, moa_usage())
+            if not session:
+                return _err(rid, 4001, "no active session")
+            sid = params.get("session_id", "")
+            moa_cfg = normalize_moa_config(_load_cfg().get("moa") or {})
+            preset = moa_cfg["default_preset"]
+            # Record the live model identity so it can be restored after the
+            # one-shot turn, then swap the agent's client in place (#53444:
+            # setting session["model_override"] alone never switched the
+            # already-built agent, so the turn silently ran on the old model).
+            agent = session.get("agent")
+            session["moa_one_shot_restore"] = {
+                "override": session.get("model_override"),
+                "model": getattr(agent, "model", None) if agent else None,
+                "provider": getattr(agent, "provider", None) if agent else None,
+            }
+            if agent is not None:
+                # Live agent: swap its client in place so THIS turn runs MoA.
+                try:
+                    _apply_model_switch(
+                        sid,
+                        session,
+                        f"{preset} --provider moa",
+                        confirm_expensive_model=False,
+                        pin_session_override=True,
+                        # One-shot turn-scoped swap — never persist the MoA
+                        # virtual provider to config.yaml.
+                        persist_override=False,
+                    )
+                except Exception as exc:
+                    session.pop("moa_one_shot_restore", None)
+                    return _err(rid, 5030, f"moa unavailable: {exc}")
+            else:
+                # No agent built yet (lazy/fresh session): the override is
+                # consumed by the first build, so the turn runs MoA without an
+                # in-place switch.
+                session["model_override"] = {
+                    "provider": "moa",
+                    "model": preset,
+                    "base_url": "moa://local",
+                    "api_key": "moa-virtual-provider",
+                    "api_mode": "chat_completions",
+                }
+            return _ok(
+                rid,
+                {
+                    "type": "send",
+                    "notice": f"MoA one-shot queued with preset {preset}; previous model will be restored after this turn.",
+                    "message": arg,
+                },
+            )
+        except Exception as exc:
+            return _err(rid, 5030, f"moa unavailable: {exc}")
+
+    if name == "retry":
+        if not session:
+            return _err(rid, 4001, "no active session to retry")
+        if session.get("running"):
+            return _err(
+                rid, 4009, "session busy — /interrupt the current turn before /retry"
+            )
+        history = session.get("history", [])
+        if not history:
+            return _err(rid, 4018, "no previous user message to retry")
+        # Walk backwards to find the last user message
+        last_user_idx = None
+        for i in range(len(history) - 1, -1, -1):
+            if history[i].get("role") == "user":
+                last_user_idx = i
+                break
+        if last_user_idx is None:
+            return _err(rid, 4018, "no previous user message to retry")
+        content = history[last_user_idx].get("content", "")
+        if isinstance(content, list):
+            content = " ".join(
+                p.get("text", "")
+                for p in content
+                if isinstance(p, dict) and p.get("type") == "text"
+            )
+        if not content:
+            return _err(rid, 4018, "last user message is empty")
+        # Truncate history: remove everything from the last user message onward
+        # (mirrors CLI retry_last() which strips the failed exchange)
+        with session["history_lock"]:
+            session["history"] = history[:last_user_idx]
+            session["history_version"] = int(session.get("history_version", 0)) + 1
+        return _ok(rid, {"type": "send", "message": content})
+
+    if name == "steer":
+        if not arg:
+            return _err(rid, 4004, "usage: /steer <prompt>")
+        agent = session.get("agent") if session else None
+        if agent and hasattr(agent, "steer"):
+            try:
+                accepted = agent.steer(arg)
+                if accepted:
+                    return _ok(
+                        rid,
+                        {
+                            "type": "exec",
+                            "output": f"⏩ Steer queued — arrives after the next tool call: {arg[:80]}{'...' if len(arg) > 80 else ''}",
+                        },
+                    )
+            except Exception:
+                pass
+        # Fallback: no active run, treat as next-turn message
+        return _ok(rid, {"type": "send", "message": arg})
+
+    if name == "goal":
+        if not session:
+            return _err(rid, 4001, "no active session")
+        try:
+            from hermes_cli.goals import GoalManager
+        except Exception as exc:
+            return _err(rid, 5030, f"goals unavailable: {exc}")
+
+        sid_key = session.get("session_key") or ""
+        if not sid_key:
+            return _err(rid, 4001, "no session key")
+
+        try:
+            goals_cfg = _load_cfg().get("goals") or {}
+            max_turns = int(goals_cfg.get("max_turns", 20) or 20)
+        except Exception:
+            max_turns = 20
+        mgr = GoalManager(session_id=sid_key, default_max_turns=max_turns)
+
+        lower = arg.strip().lower()
+        if not arg.strip() or lower == "status":
+            return _ok(rid, {"type": "exec", "output": mgr.status_line()})
+        if lower == "pause":
+            state = mgr.pause(reason="user-paused")
+            out = "No goal set." if state is None else f"⏸ Goal paused: {state.goal}"
+            return _ok(rid, {"type": "exec", "output": out})
+        if lower == "resume":
+            state = mgr.resume()
+            if state is None:
+                return _ok(rid, {"type": "exec", "output": "No goal to resume."})
+            return _ok(
+                rid,
+                {
+                    "type": "exec",
+                    "output": (
+                        f"▶ Goal resumed: {state.goal}\n"
+                        "Send any message to continue, or wait — I'll take the next step on the next turn."
+                    ),
+                },
+            )
+        if lower in {"clear", "stop", "done"}:
+            had = mgr.has_goal()
+            mgr.clear()
+            return _ok(
+                rid,
+                {
+                    "type": "exec",
+                    "output": "✓ Goal cleared." if had else "No active goal.",
+                },
+            )
+
+        # Otherwise — treat the remaining text as the new goal.
+        try:
+            state = mgr.set(arg)
+        except ValueError as exc:
+            return _err(rid, 4004, f"invalid goal: {exc}")
+
+        notice = (
+            f"⊙ Goal set ({state.max_turns}-turn budget): {state.goal}\n"
+            "I'll keep working until the goal is done, you pause/clear it, or the budget is exhausted.\n"
+            "Controls: /goal status · /goal pause · /goal resume · /goal clear"
+        )
+        # Send the goal text as the kickoff prompt. The TUI client sees
+        # {type: send, notice, message} → renders `notice` as a sys line,
+        # then submits `message` as a user turn. The post-turn judge
+        # wired in _run_prompt_submit takes over from there.
+        return _ok(
+            rid,
+            {"type": "send", "notice": notice, "message": state.goal},
+        )
+
+    if name == "undo":
+        # /undo [N]: back up N user turns (default 1), soft-delete the
+        # truncated rows on disk, and prefill the composer with the text
+        # of the user message we backed up to so it can be edited and
+        # resubmitted. N=1 is the Claude-Code-style single-step undo;
+        # /undo 3 backs up three user turns at once. See issue #21910.
+        if not session:
+            return _err(rid, 4001, "no active session to undo")
+        if session.get("running"):
+            return _err(
+                rid, 4009, "session busy — /interrupt the current turn before /undo"
+            )
+        db = _get_db()
+        if db is None:
+            return _db_unavailable_error(rid, code=5008)
+        session_key = session.get("session_key", "")
+        if not session_key:
+            return _err(rid, 4001, "no session key for undo")
+        # Parse the optional count argument (e.g. "/undo 3" → 3).
+        n = 1
+        arg_str = (arg or "").strip()
+        if arg_str:
+            try:
+                n = int(arg_str.split()[0])
+            except (ValueError, IndexError):
+                return _err(rid, 4004, f"undo: invalid count {arg_str!r} — use /undo or /undo N")
+        if n < 1:
+            n = 1
+        try:
+            recents = db.list_recent_user_messages(session_key, limit=max(n, 10))
+        except Exception as e:
+            return _err(rid, 5008, f"undo: failed to load history: {e}")
+        if not recents:
+            return _err(rid, 4018, "no user messages to undo")
+        # recents[0] is the most-recent user turn; pick the Nth-from-last.
+        # If N exceeds the number of user turns, back up to the oldest.
+        target_idx = min(n - 1, len(recents) - 1)
+        target_id = recents[target_idx]["id"]
+        try:
+            result = db.rewind_to_message(session_key, target_id)
+        except ValueError as e:
+            return _err(rid, 4004, f"undo: {e}")
+        except Exception as e:
+            return _err(rid, 5008, f"undo: {e}")
+        # Reload the active-only transcript into the in-memory session
+        # history so subsequent turns see the truncated view.
+        # repair_alternation: this reload feeds LIVE REPLAY — session["history"]
+        # is the working conversation for subsequent turns, and a rewind that
+        # lands on a durable user;user pair would otherwise re-fire the
+        # pre-request repair on every request from here on.
+        try:
+            active = db.get_messages_as_conversation(session_key, repair_alternation=True)
+        except Exception:
+            active = []
+        with session["history_lock"]:
+            session["history"] = list(active)
+            session["history_version"] = int(session.get("history_version", 0)) + 1
+        # Notify memory providers — same hook /branch fires, plus the
+        # rewound flag so providers caching per-turn document state
+        # know to invalidate. See #6672 + #21910.
+        agent = session.get("agent")
+        if agent is not None:
+            mm = getattr(agent, "_memory_manager", None)
+            if mm is not None:
+                try:
+                    mm.on_session_switch(
+                        session_key,
+                        parent_session_id="",
+                        reset=False,
+                        rewound=True,
+                    )
+                except Exception:
+                    pass
+            if hasattr(agent, "_invalidate_system_prompt"):
+                try:
+                    agent._invalidate_system_prompt()
+                except Exception:
+                    pass
+            if hasattr(agent, "_last_flushed_db_idx"):
+                try:
+                    agent._last_flushed_db_idx = len(active)
+                except Exception:
+                    pass
+        target_msg = result.get("target_message") or {}
+        target_text = target_msg.get("content") or ""
+        if isinstance(target_text, list):
+            parts = [
+                p.get("text", "") for p in target_text
+                if isinstance(p, dict) and p.get("type") == "text"
+            ]
+            target_text = "\n".join(t for t in parts if t)
+        if not isinstance(target_text, str):
+            target_text = ""
+        rewound_count = result.get("rewound_count", 0)
+        turns_undone = target_idx + 1
+        turn_word = "turn" if turns_undone == 1 else "turns"
+        notice = (
+            f"↶ Undid {turns_undone} {turn_word} ({rewound_count} message(s)). "
+            "Edit and resubmit, or send a new message."
+        )
+        return _ok(
+            rid,
+            {"type": "prefill", "message": target_text, "notice": notice},
+        )
+
+    if name in {"snapshot", "snap"}:
+        subcommand = arg.split(maxsplit=1)[0].lower() if arg else ""
+        if subcommand in {"restore", "rewind"}:
+            return _ok(
+                rid,
+                {
+                    "type": "exec",
+                    "output": (
+                        "/snapshot restore is blocked in the TUI because it changes "
+                        "config/state on disk while the live agent has cached settings. "
+                        "Run it in the classic CLI, then restart the TUI."
+                    ),
+                },
+            )
+
+    if name in {"compress", "compact"}:
+        if not session:
+            return _err(rid, 4001, "no active session to compress")
+        if session.get("running"):
+            return _err(
+                rid, 4009, "session busy — /interrupt the current turn before /compress"
+            )
+        sid = params.get("session_id", "")
+        if _session_uses_compute_host(session):
+            command = f"/{name}" + (f" {arg}" if arg else "")
+            try:
+                ack = _send_compute_host_control(
+                    sid,
+                    route_name="slash.compress",
+                    command=command,
+                    wait=True,
+                )
+            except Exception as exc:
+                return _err(rid, 5019, f"compute-host slash.compress failed: {exc}")
+            if ack.get("type") in {"control.error", "error"}:
+                return _err(
+                    rid,
+                    4009,
+                    str(ack.get("message") or "compute-host slash.compress failed"),
+                )
+            _apply_compute_host_metadata_mirror(session, ack)
+            return _ok(
+                rid,
+                {"type": "exec", "output": str(ack.get("output") or "")},
+            )
+        try:
+            from agent.manual_compression_feedback import summarize_manual_compression
+            from agent.model_metadata import estimate_request_tokens_rough
+
+            with session["history_lock"]:
+                before_messages = list(session.get("history", []))
+                history_version = int(session.get("history_version", 0))
+            before_count = len(before_messages)
+            _agent = session["agent"]
+            _sys_prompt = getattr(_agent, "_cached_system_prompt", "") or ""
+            _tools = getattr(_agent, "tools", None) or None
+            before_tokens = (
+                estimate_request_tokens_rough(
+                    before_messages, system_prompt=_sys_prompt, tools=_tools
+                )
+                if before_count
+                else 0
+            )
+            removed, usage = _compress_session_history(
+                session,
+                arg.strip() or None,
+                approx_tokens=before_tokens,
+                before_messages=before_messages,
+                history_version=history_version,
+            )
+            with session["history_lock"]:
+                after_messages = list(session.get("history", []))
+            after_count = len(after_messages)
+            _sys_prompt_after = (
+                getattr(_agent, "_cached_system_prompt", "") or _sys_prompt
+            )
+            _tools_after = getattr(_agent, "tools", None) or _tools
+            after_tokens = (
+                estimate_request_tokens_rough(
+                    after_messages,
+                    system_prompt=_sys_prompt_after,
+                    tools=_tools_after,
+                )
+                if after_count
+                else 0
+            )
+            _sync_session_key_after_compress(sid, session)
+            summary = summarize_manual_compression(
+                before_messages,
+                after_messages,
+                before_tokens,
+                after_tokens,
+                compression_state=getattr(_agent, "context_compressor", None),
+            )
+            _emit("session.info", sid, _session_info(session.get("agent"), session))
+            return _ok(
+                rid,
+                {
+                    "type": "exec",
+                    "output": "\n".join(
+                        filter(None, [summary["headline"], summary["token_line"], summary.get("note")])
+                    ),
+                },
+            )
+        except Exception as exc:
+            return _err(rid, 5009, f"compress failed: {exc}")
+
+    return _err(rid, 4018, f"not a quick/plugin/bundle/skill command: {name}")
+
 
 
 # ── Methods: paste ────────────────────────────────────────────────────

@@ -237,7 +237,47 @@ _DEFAULT_EXPORT_EXCLUDE_ROOT = frozenset({
     "browser_screenshots", "checkpoints",
     "sandboxes",
     "logs",                 # gateway logs
+    "backups",              # may contain full credential/runtime snapshots
+    "state-snapshots",      # may contain .env/auth/state DB snapshots
+    "sessions",             # request dumps can contain prompt/tool payloads
+    "pastes",               # ad-hoc captured user/runtime content
+    # Local service/application runtimes and bulky generated artifacts.
+    "homeassistant",
+    "video-editing-venv",
+    "video-editing-work",
+    "cache",
+    "media_cache",
+    "video_cache",
+    "models_dev_cache.json",
+    # OAuth/app-specific credential stores commonly created under default home.
+    "google",
+    "outlook",
+    "titan_mail",
+    "swiftbar-plugins",     # host-specific plugin symlinks; can be dangling
 })
+
+_EXPORT_SECRETISH_NAME_SUBSTRINGS = frozenset({
+    "token",
+    "secret",
+    "credential",
+    "cookie",
+    "password",
+    "passwd",
+    "oauth",
+})
+
+_EXPORT_SECRETISH_EXACT_NAMES = frozenset({
+    ".env",
+    "auth.json",
+    "auth.lock",
+})
+
+_EXPORT_SECRETISH_SUFFIXES = (
+    ".pem",
+    ".key",
+    ".p12",
+    ".pfx",
+)
 
 # Allow-list for ``export_profile("default")``: when HERMES_HOME equals the
 # cwd (Docker/custom deployments), the default profile home is the working
@@ -245,9 +285,9 @@ _DEFAULT_EXPORT_EXCLUDE_ROOT = frozenset({
 # into the export. The set below identifies the *known Hermes profile
 # artifacts* at the root of HERMES_HOME; everything else is excluded.
 # Sensitive runtime infrastructure (``state.db``, ``logs/``, ``auth.*``,
-# other profiles) is intentionally *not* in this list so the export stays
-# a portable, credential-free snapshot of the user-facing surface
-# (#58394). Add new artifacts here when introduced in ``hermes_constants``.
+# sessions/request dumps, and other profiles) is intentionally *not* in this
+# list so the export stays a portable, credential-free snapshot of the
+# user-facing surface (#58394 + Matt-local export safety).
 _DEFAULT_EXPORT_INCLUDE_ROOT = frozenset({
     # Configuration / persona
     "config.yaml", "SOUL.md", "MEMORY.md", "USER.md", "todo.json",
@@ -255,12 +295,12 @@ _DEFAULT_EXPORT_INCLUDE_ROOT = frozenset({
     # Desktop appearance/interface overlay (written by the desktop app's
     # profile export; applied by its import — see desktop.json handling).
     "desktop.json",
-    # User-facing skill, cron, and session artifacts
-    "skills", "cron", "scripts", "sessions",
+    # User-facing skill and cron artifacts. Sessions are excluded because
+    # request dumps can contain prompt and tool payloads.
+    "skills", "cron", "scripts",
     # Plugin / memory surfaces (per-profile overrides live here)
     "plugins", "memories", "knowledge", "preferences",
 })
-
 # Names that cannot be used as profile aliases
 _RESERVED_NAMES = frozenset({
     "hermes", "default", "test", "tmp", "root", "sudo",
@@ -2136,11 +2176,19 @@ def _default_export_ignore(root_dir: Path):
     def _ignore(directory: str, contents: list) -> set:
         ignored: set = set()
         for entry in contents:
+            entry_lower = entry.lower()
             # Universal exclusions (any depth)
             if entry == "__pycache__" or entry.endswith((".sock", ".tmp")):
                 ignored.add(entry)
             # npm lockfiles can appear at root
             elif entry in {"package.json", "package-lock.json"}:
+                ignored.add(entry)
+            elif (
+                entry in _EXPORT_SECRETISH_EXACT_NAMES
+                or entry.startswith(".env")
+                or entry_lower.endswith(_EXPORT_SECRETISH_SUFFIXES)
+                or any(part in entry_lower for part in _EXPORT_SECRETISH_NAME_SUBSTRINGS)
+            ):
                 ignored.add(entry)
         # Root-level allow-list: drop everything that isn't a known
         # Hermes profile artifact.
@@ -2267,6 +2315,7 @@ def export_profile(name: str, output_path: str, extra_files: Optional[Dict[str, 
                 staged,
                 symlinks=True,
                 ignore=_default_export_ignore(profile_dir),
+                ignore_dangling_symlinks=True,
             )
             _stage_extras(staged)
             _scrub_export_secrets(staged)

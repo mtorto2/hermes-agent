@@ -198,12 +198,11 @@ def _get_service_pids(all_profiles: bool = False) -> set:
             if pid is not None and pid > 0:
                 pids.add(pid)
         if all_profiles:
-            # Belt-and-suspenders for the EXCLUDE use case (#74075): a bare
-            # ``launchctl list`` prefix scan also catches ai.hermes.gateway*
-            # agents the label derivation can't map (renamed profiles, other
-            # installs sharing this user).  Over-inclusion is safe here —
-            # these PIDs are only ever protected from the kill sweep, never
-            # targeted.  Restart paths use the label-derived set only.
+            # This is intentionally wider than restart target discovery: these
+            # PIDs are only protected from the stale-manual-process sweep, never
+            # restarted. A renamed profile or another co-installed Hermes may
+            # not be in this checkout's label list, but its supervised gateway
+            # must never be mistaken for a manual process and terminated.
             try:
                 result = subprocess.run(
                     ["launchctl", "list"],
@@ -225,7 +224,6 @@ def _get_service_pids(all_profiles: bool = False) -> set:
                                 pass
             except (FileNotFoundError, subprocess.TimeoutExpired):
                 pass
-
     return pids
 
 
@@ -1841,6 +1839,16 @@ def _parse_launchd_pid_from_list_output(output: str) -> int | None:
     """
     for line in output.splitlines():
         stripped = line.strip()
+        # Legacy ``launchctl list <label>`` can return a tabular row:
+        # ``<pid>\t<status>\t<label>``. Newer/detailed output uses
+        # ``"PID" = <number>;`` below.
+        if stripped and stripped[0].isdigit():
+            first = stripped.split(None, 1)[0]
+            try:
+                pid = int(first)
+                return pid if pid > 0 else None
+            except ValueError:
+                pass
         if stripped.startswith('"PID"') or stripped.startswith("PID"):
             parts = stripped.split("=", 1)
             if len(parts) == 2:
@@ -1944,9 +1952,24 @@ def _probe_launchd_service_running() -> bool:
     """
     if not get_launchd_plist_path().exists():
         return False
+    label = get_launchd_label()
+    try:
+        domain = _launchd_domain()
+        result = subprocess.run(
+            ["launchctl", "print", f"{domain}/{label}"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode == 0 and "state = running" in (result.stdout or ""):
+            return True
+    except subprocess.TimeoutExpired:
+        return False
+    except Exception:
+        pass
     try:
         result = subprocess.run(
-            ["launchctl", "list", get_launchd_label()],
+            ["launchctl", "list", label],
             capture_output=True,
             text=True, encoding='utf-8', errors='replace',
             timeout=10,

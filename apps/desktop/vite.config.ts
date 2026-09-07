@@ -117,6 +117,9 @@ export default defineConfig(({ command }) => ({
     // present." Pinning the config makes the build hermetic.
     postcss: { plugins: [] }
   },
+  test: {
+    setupFiles: ['./src/test/setup.ts']
+  },
   build: {
     // The renderer intentionally ships FEW chunks (not one, not thousands):
     //   · `codeSplitting: false` (the old setup) inlines every `lazy()` /

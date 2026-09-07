@@ -3130,7 +3130,9 @@ def _connect_repair_durable(
     return conn
 
 
-def _reapply_durability_barriers(conn: sqlite3.Connection) -> bool:
+def _reapply_durability_barriers(
+    conn: sqlite3.Connection, *, enforce_synchronous: bool = True
+) -> bool:
     """Best-effort (re)application of the macOS write barriers.  Never raises.
 
     Returns True when the pragmas were accepted.  Callers about to rewrite the
@@ -3140,7 +3142,8 @@ def _reapply_durability_barriers(conn: sqlite3.Connection) -> bool:
     """
     try:
         _apply_macos_checkpoint_barrier(conn)
-        _enforce_macos_synchronous_full(conn)
+        if enforce_synchronous:
+            _enforce_macos_synchronous_full(conn)
         return True
     except sqlite3.DatabaseError:
         # Schema still unparseable — the pragmas cannot be set yet.
@@ -3153,12 +3156,10 @@ def apply_durability_barriers(conn: sqlite3.Connection) -> bool:
     """Apply state-store durability barriers without changing journal mode.
 
     This is the public entry point for secondary users of ``state.db`` that
-    must inherit its owner's journal mode while retaining per-connection
-    durability settings. Also applies the configured ``database.synchronous``
-    level (a per-connection pragma that would otherwise only ride on the
-    journal-mode setup path guest connections must not run).
+    must inherit its owner's journal mode and current synchronous level, unless
+    ``database.synchronous`` explicitly overrides that per-connection setting.
     """
-    ok = _reapply_durability_barriers(conn)
+    ok = _reapply_durability_barriers(conn, enforce_synchronous=False)
     try:
         # Local import avoids a circular import with hermes_cli.config.
         from hermes_cli.config import cfg_get, load_config_readonly

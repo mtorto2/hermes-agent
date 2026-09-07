@@ -213,13 +213,24 @@ class TestGetServicePidsScoping:
         monkeypatch.setattr(
             gw, "_locate_launchd_gateway_service", lambda label: located[label]
         )
+        monkeypatch.setattr(
+            gw.subprocess,
+            "run",
+            lambda *a, **k: _completed(
+                0, "300\t0\tai.hermes.gateway-external-install\n"
+            ),
+        )
 
     def test_all_profiles_returns_every_gateway_service_pid(self, monkeypatch):
         """The update sweep's exclude-set must protect ALL freshly-restarted
         services, not only the invoking profile's (else the sweep SIGTERMs
         gateways launchd just respawned)."""
         self._wire(monkeypatch)
-        assert gw._get_service_pids(all_profiles=True) == {100, 200}
+        # The broader scan is an exclusion-only safety net. It must preserve a
+        # supervised gateway that this checkout cannot restart (for example a
+        # co-installed or renamed profile), without ever turning it into a
+        # restart target.
+        assert gw._get_service_pids(all_profiles=True) == {100, 200, 300}
 
     def test_default_stays_scoped_to_current_profile(self, monkeypatch):
         """Regression guard: default-scope callers (gateway status, cron,

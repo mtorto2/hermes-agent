@@ -125,6 +125,14 @@ def _patch_update_deps(monkeypatch, tmp_path, run_side_effect):
         "hermes_cli.update_inventory.collect_runtime_inventory",
         lambda: SimpleNamespace(runtimes=[], to_dict=lambda: {}),
     )
+    monkeypatch.setattr(
+        update_cmd, "_restart_macos_launchd_gateways", lambda *a, **k: ([], [])
+    )
+    monkeypatch.setattr(hermes_main, "_capture_active_lazy_features", lambda: [])
+    monkeypatch.setattr(hermes_main, "_capture_active_tool_dependencies", lambda: [])
+    monkeypatch.setattr(
+        "hermes_cli.macos_tcc_anchor.ensure_tcc_anchor", lambda *a, **k: None
+    )
 
 
 def _update_args():

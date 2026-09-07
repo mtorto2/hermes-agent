@@ -50,6 +50,7 @@ _EXEMPT_DIRS = (
     "node_modules",
     ".git",
     ".venv",
+    ".test-venv",
     "venv",
     ".worktrees",
 )
@@ -136,6 +137,8 @@ def _source_files() -> list[Path]:
         # dist output directory.
         if rel.parts and _is_packaging_copy(rel.parts[0]):
             continue
+        if rel.parts and _is_python_virtualenv(rel.parts[0]):
+            continue
         files.append(path)
     return files
 
@@ -149,6 +152,13 @@ def _is_packaging_copy(top_level: str) -> bool:
     if not candidate.is_dir():
         return False
     return (candidate / "PKG-INFO").exists()
+
+
+@functools.lru_cache(maxsize=None)
+def _is_python_virtualenv(top_level: str) -> bool:
+    """Whether *top_level* is a generated virtual environment, not source."""
+    candidate = REPO_ROOT / top_level
+    return candidate.is_dir() and (candidate / "pyvenv.cfg").is_file()
 
 
 def _findings() -> list[tuple[str, str, int]]:

@@ -4,7 +4,12 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { ProjectDialog } from './project-dialog'
 
-afterEach(cleanup)
+afterEach(async () => {
+  cleanup()
+  // Radix FocusScope restores autofocus in a zero-delay task during unmount.
+  // Keep jsdom alive until that task uses the window-realm CustomEvent.
+  await new Promise<void>(resolve => window.setTimeout(resolve, 0))
+})
 
 vi.mock('@/i18n', () => ({
   useI18n: () => ({

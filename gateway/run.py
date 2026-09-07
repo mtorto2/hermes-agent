@@ -62,6 +62,7 @@ from agent.conversation_compression import (
 from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
 from agent.compaction_display import project_compaction_message_for_display
 from agent.i18n import t
+from agent.light_cues import LightCueEvent
 from agent.interrupt_compat import request_hard_interrupt
 from agent.turn_context import (
     compression_made_progress,
@@ -117,6 +118,19 @@ _GATEWAY_PROXY_SSE_BUFFER_MAX_CHARS = 16 * 1024 * 1024
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
 _GATEWAY_HYGIENE_PLATFORM = "gateway_hygiene"
 
+
+def _build_nah_instruction(style: str = "") -> str:
+    style = (style or "").strip()
+    instruction = (
+        "Summarize your immediately previous assistant reply into the shortest useful TL;DR. "
+        "Do not mention this instruction or any skill. Do not re-answer the original task. "
+        "No tools. Default to 1-3 bullets unless one sentence is enough."
+    )
+    if style:
+        instruction += f" Extra style request: {style}"
+    return instruction
+
+
 _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"("  # transient/auxiliary status that should stay in logs, not gateway chats
     r"auxiliary\s+.+\s+failed"
@@ -146,6 +160,7 @@ _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"|rate\s+limited\.\s+waiting\s+\d"
     r"|retrying\s+in\s+\d"
     r"|max\s+retries\s+\(\d+\).*(?:trying\s+fallback|exhausted|invalid\s+responses)"
+    r"|model\s+returned\s+empty\s+after\s+tool\s+calls"
     r"|stream\s+(?:drop|drop\s+mid\s+tool-call).+retry\s+\d"
     r"|stale\s+connections\s+from\s+a\s+previous\s+provider\s+issue"
     rf"|{re.escape(COMPACTION_DONE_STATUS)}"
@@ -1023,6 +1038,36 @@ def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
     if _looks_like_gateway_provider_error(redacted):
         return _gateway_provider_error_reply(redacted)
     return redacted
+
+
+_VOICE_TRANSCRIPT_PREFIX_MARKERS = (
+    "🎙️ You said:",
+    "🎙️ You said: ",
+)
+
+
+def _format_voice_transcript_echo(transcripts: List[str]) -> str:
+    """Build the user-visible Telegram voice transcript audit block."""
+    clean = [str(t or "").strip() for t in transcripts if str(t or "").strip()]
+    if not clean:
+        return ""
+    transcript = "\n\n".join(clean)
+    if "\n" in transcript or len(transcript) > 180:
+        return f'🎙️ You said:\n"{transcript}"'
+    return f'🎙️ You said: "{transcript}"'
+
+
+def _prefix_voice_transcript_echo(response: str, transcripts: List[str]) -> str:
+    """Prefix a final reply with the Telegram voice transcript, without duplicates."""
+    if not response:
+        return response
+    body = str(response).lstrip()
+    if body.startswith(_VOICE_TRANSCRIPT_PREFIX_MARKERS):
+        return response
+    prefix = _format_voice_transcript_echo(transcripts)
+    if not prefix:
+        return response
+    return f"{prefix}\n\n{response}"
 
 
 def _prepare_gateway_status_message(platform: Any, event_type: str, message: str) -> Optional[str]:
@@ -6506,6 +6551,22 @@ class TurnRunner:
                     exc_info=True,
                 )
 
+            # Agent Lights: a clarify prompt needs a human answer — signal the
+            # chat's light cue while the agent thread blocks on the response.
+            # Mirrors the approval path's HUMAN_INTERVENTION cue.
+            try:
+                safe_schedule_threadsafe(
+                    ctx._status_adapter.emit_light_cue_for_chat(
+                        ctx._status_chat_id,
+                        LightCueEvent.HUMAN_INTERVENTION,
+                    ),
+                    ctx._loop_for_step,
+                    logger=logger,
+                    log_message="Clarify light-cue scheduling error",
+                )
+            except Exception:
+                pass
+
             fut = safe_schedule_threadsafe(
                 ctx._status_adapter.send_clarify(
                     chat_id=ctx._status_chat_id,
@@ -6561,6 +6622,22 @@ class TurnRunner:
                         "resume_typing_for_chat after clarify answer failed",
                         exc_info=True,
                     )
+            # Agent Lights: the clarify prompt is resolved — answered, timed
+            # out, or undeliverable (sentinel strings start with '['). Resume
+            # the working cue on every return path, matching the approval
+            # path's resume behaviour.
+            try:
+                safe_schedule_threadsafe(
+                    ctx._status_adapter.emit_light_cue_for_chat(
+                        ctx._status_chat_id,
+                        LightCueEvent.WORKING,
+                    ),
+                    ctx._loop_for_step,
+                    logger=logger,
+                    log_message="Clarify resume light-cue scheduling error",
+                )
+            except Exception:
+                pass
             return _clarify_response
 
         agent.clarify_callback = _clarify_callback_sync
@@ -6642,9 +6719,11 @@ class TurnRunner:
         # to the user immediately.
         from tools.approval import (
             register_gateway_notify,
+            register_gateway_resume,
             reset_current_session_key,
             set_current_session_key,
             unregister_gateway_notify,
+            unregister_gateway_resume,
         )
 
         def _approval_notify_sync(approval_data: dict) -> None:
@@ -6672,6 +6751,21 @@ class TurnRunner:
 
             cmd = approval_data.get("command", "")
             desc = approval_data.get("description", "dangerous command")
+            # Agent Lights: signal the chat's light cue that a human decision is
+            # required while the agent thread blocks on approval.
+            if ctx._status_adapter is not None:
+                try:
+                    safe_schedule_threadsafe(
+                        ctx._status_adapter.emit_light_cue_for_chat(
+                            ctx._status_chat_id,
+                            LightCueEvent.HUMAN_INTERVENTION,
+                        ),
+                        ctx._loop_for_step,
+                        logger=logger,
+                        log_message="Approval light-cue scheduling error",
+                    )
+                except Exception:
+                    pass
 
             # Redact credentials from the command before displaying it in
             # the approval prompt — Tirith's findings are already redacted,
@@ -6761,6 +6855,23 @@ class TurnRunner:
                     _approval_send_fut.result(timeout=15)
             except Exception as _e:
                 logger.error("Failed to send approval request: %s", _e)
+
+        def _approval_resume_sync() -> None:
+            """Mark gateway light cues working after any approval path unblocks."""
+            if ctx._status_adapter is None:
+                return
+            try:
+                safe_schedule_threadsafe(
+                    ctx._status_adapter.emit_light_cue_for_chat(
+                        ctx._status_chat_id,
+                        LightCueEvent.WORKING,
+                    ),
+                    ctx._loop_for_step,
+                    logger=logger,
+                    log_message="Approval resume light-cue scheduling error",
+                )
+            except Exception:
+                pass
 
         # Keep real user text separate from API-only recovery guidance.  If
         # an auto-continue note is prepended below, persist the original
@@ -6907,6 +7018,7 @@ class TurnRunner:
         _approval_session_key = ctx.session_key or ""
         _approval_session_token = set_current_session_key(_approval_session_key)
         register_gateway_notify(_approval_session_key, _approval_notify_sync)
+        register_gateway_resume(_approval_session_key, _approval_resume_sync)
         try:
             # If _prepare_inbound_message_text buffered image paths for native
             # attachment, wrap the user turn as an OpenAI-style multimodal
@@ -6965,6 +7077,7 @@ class TurnRunner:
                 _conversation_kwargs["persist_user_timestamp"] = _persist_user_timestamp_override
             result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
         finally:
+            unregister_gateway_resume(_approval_session_key)
             unregister_gateway_notify(_approval_session_key)
             # Cancel any pending clarify entries so blocked agent
             # threads don't hang past the end of the run (interrupt,
@@ -7577,7 +7690,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # /new and /reset.  /model and other mid-session operations
         # preserve the queue.  Lives on SessionState.conversation.queued_events;
         # native image paths, busy-ack debounce timestamps and the monotonic
-        # run-generation counter (#28686, NEVER reset) live on SessionState too.
+        # run-generation counter (#28686, NEVER reset) live on SessionState too
+        # (proxied via legacy_dict_property).
+        # Matt-local: buffer of voice-transcript prefixes awaiting echo onto the
+        # next assistant response (Telegram STT).  Not managed by SessionState —
+        # kept as a plain per-session dict so its local echo-once lifecycle is
+        # preserved.  Consumers read it defensively via getattr.
+        self._voice_transcript_echo_by_session: Dict[str, List[str]] = {}
         # Session keys that already received a stall notification for the
         # current stall episode (cleared when pending clears / activity resumes
         # / conversation boundary). See gateway.session_stall.
@@ -17896,20 +18015,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # /reset and /new must bypass the running-agent guard so they
         # actually dispatch as commands instead of being queued as user
         # text (which would be fed back to the agent with the same
-        # broken history — #2170).  Interrupt the agent first, then
-        # clear the adapter's pending queue so the stale "/reset" text
-        # doesn't get re-processed as a user message after the
-        # interrupt completes.
-        # Clear any pending messages so the old text doesn't replay
-        await self._interrupt_and_clear_session(
-            quick_key,
-            source,
-            interrupt_reason=_INTERRUPT_REASON_RESET,
-            invalidation_reason="new_command",
+        # broken history — #2170).  The destructive work stays inside the
+        # confirmation callback so a pending /new or /reset does not interrupt
+        # an active turn until the user explicitly approves it.
+        async def _do_reset():
+            # Clear pending messages so the old command text cannot replay
+            # after the interrupt completes.
+            await self._interrupt_and_clear_session(
+                quick_key,
+                source,
+                interrupt_reason=_INTERRUPT_REASON_RESET,
+                invalidation_reason="new_command",
+            )
+            # The interrupt removes the running-agent entry before the reset
+            # handler rotates the session.
+            return await self._handle_reset_command(event)
+
+        return await self._maybe_confirm_destructive_slash(
+            event=event,
+            command="new",
+            title="/new",
+            detail=(
+                "This starts a fresh session and discards the current "
+                "conversation history."
+            ),
+            execute=_do_reset,
         )
-        # Clean up the running agent entry so the reset handler
-        # doesn't think an agent is still active.
-        return await self._handle_reset_command(event)
 
     async def _busy_queue_command(self, event: MessageEvent, quick_key: str, source):
         # /queue <prompt> — queue without interrupting.
@@ -19015,6 +19146,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if canonical == "whoami":
             return await self._handle_whoami_command(event)
 
+        # /status is already dispatched earlier via
+        # _gateway_plain_command_handlers(); only /repos needs wiring here.
+        if canonical == "repos":
+            return await self._handle_repos_command(event)
+
         if canonical == "egress":
             from hermes_cli.proxy_cli import format_status_text
 
@@ -19199,6 +19335,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if canonical == "compress":
             return await self._handle_compress_command(event)
+
+        if canonical == "nah":
+            event.text = _build_nah_instruction(event.get_command_args().strip())
+            command = None
+            # Fall through to the normal agent path. This avoids skill-slash
+            # injection, so users do not see raw SKILL.md/frontmatter content.
 
         if canonical == "usage":
             return await self._handle_usage_command(event)
@@ -19730,6 +19872,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Reset only this session's per-call buffer; other sessions may be
         # concurrently preparing multimodal turns on the same runner.
         self._consume_pending_native_image_paths(session_key)
+        voice_transcript_cache = getattr(self, "_voice_transcript_echo_by_session", None)
+        if voice_transcript_cache is not None:
+            voice_transcript_cache.pop(session_key, None)
 
         _is_shared_multi_user = is_shared_multi_user_session(
             source,
@@ -19844,19 +19989,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
 
             if audio_paths:
-                message_text, _successful_transcripts = await self._enrich_message_with_transcription(
+                message_text, voice_transcripts = await self._enrich_message_with_transcription(
                     message_text,
                     audio_paths,
                 )
-                # Echo each successful transcript back to the user immediately
-                # when configured. Lets users verify STT quality in real-time,
-                # while allowing quiet STT for users who only want the agent to
-                # receive the transcription.
-                if _successful_transcripts and self._should_echo_stt_transcripts():
+                should_echo_transcripts = self._should_echo_stt_transcripts()
+                if (
+                    source.platform == Platform.TELEGRAM
+                    and event.message_type == MessageType.VOICE
+                    and voice_transcripts
+                    and not should_echo_transcripts
+                ):
+                    transcript_cache = getattr(self, "_voice_transcript_echo_by_session", None)
+                    if transcript_cache is None:
+                        transcript_cache = {}
+                        self._voice_transcript_echo_by_session = transcript_cache
+                    transcript_cache[session_key] = list(voice_transcripts)
+                # Echo each successful transcript back immediately when configured.
+                # When disabled, Matt-local final-reply prefixing preserves voice
+                # auditability without creating a second separate gateway reply.
+                if voice_transcripts and should_echo_transcripts:
                     _echo_adapter = self._adapter_for_source(source)
                     _echo_meta = self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
                     if _echo_adapter:
-                        for _tx in _successful_transcripts:
+                        for _tx in voice_transcripts:
                             try:
                                 await _echo_adapter.send(
                                     source.chat_id,
@@ -19867,15 +20023,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 logger.debug(
                                     "Transcript echo failed (non-fatal): %s", _echo_exc,
                                 )
-                # NOTE: Previously, when transcription failed (e.g. no STT
-                # provider configured), the gateway also emitted a hardcoded
-                # English notice via `_stt_adapter.send()`. That bypassed the
-                # LLM and produced two replies — one pre-canned English clip
-                # (which TTS then spoke aloud, in the wrong language) and one
-                # correct, localized LLM reply from the enriched message text.
-                # The enrichment step now leaves a single neutral marker in the
-                # prompt, so the LLM produces one coherent reply in the user's
-                # language. The hardcoded send has therefore been removed.
+                # NOTE: When transcription fails, do not emit a hardcoded English
+                # gateway notice. The enrichment step leaves a neutral marker in
+                # the prompt so the LLM produces one coherent localized reply.
 
         if audio_file_paths:
             from tools.credential_files import to_agent_visible_cache_path as _to_agent_path
@@ -22757,6 +22907,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             ):
                 await self._send_voice_reply(event, response)
 
+            if (
+                response
+                and not _already_sent
+                and source.platform == Platform.TELEGRAM
+                and event.message_type == MessageType.VOICE
+            ):
+                transcript_cache = getattr(self, "_voice_transcript_echo_by_session", {}) or {}
+                voice_transcripts = transcript_cache.pop(session_key, [])
+                response = _prefix_voice_transcript_echo(response, voice_transcripts)
+
             # If streaming already delivered the response, extract and
             # deliver any MEDIA: files before returning None.  Streaming
             # sends raw text chunks that include MEDIA: tags — the normal
@@ -23029,9 +23189,522 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
 
 
+    async def _handle_kanban_command(self, event: MessageEvent) -> str:
+        """Handle /kanban — delegate to the shared kanban CLI.
 
+        Run the potentially-blocking DB work in a thread pool so the
+        gateway event loop stays responsive. Read operations (list,
+        show, context, tail) are permitted while an agent is running;
+        mutations are allowed too because the board is profile-agnostic
+        and does not touch the running agent's state.
 
+        For ``/kanban create`` invocations we also auto-subscribe the
+        originating gateway source (platform + chat + thread) to the new
+        task's terminal events, so the user hears back when the worker
+        completes / blocks / auto-blocks / crashes without having to poll.
+        """
+        import asyncio
+        import re
+        import shlex
+        from hermes_cli.kanban import run_slash
 
+        text = (event.text or "").strip()
+        # Strip the leading "/kanban" (with or without slash), leaving args.
+        if text.startswith("/"):
+            text = text.lstrip("/")
+        if text.startswith("kanban"):
+            text = text[len("kanban"):].lstrip()
+
+        tokens = shlex.split(text) if text else []
+        requested_board = None
+        action = None
+        i = 0
+        while i < len(tokens):
+            tok = tokens[i]
+            if tok == "--board":
+                if i + 1 >= len(tokens):
+                    break
+                requested_board = tokens[i + 1]
+                i += 2
+                continue
+            if tok.startswith("--board="):
+                requested_board = tok.split("=", 1)[1]
+                i += 1
+                continue
+            action = tok
+            break
+
+        is_create = action == "create"
+
+        try:
+            output = await asyncio.to_thread(run_slash, text)
+        except Exception as exc:  # pragma: no cover - defensive
+            return t("gateway.kanban.error_prefix", error=exc)
+
+        # Auto-subscribe on create. Parse the task id from the CLI's standard
+        # success line ("Created t_abcd  (ready, assignee=...)"). If the user
+        # passed --json we don't subscribe; they're clearly scripting and
+        # can call /kanban notify-subscribe explicitly.
+        if is_create and output:
+            m = re.search(r"Created\s+(t_[0-9a-f]+)\b", output)
+            if m:
+                task_id = m.group(1)
+                try:
+                    source = event.source
+                    platform = getattr(source, "platform", None)
+                    platform_str = (
+                        platform.value if hasattr(platform, "value") else str(platform or "")
+                    ).lower()
+                    chat_id = str(getattr(source, "chat_id", "") or "")
+                    chat_type = str(getattr(source, "chat_type", "") or "") or None
+                    thread_id = str(getattr(source, "thread_id", "") or "")
+                    user_id = str(getattr(source, "user_id", "") or "") or None
+                    user_id_alt = str(getattr(source, "user_id_alt", "") or "") or None
+                    delivery_metadata = self._thread_metadata_for_source(
+                        source, self._reply_anchor_for_event(event)
+                    ) or None
+                    if isinstance(delivery_metadata, dict):
+                        chat_type = str(getattr(source, "chat_type", "") or "")
+                        if chat_type:
+                            delivery_metadata.setdefault("chat_type", chat_type)
+                    if platform_str and chat_id:
+                        def _sub():
+                            from hermes_cli import kanban_db as _kb
+                            conn = _kb.connect(board=requested_board)
+                            try:
+                                _kb.add_notify_sub(
+                                    conn, task_id=task_id,
+                                    platform=platform_str, chat_id=chat_id,
+                                    chat_type=chat_type,
+                                    thread_id=thread_id or None,
+                                    user_id=user_id,
+                                    user_id_alt=user_id_alt,
+                                    notifier_profile=getattr(self, "_kanban_notifier_profile", None) or self._active_profile_name(),
+                                    delivery_metadata=delivery_metadata,
+                                    )
+                            finally:
+                                conn.close()
+                        await asyncio.to_thread(_sub)
+                        output = (
+                            output.rstrip()
+                            + "\n"
+                            + t("gateway.kanban.subscribed_suffix", task_id=task_id)
+                        )
+                except Exception as exc:
+                    logger.warning("kanban create auto-subscribe failed: %s", exc)
+
+        def _is_status_audio_request(raw_tokens: list[str]) -> bool:
+            if "--json" in raw_tokens:
+                return False
+            idx = 0
+            while idx < len(raw_tokens):
+                tok = raw_tokens[idx]
+                if tok == "--board":
+                    idx += 2
+                    continue
+                if tok.startswith("--board="):
+                    idx += 1
+                    continue
+                break
+            if idx + 1 >= len(raw_tokens):
+                return False
+            if raw_tokens[idx] not in {"boards", "board"}:
+                return False
+            if raw_tokens[idx + 1] != "status":
+                return False
+            return "audio" in raw_tokens[idx + 2:]
+
+        wants_status_audio = _is_status_audio_request(tokens)
+        if wants_status_audio and output.startswith("Kanban morning report."):
+            try:
+                from tools.tts_tool import check_tts_requirements, text_to_speech_tool
+                if check_tts_requirements():
+                    import json as _json
+                    from gateway.session_context import clear_session_vars, set_session_vars
+
+                    def _synthesize_kanban_status_audio():
+                        source = event.source
+                        tokens_ctx = set_session_vars(
+                            platform=str(getattr(source.platform, "value", source.platform) or ""),
+                            chat_id=source.chat_id,
+                            chat_name=source.chat_name or "",
+                            thread_id=str(source.thread_id) if source.thread_id else "",
+                            user_id=str(source.user_id) if source.user_id else "",
+                            user_name=str(source.user_name) if source.user_name else "",
+                            session_key="",
+                            message_id=str(event.message_id) if event.message_id else "",
+                        )
+                        try:
+                            return text_to_speech_tool(text=output)
+                        finally:
+                            clear_session_vars(tokens_ctx)
+
+                    tts_result_str = await asyncio.to_thread(_synthesize_kanban_status_audio)
+                    tts_data = _json.loads(tts_result_str)
+                    audio_path = tts_data.get("file_path")
+                    if audio_path:
+                        output = output.rstrip() + f"\n\n[[audio_as_voice]]\nMEDIA:{audio_path}"
+            except Exception as exc:
+                logger.warning("kanban boards status audio TTS failed: %s", exc)
+
+        # Gateway messages have practical length caps; truncate long
+        # listings to keep the UX reasonable. If we appended a native media
+        # directive, preserve it at the end so truncation does not corrupt
+        # delivery of generated audio.
+        if len(output) > 3800:
+            media_marker = "\n\n[[audio_as_voice]]\nMEDIA:"
+            marker_start = output.find(media_marker)
+            if marker_start != -1:
+                text_part = output[:marker_start].rstrip()
+                media_part = output[marker_start:]
+                suffix = "\n" + t("gateway.kanban.truncated_suffix")
+                budget = 3800 - len(media_part) - len(suffix)
+                if budget > 0:
+                    output = text_part[:budget].rstrip() + suffix + media_part
+                else:
+                    output = media_part[-3800:]
+            else:
+                output = output[:3800] + "\n" + t("gateway.kanban.truncated_suffix")
+        return output or t("gateway.kanban.no_output")
+
+    async def _handle_status_command(self, event: MessageEvent) -> str:
+        """Handle /status command."""
+        source = event.source
+        session_entry = await self.async_session_store.get_or_create_session(source)
+
+        connected_platforms = [p.value for p in self.adapters.keys()]
+
+        # Check if there's an active agent
+        session_key = session_entry.session_key
+        status_agent = self._running_agents.get(session_key)
+        is_running = status_agent is not None
+
+        # Count pending /queue follow-ups (slot + overflow).
+        adapter = self.adapters.get(source.platform) if source else None
+        queue_depth = self._queue_depth(session_key, adapter=adapter)
+
+        def _clean_str(value: Any) -> str:
+            return str(value or "").strip()
+
+        def _int_value(value: Any) -> int:
+            try:
+                return int(value or 0)
+            except (TypeError, ValueError):
+                return 0
+
+        title = None
+        session_row: dict[str, Any] = {}
+        # Pull token totals from the SQLite session DB rather than the
+        # in-memory SessionStore.  The agent's per-turn token deltas are
+        # persisted into sessions_db (run_agent.py), not into SessionEntry,
+        # so session_entry.total_tokens is always 0.  SessionDB is the
+        # single source of truth; reading it here keeps /status accurate
+        # without duplicating token writes into two stores.
+        db_total_tokens = 0
+        persisted_route: dict[str, Any] = {}
+        if self._session_db:
+            try:
+                title = await self._session_db.get_session_title(session_entry.session_id)
+            except Exception:
+                title = None
+            try:
+                row = await self._session_db.get_session(session_entry.session_id)
+                if row:
+                    session_row = dict(row)
+                    db_total_tokens = (
+                        (row.get("input_tokens") or 0)
+                        + (row.get("output_tokens") or 0)
+                        + (row.get("cache_read_tokens") or 0)
+                        + (row.get("cache_write_tokens") or 0)
+                        + (row.get("reasoning_tokens") or 0)
+                    )
+            except Exception:
+                db_total_tokens = 0
+            try:
+                route = await self._session_db.get_dominant_session_model_route(
+                    session_entry.session_id
+                )
+                if isinstance(route, dict):
+                    persisted_route = route
+            except Exception:
+                persisted_route = {}
+
+        if status_agent is None:
+            cache_lock = getattr(self, "_agent_cache_lock", None)
+            cache = getattr(self, "_agent_cache", None)
+            if cache is not None:
+                try:
+                    if cache_lock is not None:
+                        with cache_lock:
+                            cached = cache.get(session_key)
+                    else:
+                        cached = cache.get(session_key)
+                    if cached:
+                        status_agent = cached[0]
+                except Exception:
+                    status_agent = None
+
+        model_name = ""
+        provider_name = ""
+        route_resolved = False
+        context_used = 0
+        context_total = 0
+        if status_agent is not None and status_agent is not _AGENT_PENDING_SENTINEL:
+            live_model = _clean_str(getattr(status_agent, "model", ""))
+            live_provider = _clean_str(getattr(status_agent, "provider", ""))
+            if live_model and live_provider:
+                model_name = live_model
+                provider_name = live_provider
+                route_resolved = True
+            else:
+                model_name = live_model
+                provider_name = live_provider
+            ctx = getattr(status_agent, "context_compressor", None)
+            if ctx is not None:
+                context_used = _int_value(getattr(ctx, "last_prompt_tokens", 0))
+                context_total = _int_value(getattr(ctx, "context_length", 0))
+
+        persisted_model = _clean_str(persisted_route.get("model"))
+        persisted_provider = _clean_str(persisted_route.get("billing_provider"))
+        if not route_resolved and persisted_model and persisted_provider:
+            model_name = persisted_model
+            provider_name = persisted_provider
+            route_resolved = True
+        if not route_resolved:
+            model_name = model_name or _clean_str(session_row.get("model"))
+            provider_name = provider_name or _clean_str(session_row.get("billing_provider"))
+        context_used = context_used or _int_value(getattr(session_entry, "last_prompt_tokens", 0))
+
+        user_config: dict[str, Any] = {}
+        if not model_name or not provider_name or not context_total:
+            try:
+                user_config = _load_gateway_config()
+            except Exception:
+                user_config = {}
+        if not model_name:
+            model_name = _resolve_gateway_model(user_config)
+        if not provider_name:
+            model_cfg = user_config.get("model", {}) if isinstance(user_config, dict) else {}
+            if isinstance(model_cfg, dict):
+                provider_name = _clean_str(model_cfg.get("provider"))
+        if not context_total:
+            model_cfg = user_config.get("model", {}) if isinstance(user_config, dict) else {}
+            configured_context = model_cfg.get("context_length") if isinstance(model_cfg, dict) else None
+            if isinstance(configured_context, int) and configured_context > 0:
+                context_total = configured_context
+
+        model_line = ""
+        if model_name:
+            if provider_name:
+                model_line = t("gateway.status.model_provider", model=model_name, provider=provider_name)
+            else:
+                model_line = t("gateway.status.model", model=model_name)
+
+        context_line = ""
+        if context_total:
+            pct = min(100, round((context_used / context_total) * 100)) if context_total else 0
+            context_line = t(
+                "gateway.status.context",
+                used=f"{context_used:,}",
+                total=f"{context_total:,}",
+                pct=f"{pct}",
+            )
+        elif context_used:
+            context_line = t("gateway.status.context_used", used=f"{context_used:,}")
+
+        lines = [
+            t("gateway.status.header"),
+            "",
+            t("gateway.status.session_id", session_id=session_entry.session_id),
+        ]
+        if title:
+            lines.append(t("gateway.status.title", title=title))
+        lines.extend([
+            t("gateway.status.created", timestamp=session_entry.created_at.strftime('%Y-%m-%d %H:%M')),
+            t("gateway.status.last_activity", timestamp=session_entry.updated_at.strftime('%Y-%m-%d %H:%M')),
+        ])
+        if model_line:
+            lines.append(model_line)
+        if context_line:
+            lines.append(context_line)
+        lines.extend([
+            t("gateway.status.tokens", tokens=f"{db_total_tokens:,}"),
+            t("gateway.status.agent_running", state=t("gateway.status.state_yes") if is_running else t("gateway.status.state_no")),
+        ])
+        if queue_depth:
+            lines.append(t("gateway.status.queued", count=queue_depth))
+        if source.platform == Platform.MATRIX:
+            adapter = self.adapters.get(Platform.MATRIX)
+            scope = getattr(adapter, "_matrix_session_scope", os.getenv("MATRIX_SESSION_SCOPE", "auto"))
+            thread = source.thread_id or "none"
+            import hashlib
+            digest = hashlib.sha256(str(session_key or "").encode("utf-8")).hexdigest()[:12]
+            lines.extend([
+                "",
+                t("gateway.status.matrix_scope_header"),
+                t("gateway.status.matrix_scope_room", room=source.chat_name or source.chat_id),
+                t("gateway.status.matrix_scope_room_id", room_id=source.chat_id),
+                t("gateway.status.matrix_scope_thread", thread_id=thread),
+                t("gateway.status.matrix_scope_mode", scope=scope),
+                t("gateway.status.matrix_scope_key", session_key=f"sha256:{digest}"),
+            ])
+        lines.extend([
+            "",
+            t("gateway.status.platforms", platforms=', '.join(connected_platforms)),
+        ])
+
+        return "\n".join(lines)
+
+    async def _handle_repos_command(self, event: MessageEvent) -> str:
+        """Handle /repos command."""
+        from hermes_cli.repo_status import format_repo_status_gateway
+
+        args = event.get_command_args().strip()
+        return await asyncio.to_thread(format_repo_status_gateway, args)
+
+    async def _handle_agents_command(self, event: MessageEvent) -> str:
+        """Handle /agents command - list active agents and running tasks."""
+        from tools.process_registry import format_uptime_short, process_registry
+
+        now = time.time()
+        current_session_key = self._session_key_for_source(event.source)
+
+        running_agents: dict = getattr(self, "_running_agents", {}) or {}
+        running_started: dict = getattr(self, "_running_agents_ts", {}) or {}
+
+        agent_rows: list[dict] = []
+        for session_key, agent in running_agents.items():
+            started = float(running_started.get(session_key, now))
+            elapsed = max(0, int(now - started))
+            is_pending = agent is _AGENT_PENDING_SENTINEL
+            agent_rows.append(
+                {
+                    "session_key": session_key,
+                    "elapsed": elapsed,
+                    "state": t("gateway.agents.state_starting") if is_pending else t("gateway.agents.state_running"),
+                    "session_id": "" if is_pending else str(getattr(agent, "session_id", "") or ""),
+                    "model": "" if is_pending else str(getattr(agent, "model", "") or ""),
+                }
+            )
+
+        agent_rows.sort(key=lambda row: row["elapsed"], reverse=True)
+
+        running_processes: list[dict] = []
+        try:
+            running_processes = [
+                p for p in process_registry.list_sessions()
+                if p.get("status") == "running"
+            ]
+        except Exception:
+            running_processes = []
+
+        background_tasks = [
+            t for t in (getattr(self, "_background_tasks", set()) or set())
+            if hasattr(t, "done") and not t.done()
+        ]
+
+        lines = [
+            t("gateway.agents.header"),
+            "",
+            t("gateway.agents.active_agents", count=len(agent_rows)),
+        ]
+
+        if agent_rows:
+            for idx, row in enumerate(agent_rows[:12], 1):
+                current = t("gateway.agents.this_chat") if row["session_key"] == current_session_key else ""
+                sid = f" · `{row['session_id']}`" if row["session_id"] else ""
+                model = f" · `{row['model']}`" if row["model"] else ""
+                lines.append(
+                    f"{idx}. `{row['session_key']}` · {row['state']} · "
+                    f"{format_uptime_short(row['elapsed'])}{sid}{model}{current}"
+                )
+            if len(agent_rows) > 12:
+                lines.append(t("gateway.agents.more", count=len(agent_rows) - 12))
+
+        lines.extend(
+            [
+                "",
+                t("gateway.agents.running_processes", count=len(running_processes)),
+            ]
+        )
+        if running_processes:
+            for proc in running_processes[:12]:
+                cmd = " ".join(str(proc.get("command", "")).split())
+                if len(cmd) > 90:
+                    cmd = cmd[:87] + "..."
+                lines.append(
+                    f"- `{proc.get('session_id', '?')}` · "
+                    f"{format_uptime_short(int(proc.get('uptime_seconds', 0)))} · `{cmd}`"
+                )
+            if len(running_processes) > 12:
+                lines.append(t("gateway.agents.more", count=len(running_processes) - 12))
+
+        lines.extend(
+            [
+                "",
+                t("gateway.agents.async_jobs", count=len(background_tasks)),
+            ]
+        )
+
+        # Background (async) delegations — delegate_task(background=true).
+        # Live per-child activity comes from the registry's progress sampler.
+        delegations: list[dict] = []
+        try:
+            from tools.async_delegation import list_async_delegations
+            delegations = [
+                d for d in list_async_delegations()
+                if d.get("status") in ("running", "stalling", "finalizing")
+            ]
+        except Exception:
+            delegations = []
+        if delegations:
+            lines.extend(
+                [
+                    "",
+                    t(
+                        "gateway.agents.background_delegations",
+                        count=len(delegations),
+                    ),
+                ]
+            )
+            for d in delegations[:12]:
+                goal = " ".join(str(d.get("goal") or "").split())
+                if len(goal) > 70:
+                    goal = goal[:67] + "..."
+                status = d.get("status", "?")
+                row = f"- `{d.get('delegation_id', '?')}` · {status}"
+                if status == "stalling":
+                    quiet = d.get("stalled_after_quiet_seconds")
+                    if quiet is not None:
+                        row += f" · no progress {quiet:.0f}s"
+                elif d.get("seconds_since_progress", 0) >= 60:
+                    row += f" · quiet {d['seconds_since_progress']:.0f}s"
+                if goal:
+                    row += f" · {goal}"
+                lines.append(row)
+                for i, child in enumerate(d.get("children_activity") or []):
+                    if not isinstance(child, dict):
+                        continue
+                    tool = child.get("current_tool")
+                    doing = f"`{tool}`" if tool else "between turns"
+                    part = (
+                        f"  - child {i + 1}: "
+                        f"{child.get('api_calls', '?')} api calls · {doing}"
+                    )
+                    idle = child.get("seconds_since_activity")
+                    if idle is not None:
+                        part += f" · active {idle:.0f}s ago"
+                    lines.append(part)
+            if len(delegations) > 12:
+                lines.append(
+                    t("gateway.agents.more", count=len(delegations) - 12)
+                )
+
+        if not agent_rows and not running_processes and not background_tasks and not delegations:
+            lines.append("")
+            lines.append(t("gateway.agents.none"))
+
+        return "\n".join(lines)
 
     def _sibling_thread_run_keys(self, source: SessionSource, own_key: str) -> list:
         """Find running-agent keys for OTHER participants in the same thread.
@@ -24109,8 +24782,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Ogg/Opus bytes for every provider. Others keep MP3.
             audio_path = build_auto_tts_output_path(event.source.platform)
 
+            def _synthesize_voice_reply_with_context():
+                from gateway.session_context import set_session_vars, clear_session_vars
+
+                source = event.source
+                tokens = set_session_vars(
+                    platform=str(getattr(source.platform, "value", source.platform) or ""),
+                    chat_id=source.chat_id,
+                    chat_name=source.chat_name or "",
+                    thread_id=str(source.thread_id) if source.thread_id else "",
+                    user_id=str(source.user_id) if source.user_id else "",
+                    user_name=str(source.user_name) if source.user_name else "",
+                    session_key="",
+                    message_id=str(event.message_id) if event.message_id else "",
+                )
+                try:
+                    return text_to_speech_tool(text=tts_text, output_path=audio_path)
+                finally:
+                    clear_session_vars(tokens)
+
             result_json = await asyncio.to_thread(
-                text_to_speech_tool, text=tts_text, output_path=audio_path
+                _synthesize_voice_reply_with_context
             )
             try:
                 result = json.loads(result_json)
@@ -25629,16 +26321,41 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             counter = _itertools.count(1)
             self._slash_confirm_counter = counter
         confirm_id = f"{next(counter)}"
+        adapter = self._adapter_for_source(source)
+
+        async def _resolve_with_light_resume(choice: str) -> Optional[str]:
+            """Run the confirmation handler and clear the intervention cue.
+
+            Button callbacks resolve through tools.slash_confirm outside the
+            normal inbound-message lifecycle, so this wrapper owns the matching
+            terminal light event for both button and text confirmation paths.
+            """
+            try:
+                return await handler(choice)
+            finally:
+                emit_light: Optional[Callable[[str, LightCueEvent], Awaitable[Any]]] = (
+                    getattr(adapter, "emit_light_cue_for_chat", None)
+                )
+                if callable(emit_light):
+                    try:
+                        await emit_light(source.chat_id, LightCueEvent.WORKING)
+                    except Exception:
+                        pass
 
         # Register the pending confirm FIRST so a super-fast button click
         # cannot race the send_slash_confirm return.
-        _slash_confirm_mod.register(session_key, confirm_id, command, handler)
+        _slash_confirm_mod.register(
+            session_key, confirm_id, command, _resolve_with_light_resume,
+        )
 
-        adapter = self._adapter_for_source(source)
         metadata = self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
 
         used_buttons = False
         if adapter is not None:
+            try:
+                await adapter.emit_light_cue_for_chat(source.chat_id, LightCueEvent.HUMAN_INTERVENTION)
+            except Exception:
+                pass
             try:
                 button_result = await adapter.send_slash_confirm(
                     chat_id=source.chat_id,
@@ -26680,7 +27397,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self,
         user_text: str,
         audio_paths: List[str],
-    ) -> tuple[str, List[str]]:
+    ):
         """
         Auto-transcribe user voice/audio messages using the configured STT provider
         and prepend the transcript to the message text.
@@ -26698,6 +27415,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 list if every clip failed or STT is disabled. Callers can use
                 this to echo transcripts back to the user before the agent loop.
         """
+        successful_transcripts: List[str] = []
+
+        def _finish(text: str):
+            return text, successful_transcripts
+
         seen = set()
         audio_paths = [p for p in audio_paths if p not in seen and not seen.add(p)]
         if not getattr(self.config, "stt_enabled", True):
@@ -26712,14 +27434,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 else:
                     notes.append(f"[The user sent a voice message: {abs_path}]")
             if not notes:
-                return user_text, []
+                return _finish(user_text)
             prefix = "\n\n".join(notes)
             _placeholder = "(The user sent a message with no text content)"
             if user_text and user_text.strip() == _placeholder:
-                return prefix, []
+                return _finish(prefix)
             if user_text:
-                return f"{prefix}\n\n{user_text}", []
-            return prefix, []
+                return _finish(f"{prefix}\n\n{user_text}")
+            return _finish(prefix)
 
         try:
             from tools.transcription_tools import (
@@ -26737,7 +27459,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return unavailable_note, []
 
         enriched_parts = []
-        successful_transcripts: List[str] = []
         for path in audio_paths:
             try:
                 logger.debug("Transcribing user voice: %s", path)
@@ -26777,6 +27498,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # the LLM volunteer commentary about voice mode rather than
                     # reply to the content.
                     enriched_parts.append(f'"{transcript}"')
+
                 else:
                     error = result.get("error", "unknown error")
                     # All failure branches: a single, minimal, neutral marker.
@@ -26812,11 +27534,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # when we successfully transcribed the audio — it's redundant.
             _placeholder = "(The user sent a message with no text content)"
             if user_text and user_text.strip() == _placeholder:
-                return prefix, successful_transcripts
+                return _finish(prefix)
             if user_text:
-                return f"{prefix}\n\n{user_text}", successful_transcripts
-            return prefix, successful_transcripts
-        return user_text, successful_transcripts
+                return _finish(f"{prefix}\n\n{user_text}")
+            return _finish(prefix)
+        return _finish(user_text)
 
     def _pending_event_audio_paths(self, event) -> List[str]:
         """Return STT-eligible paths from a pending voice message."""

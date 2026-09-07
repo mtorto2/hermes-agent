@@ -524,3 +524,112 @@ describe('requestForSessionProfile', () => {
     expect(ambient).toHaveBeenNthCalledWith(3, 'session.usage', params, undefined, controller.signal)
   })
 })
+
+describe('queued route handoff protocol', () => {
+  beforeEach(() => {
+    setPrimaryGateway(makePrimary() as never, 'default')
+    installDesktop()
+    vi.useFakeTimers()
+  })
+  afterEach(() => vi.useRealTimers())
+
+  const route = { connectionId: 'source-a', profile: 'worker' }
+  const send = (text: string) =>
+    requestForSessionProfile(route, vi.fn() as never, 'prompt.submit', { session_id: 'handoff', text })
+  const event = (type: string, payload?: Record<string, unknown>) =>
+    secondaryGateways[0].emit({ type, session_id: 'handoff', payload })
+
+  it.each(['queued', 'streaming'])('retains a %s lazy successor past idle debounce', async status => {
+    promptAckStatus = 'streaming'
+    await send('first')
+    event('message.start')
+    promptAckStatus = status
+    await send('successor')
+    event('message.complete', { text: 'timeout' })
+    event('session.info', { running: false, pending_turn: true })
+    await vi.advanceTimersByTimeAsync(2000)
+    expect(secondaryGateways[0].close).not.toHaveBeenCalled()
+    event('message.start')
+    event('message.complete', { text: 'done' })
+    event('session.info', { running: false, pending_turn: false })
+    await vi.advanceTimersByTimeAsync(500)
+    expect(secondaryGateways[0].close).toHaveBeenCalledOnce()
+  })
+
+  it('a first RPC failure cannot release its synchronously started queued successor', async () => {
+    // Pre-open through the public turn store, then relinquish this setup hold.
+    const { retainGatewayForSessionTurn } = await import('./gateway')
+    const setupRelease = await retainGatewayForSessionTurn('source-a', 'worker', 'setup')
+    const gateway = secondaryGateways[0]
+    let rejectFirst!: (reason: Error) => void
+    let entered!: () => void
+    const called = new Promise<void>(resolve => {
+      entered = resolve
+    })
+    gateway.request.mockImplementationOnce(() => {
+      entered()
+      return new Promise((_resolve, reject) => {
+        rejectFirst = reject
+      })
+    })
+    const first = send('unsaved').catch(error => error)
+    await called
+    promptAckStatus = 'queued'
+    await send('queued')
+    setupRelease()
+    event('session.info', { running: false, pending_turn: true })
+    event('message.start')
+    rejectFirst(new Error('session storage unavailable'))
+    expect(await first).toBeInstanceOf(Error)
+    await vi.advanceTimersByTimeAsync(2000)
+    expect(gateway.close).not.toHaveBeenCalled()
+    event('message.complete', { text: 'done' })
+    event('session.info', { running: false, pending_turn: false })
+    await vi.advanceTimersByTimeAsync(500)
+    expect(gateway.close).toHaveBeenCalledOnce()
+  })
+})
+
+describe('audit: failed route reservations', () => {
+  beforeEach(() => {
+    setPrimaryGateway(makePrimary() as never, 'default')
+    installDesktop()
+    vi.useFakeTimers()
+  })
+  afterEach(() => vi.useRealTimers())
+
+  it.each([
+    [false, 'reject'], [false, 'error'], [true, 'reject'], [true, 'error']
+  ] as const)('predecessor live=%s, candidate failure=%s', async (live, failure) => {
+    const route = { connectionId: 'source-a', profile: 'worker' }
+    const send = () => requestForSessionProfile(route, vi.fn() as never, 'prompt.submit', {
+      session_id: 'audit-reservation', text: 'work'
+    })
+    promptAckStatus = 'streaming'
+    await send()
+    const gateway = secondaryGateways[0]
+    const event = (type: string) => gateway.emit({
+      type, session_id: 'audit-reservation', payload: { running: false }
+    })
+    event('message.start')
+    if (!live) {
+      event('message.complete')
+      event('session.info')
+    }
+    if (failure === 'reject') {
+      gateway.request.mockRejectedValueOnce(new Error('not admitted'))
+      await expect(send()).rejects.toThrow('not admitted')
+    } else {
+      gateway.request.mockResolvedValueOnce({ status: 'error' })
+      await send()
+    }
+    await vi.advanceTimersByTimeAsync(500)
+    if (live) {
+      expect(gateway.close).not.toHaveBeenCalled()
+      event('message.complete')
+      event('session.info')
+      await vi.advanceTimersByTimeAsync(500)
+    }
+    expect(gateway.close).toHaveBeenCalledOnce()
+  })
+})

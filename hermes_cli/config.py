@@ -4977,6 +4977,7 @@ def show_config():
         ("BROWSERBASE_API_KEY", "Browserbase"),
         ("BROWSER_USE_API_KEY", "Browser Use"),
         ("FAL_KEY", "FAL"),
+        ("HEYGEN_API_KEY", "HeyGen"),
     ]
     
     for env_key, name in keys:

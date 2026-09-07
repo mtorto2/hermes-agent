@@ -415,12 +415,13 @@ const ComposerPane = memo(function ComposerPane({
                 )}
               </Box>
 
-              <Box flexGrow={0} flexShrink={0} height={inputHeight} width={inputColumns}>
+              <Box flexGrow={0} flexShrink={0} height={inputHeight + 1} width={inputColumns}>
                 {/* Reserve the transcript scrollbar gutter too so typing never rewraps when the scrollbar column repaints. */}
                 <TextInput
                   accentColor={ui.theme.color.accent}
                   color={ui.theme.color.text}
                   columns={inputColumns}
+                  enableInputCompactor
                   mouseApiRef={inputMouseRef}
                   onChange={composer.updateInput}
                   onPaste={composer.handleTextPaste}

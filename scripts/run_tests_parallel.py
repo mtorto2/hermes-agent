@@ -381,96 +381,88 @@ def _run_one_file_once(
 ) -> Tuple[Path, int, str, dict[str, int], float]:
     """Single attempt of a per-file pytest subprocess (see _run_one_file)."""
     cmd = [sys.executable, "-m", "pytest", str(file), *pytest_args]
-
-    # Give this subprocess its own pytest temp root.
-    #
-    # pytest builds its tmp_path root as <temproot>/pytest-of-<user>/. At the
-    # end of a session it walks that directory with cleanup_dead_symlinks().
-    # The walk lists the directory. Then it asks whether the `pytest-current`
-    # symlink resolves. Then it unlinks the symlink.
-    #
-    # Every file shared one root. A second process replaced that symlink
-    # between the question and the unlink. The first process then died with
-    # FileNotFoundError after all of its tests passed.
-    #
-    # The risk grows with the number of processes that finish together. At 8
-    # workers it never occurred. At 144 workers it occurs.
-    #
-    # One root for each subprocess removes the shared directory that the race
-    # needs. The parent deletes the root after the attempt.
-    env = os.environ.copy()
-    temproot = tempfile.mkdtemp(prefix="hermes-pytest-tmproot-")
-    env["PYTEST_DEBUG_TEMPROOT"] = temproot
-
-    subproc_start = time.monotonic()
-    # launch the pytest process
-    proc = subprocess.Popen(
-        cmd,
-        cwd=repo_root,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True, encoding="utf-8", errors="replace",
-        env=env,
-        # POSIX: place the child at the head of its own process group so
-        # _kill_tree can SIGKILL the group atomically.
-        # Windows: this maps to CREATE_NEW_PROCESS_GROUP in CPython 3.12+;
-        # _kill_tree handles the Windows path via taskkill /F /T.
-        start_new_session=True,
-    )
-
-    # Capture the pgid NOW, before the leader can exit and be reaped. Once
-    # the leader is reaped, os.getpgid(proc.pid) raises ProcessLookupError
-    # even though grandchildren in that group are still alive — defeating
-    # the whole cleanup. None on Windows where the pgid concept doesn't apply.
-    pgid: int | None = None
-    if sys.platform != "win32":
-        try:
-            pgid = os.getpgid(proc.pid)
-        except (ProcessLookupError, PermissionError):
-            pgid = None
-
+    child_env = os.environ.copy()
+    # The interactive gateway/TUI exports this for its live checkout. A
+    # candidate runner must override it so entry-point import hardening tests
+    # the checkout that launched the runner, not a concurrently running one.
+    child_env["HERMES_PYTHON_SRC_ROOT"] = str(repo_root.resolve())
+    # Every pytest child must have an independent numbered-temp root. Sharing
+    # TMPDIR races pytest's ``pytest-current`` bookkeeping cleanup on macOS.
+    # Keep POSIX roots short so nested ``tmp_path`` Unix sockets fit Darwin's
+    # AF_UNIX pathname limit.
+    scratch_parent = "/tmp" if os.name == "posix" and os.path.isdir("/tmp") else None
+    scratch_prefix = "hv-" if scratch_parent else "hermes-pytest-child-"
+    child_tmpdir = Path(tempfile.mkdtemp(prefix=scratch_prefix, dir=scratch_parent))
+    child_env["TMPDIR"] = str(child_tmpdir)
     try:
-        output, _ = proc.communicate(timeout=file_timeout)
-        rc = proc.returncode
-    except subprocess.TimeoutExpired:
-        _kill_tree(proc, pgid=pgid)
-        try:
-            output, _ = proc.communicate(timeout=10)
-        except subprocess.TimeoutExpired:
-            output = "(file timeout exceeded; output unavailable)"
-        rc = 124  # de facto convention for "killed by timeout".
-        output = (
-            f"({file_timeout:.0f}s exceeded; "
-            f"process tree SIGKILL'd)\n{output}"
+        subproc_start = time.monotonic()
+        # launch the pytest process
+        proc = subprocess.Popen(
+            cmd,
+            cwd=repo_root,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True, encoding="utf-8", errors="replace",
+            env=child_env,
+            # POSIX: place the child at the head of its own process group so
+            # _kill_tree can SIGKILL the group atomically.
+            # Windows: this maps to CREATE_NEW_PROCESS_GROUP in CPython 3.12+;
+            # _kill_tree handles the Windows path via taskkill /F /T.
+            start_new_session=True,
         )
-    except BaseException:
-        # KeyboardInterrupt / runner crash — make sure no zombie
-        # grandchildren outlive us.
-        _kill_tree(proc, pgid=pgid)
-        raise
-    else:
-        # Happy path: pytest exited on its own. Kill the group anyway in
-        # case it left grandchildren behind; already-dead is a no-op.
-        _kill_tree(proc, pgid=pgid)
 
-        output +=  "\n"
+        # Capture the pgid NOW, before the leader can exit and be reaped. Once
+        # the leader is reaped, os.getpgid(proc.pid) raises ProcessLookupError
+        # even though grandchildren in that group are still alive — defeating
+        # the whole cleanup. None on Windows where the pgid concept doesn't apply.
+        pgid: int | None = None
+        if sys.platform != "win32":
+            try:
+                pgid = os.getpgid(proc.pid)
+            except (ProcessLookupError, PermissionError):
+                pgid = None
+
+        try:
+            output, _ = proc.communicate(timeout=file_timeout)
+            rc = proc.returncode
+        except subprocess.TimeoutExpired:
+            _kill_tree(proc, pgid=pgid)
+            try:
+                output, _ = proc.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                output = "(file timeout exceeded; output unavailable)"
+            rc = 124  # de facto convention for "killed by timeout".
+            output = (
+                f"({file_timeout:.0f}s exceeded; "
+                f"process tree SIGKILL'd)\n{output}"
+            )
+        except BaseException:
+            # KeyboardInterrupt / runner crash — make sure no zombie
+            # grandchildren outlive us.
+            _kill_tree(proc, pgid=pgid)
+            raise
+        else:
+            # Happy path: pytest exited on its own. Kill the group anyway in
+            # case it left grandchildren behind; already-dead is a no-op.
+            _kill_tree(proc, pgid=pgid)
+
+            output +=  "\n"
+
+        if rc == 5:
+            # No tests collected in THIS file — legitimate per-file: a
+            # platform-gated or fully-marker-filtered file (e.g. a win32-only
+            # suite on Linux) collects nothing and must not fail the suite.
+            # Tolerated here; the RUN-level guard in main() still fails when
+            # NOTHING was collected across every file, so a broken invocation
+            # (venv without pytest, -k that matches nothing) can't report green.
+            rc = 0
+        summary = _parse_pytest_summary(output)
+        subproc_wall = time.monotonic() - subproc_start
+        return file, rc, output, summary, subproc_wall
     finally:
-        # Delete the temp root for this attempt. Nothing reads it after the
-        # subprocess exits. More than 3000 of them fill the disk of the
-        # runner over one suite.
-        shutil.rmtree(temproot, ignore_errors=True)
-
-    if rc == 5:
-        # No tests collected in THIS file — legitimate per-file: a
-        # platform-gated or fully-marker-filtered file (e.g. a win32-only
-        # suite on Linux) collects nothing and must not fail the suite.
-        # Tolerated here; the RUN-level guard in main() still fails when
-        # NOTHING was collected across every file, so a broken invocation
-        # (venv without pytest, -k that matches nothing) can't report green.
-        rc = 0
-    summary = _parse_pytest_summary(output)
-    subproc_wall = time.monotonic() - subproc_start
-    return file, rc, output, summary, subproc_wall
+        # The child process group is always reaped above before this removes
+        # its unique scratch root, so test-spawned descendants cannot retain it.
+        shutil.rmtree(child_tmpdir, ignore_errors=True)
 
 
 def _parse_pytest_summary(output: str) -> dict[str, int]:

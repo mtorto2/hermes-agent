@@ -24,6 +24,7 @@ from abc import ABC, abstractmethod
 from urllib.parse import urlsplit
 
 from utils import normalize_proxy_url
+from agent.light_cues import LightCueEvent, LightCueService
 
 logger = logging.getLogger(__name__)
 
@@ -3260,6 +3261,7 @@ class BasePlatformAdapter(ABC):
         # Chats where typing indicator is paused (e.g. during approval waits).
         # _keep_typing skips send_typing when the chat_id is in this set.
         self._typing_paused: set = set()
+        self._light_cue_service: LightCueService | None = None
         # Dynamic working-state status text per chat (chat_id -> phrase).
         # Set by the gateway on tool starts ("is running pytest…") and read
         # by adapters whose typing indicator renders text (Slack's
@@ -3276,6 +3278,62 @@ class BasePlatformAdapter(ABC):
         Python ``len`` (e.g. Telegram counts UTF-16 code units).
         """
         return len
+
+    def _get_light_cue_service(self) -> LightCueService:
+        """Return this adapter's shared light cue service."""
+        service = getattr(self, "_light_cue_service", None)
+        if not isinstance(service, LightCueService):
+            service = LightCueService()
+            self._light_cue_service = service
+        return service
+
+    def _light_cue_applies_to_chat(self, chat_id: Any) -> bool:
+        """Return whether shared light cues should fire for *chat_id*.
+
+        Adapters with platform-specific scoping (Telegram's
+        ``allowed_chat_ids`` for the WiZ light, for example) override this
+        hook.  The lifecycle emission itself stays in the shared adapter
+        runtime so busy/final/error cues are not duplicated in every platform
+        adapter.
+        """
+        return True
+
+    async def emit_light_cue_for_chat(self, chat_id: Any, event: LightCueEvent | str) -> bool:
+        """Best-effort shared light cue emission with per-chat scoping."""
+        if not self._light_cue_applies_to_chat(chat_id):
+            return False
+        try:
+            return bool(await asyncio.to_thread(self._get_light_cue_service().emit, event))
+        except Exception as exc:
+            # Light cues are a convenience notifier. Never let LAN/UDP/backend
+            # failures interfere with message processing or delivery.
+            logger.debug("[%s] light cue update failed: %s", self.name, exc)
+            return False
+
+    async def _emit_processing_light_cue(
+        self,
+        hook_name: str,
+        event: MessageEvent | None,
+        outcome: ProcessingOutcome | None = None,
+    ) -> None:
+        """Emit shared turn-lifecycle light cues before platform hooks."""
+        if event is None:
+            return
+        chat_id = getattr(getattr(event, "source", None), "chat_id", None)
+        if chat_id is None:
+            return
+        if hook_name == "on_processing_start":
+            cue_event = LightCueEvent.WORKING
+        elif hook_name == "on_processing_complete":
+            if outcome == ProcessingOutcome.SUCCESS:
+                cue_event = LightCueEvent.FINAL_ANSWER
+            elif outcome == ProcessingOutcome.FAILURE:
+                cue_event = LightCueEvent.ERROR
+            else:
+                cue_event = LightCueEvent.IDLE
+        else:
+            return
+        await self.emit_light_cue_for_chat(chat_id, cue_event)
 
     def max_message_length_for_chat(self, chat_id: str) -> int:
         """Per-chat max message length, in ``message_len_fn_for_chat`` units.
@@ -4776,25 +4834,87 @@ class BasePlatformAdapter(ABC):
             text = f"{caption}\n{text}"
         return await self.send(chat_id=chat_id, content=text, reply_to=reply_to, metadata=metadata)
 
+    @staticmethod
+    def _normalize_tts_currency(text: str) -> str:
+        """Make dollar amounts listener-friendly before synthesis."""
+
+        def repl(match: re.Match) -> str:
+            dollars_raw = match.group(1)
+            cents_raw = match.group(2)
+            dollars_text = dollars_raw.replace(",", "")
+            try:
+                dollars = int(dollars_text)
+            except ValueError:
+                return match.group(0)
+            dollar_word = "dollar" if dollars == 1 else "dollars"
+            if cents_raw and cents_raw != "00":
+                cents = int(cents_raw)
+                cent_word = "cent" if cents == 1 else "cents"
+                return f"{dollars} {dollar_word} and {cents} {cent_word}"
+            return f"{dollars} {dollar_word}"
+
+        return re.sub(r"\$(\d{1,3}(?:,\d{3})*|\d+)(?:\.(\d{2}))?\b", repl, text)
+
+    @staticmethod
+    def _normalize_tts_exact_hour_times(text: str) -> str:
+        """Avoid TTS reading exact-hour times as 'ten zero zero A M'."""
+
+        def repl(match: re.Match) -> str:
+            hour = str(int(match.group(1)))
+            meridiem = match.group(2).upper()
+            return f"{hour} {meridiem} M"
+
+        return re.sub(r"\b(\d{1,2}):00\s*([AaPp])\.?[Mm]\.?\b", repl, text)
+
+    @classmethod
+    def normalize_tts_spoken_text(cls, text: str) -> str:
+        """Apply narrow, safe spoken-form cleanups for gateway auto-TTS."""
+        text = cls._normalize_tts_currency(text)
+        text = cls._normalize_tts_exact_hour_times(text)
+        return text
+
     def prepare_tts_text(self, text: str) -> str:
         """Prepare a spoken script for TTS.
 
         Auto-TTS should not feed raw chat Markdown, ``⋗`` reasoning
         blocks, or compact symbols to the speech provider.  It should receive
-        a transcript-like script: reasoning blocks removed, headings and
+        a transcript-like script.
+
+        Removes the Telegram voice-transcript audit block first (so the user's
+        own dictated prompt is never read back to them), then hands off to the
+        shared spoken-text normalizer: reasoning blocks removed, headings and
         bullets flattened into sentence pauses, and units like ``°C``
         expanded to words such as ``degrees Celsius``.
 
         Provider-safe chunking and platform delivery limits are enforced
         by the TTS tool.
         """
+        # Telegram voice replies may be prefixed by GatewayRunner with a visible
+        # transcript audit block like:
+        #   🎙️ You said: "..."
+        #
+        #   <assistant reply>
+        # Keep that block in the text reply/caption, but don't read the user's
+        # own dictated prompt back to them in the generated audio.
+        text = re.sub(
+            r'^\s*🎙️ You said:\s*".*?"\s*\n\s*\n',
+            '',
+            text,
+            count=1,
+            flags=re.DOTALL,
+        )
         try:
             from tools.tts_text_normalize import prepare_spoken_text
-            return prepare_spoken_text(text, max_chars=None)
+            return prepare_spoken_text(
+                self.normalize_tts_spoken_text(text),
+                max_chars=None,
+            )
         except Exception:
             # Keep auto-TTS best-effort if the normalizer ever fails.
             text = re.sub(r'<think[\s>].*?</think>', ' ', text, flags=re.DOTALL)
-            return re.sub(r'[*_`#\[\]()]', '', text).strip()
+            text = re.sub(r'[*_`#\[\]()]', '', text)
+            text = self.normalize_tts_spoken_text(text)
+            return text.strip()
 
     async def play_tts(
         self,
@@ -5652,6 +5772,35 @@ class BasePlatformAdapter(ABC):
 
     async def _run_processing_hook(self, hook_name: str, *args: Any, **kwargs: Any) -> None:
         """Run a lifecycle hook without letting failures break message flow."""
+        event = args[0] if args else None
+        outcome = args[1] if len(args) > 1 and isinstance(args[1], ProcessingOutcome) else None
+        if hook_name == "on_processing_start":
+            # A LAN/UI indicator is best-effort. Do not yield before the
+            # handler starts: a slow or unavailable light backend must never
+            # delay inbound message dispatch.
+            task = asyncio.create_task(self._emit_processing_light_cue(hook_name, event, outcome))
+            pending = getattr(self, "_processing_light_start_tasks", None)
+            if pending is None:
+                pending = {}
+                self._processing_light_start_tasks = pending
+            pending[id(event)] = task
+
+            def _discard_start_task(done: asyncio.Task, key: int = id(event)) -> None:
+                if pending.get(key) is done:
+                    pending.pop(key, None)
+
+            task.add_done_callback(_discard_start_task)
+        else:
+            # A start cue is intentionally non-blocking, but a completion cue
+            # must not overtake it when thread-pool scheduling is contended.
+            pending = getattr(self, "_processing_light_start_tasks", {})
+            start_task = pending.pop(id(event), None)
+            if start_task is not None:
+                try:
+                    await asyncio.shield(start_task)
+                except Exception:
+                    pass
+            await self._emit_processing_light_cue(hook_name, event, outcome)
         hook = getattr(self, hook_name, None)
         if not callable(hook):
             return
@@ -6681,19 +6830,48 @@ class BasePlatformAdapter(ABC):
                             speech_text = self.prepare_tts_text(text_content)
                             if not speech_text:
                                 raise ValueError("Empty text after markdown cleanup")
-                            # Pass an explicit platform-aware output path: the
-                            # HERMES_SESSION_PLATFORM contextvar the tool would
-                            # otherwise consult is already cleared by the time
-                            # this post-handler block runs, which silently
-                            # produced MP3 (audio attachment, not a native
-                            # voice bubble) on Opus platforms (#57049, #36685).
+                            # Upstream guard: pass an explicit platform-aware
+                            # output path so we get a native voice bubble (Opus)
+                            # rather than MP3 — the HERMES_SESSION_PLATFORM
+                            # contextvar the tool would otherwise consult is
+                            # already cleared by the time this post-handler block
+                            # runs (#57049, #36685).
                             _tts_requested_path = build_auto_tts_output_path(
                                 self.platform
                             )
+
+                            def _synthesize_auto_tts_with_context():
+                                # Local: also re-propagate the originating
+                                # session context in the worker thread so the
+                                # TTS tool's platform-aware routing (and any
+                                # session-scoped config) still applies alongside
+                                # the explicit output path.
+                                from gateway.session_context import (
+                                    set_session_vars,
+                                    clear_session_vars,
+                                )
+
+                                source = event.source
+                                tokens = set_session_vars(
+                                    platform=str(getattr(source.platform, "value", source.platform) or ""),
+                                    chat_id=source.chat_id,
+                                    chat_name=source.chat_name or "",
+                                    thread_id=str(source.thread_id) if source.thread_id else "",
+                                    user_id=str(source.user_id) if source.user_id else "",
+                                    user_name=str(source.user_name) if source.user_name else "",
+                                    session_key="",
+                                    message_id=str(event.message_id) if event.message_id else "",
+                                )
+                                try:
+                                    return text_to_speech_tool(
+                                        text=speech_text,
+                                        output_path=_tts_requested_path,
+                                    )
+                                finally:
+                                    clear_session_vars(tokens)
+
                             tts_result_str = await asyncio.to_thread(
-                                text_to_speech_tool,
-                                text=speech_text,
-                                output_path=_tts_requested_path,
+                                _synthesize_auto_tts_with_context
                             )
                             tts_data = _json.loads(tts_result_str)
                             if tts_data.get("success", True):

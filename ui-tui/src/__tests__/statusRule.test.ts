@@ -93,7 +93,7 @@ describe('statusBarSegments', () => {
   })
 
   it('sheds tail segments in priority order as the terminal narrows', () => {
-    // the context bar is the last of the tail to go.
+    // The context bar is the last tail segment to go.
     const order: (keyof ReturnType<typeof statusBarSegments>)[] = [
       'bar',
       'duration',

@@ -71,6 +71,7 @@ def _clear_approval_state():
     from tools import approval as mod
     mod._gateway_queues.clear()
     mod._gateway_notify_cbs.clear()
+    mod._gateway_resume_cbs.clear()
     mod._session_approved.clear()
     mod._permanent_approved.clear()
     mod._pending.clear()
@@ -137,6 +138,49 @@ class TestBlockingGatewayApproval:
         assert entry.result == "once"
         unregister_gateway_notify(session_key)
 
+    def test_resolve_returns_zero_when_no_pending(self):
+        from tools.approval import resolve_gateway_approval
+        assert resolve_gateway_approval("nonexistent", "once") == 0
+
+    def test_resolve_calls_resume_callback_after_unblocking(self):
+        from tools.approval import (
+            _ApprovalEntry,
+            _gateway_queues,
+            register_gateway_resume,
+            resolve_gateway_approval,
+            unregister_gateway_resume,
+        )
+
+        session_key = "test-resume-callback"
+        calls = []
+        register_gateway_resume(session_key, lambda: calls.append("working"))
+        entry = _ApprovalEntry({"command": "rm -rf /tmp/nope"})
+        _gateway_queues[session_key] = [entry]
+
+        try:
+            assert resolve_gateway_approval(session_key, "once") == 1
+        finally:
+            unregister_gateway_resume(session_key)
+
+        assert entry.event.is_set()
+        assert entry.result == "once"
+        assert calls == ["working"]
+
+    def test_resolve_all_unblocks_multiple_entries(self):
+        """resolve_gateway_approval with resolve_all=True signals all entries."""
+        from tools.approval import (
+            resolve_gateway_approval, _ApprovalEntry, _gateway_queues,
+        )
+        session_key = "test-all"
+        e1 = _ApprovalEntry({"command": "cmd1"})
+        e2 = _ApprovalEntry({"command": "cmd2"})
+        e3 = _ApprovalEntry({"command": "cmd3"})
+        _gateway_queues[session_key] = [e1, e2, e3]
+
+        count = resolve_gateway_approval(session_key, "session", resolve_all=True)
+        assert count == 3
+        assert all(e.event.is_set() for e in [e1, e2, e3])
+        assert all(e.result == "session" for e in [e1, e2, e3])
 
     def test_resolve_single_pops_oldest_fifo(self):
         """resolve_gateway_approval without resolve_all resolves oldest first."""
@@ -301,17 +345,139 @@ class TestBlockingApprovalE2E:
         os.environ.pop("HERMES_GATEWAY_SESSION", None)
         os.environ.pop("HERMES_EXEC_ASK", None)
         os.environ.pop("HERMES_SESSION_KEY", None)
-        # These E2E tests exercise manual gateway blocking; default config is
-        # approvals.mode=smart which may auto-approve/deny via aux LLM before
-        # notify_cb runs (flaky on CI when the LLM is slow or unavailable).
-        self._approval_mode_patch = patch(
-            "tools.approval._get_approval_mode", return_value="manual"
+
+    def test_blocking_approval_approve_once(self):
+        """check_all_command_guards blocks until resolve_gateway_approval is called."""
+        from tools.approval import (
+            register_gateway_notify, unregister_gateway_notify,
+            resolve_gateway_approval, check_all_command_guards,
         )
-        self._approval_mode_patch.start()
 
-    def teardown_method(self):
-        self._approval_mode_patch.stop()
+        session_key = "e2e-test"
+        notified = []
 
+        register_gateway_notify(session_key, lambda d: notified.append(d))
+
+        result_holder = [None]
+
+        def agent_thread():
+            from tools.approval import reset_current_session_key, set_current_session_key
+
+            token = set_current_session_key(session_key)
+            os.environ["HERMES_GATEWAY_SESSION"] = "1"
+            os.environ["HERMES_EXEC_ASK"] = "1"
+            os.environ["HERMES_SESSION_KEY"] = session_key
+            try:
+                result_holder[0] = check_all_command_guards(
+                    "rm -rf /important", "local"
+                )
+            finally:
+                os.environ.pop("HERMES_GATEWAY_SESSION", None)
+                os.environ.pop("HERMES_EXEC_ASK", None)
+                os.environ.pop("HERMES_SESSION_KEY", None)
+                reset_current_session_key(token)
+
+        t = threading.Thread(target=agent_thread)
+        t.start()
+
+        for _ in range(50):
+            if notified:
+                break
+            time.sleep(0.05)
+
+        assert len(notified) == 1
+        assert "rm -rf /important" in notified[0]["command"]
+
+        resolve_gateway_approval(session_key, "once")
+        t.join(timeout=5)
+
+        assert result_holder[0] is not None
+        assert result_holder[0]["approved"] is True
+        unregister_gateway_notify(session_key)
+
+    def test_blocking_approval_timeout_fires_resume_callback(self):
+        """Timed-out gateway approvals also resume the working light cue."""
+        from tools.approval import (
+            check_all_command_guards,
+            register_gateway_notify,
+            register_gateway_resume,
+            reset_current_session_key,
+            set_current_session_key,
+            unregister_gateway_notify,
+            unregister_gateway_resume,
+        )
+
+        session_key = "e2e-timeout-test"
+        notified = []
+        resumed = []
+        register_gateway_notify(session_key, lambda d: notified.append(d))
+        register_gateway_resume(session_key, lambda: resumed.append("working"))
+
+        # The canonical approval timeout is `approvals.timeout`; the legacy
+        # gateway_timeout key is intentionally ignored by the shared resolver.
+        with patch("tools.approval._get_approval_config", return_value={"timeout": 0}):
+            token = set_current_session_key(session_key)
+            os.environ["HERMES_GATEWAY_SESSION"] = "1"
+            os.environ["HERMES_EXEC_ASK"] = "1"
+            os.environ["HERMES_SESSION_KEY"] = session_key
+            try:
+                result = check_all_command_guards("rm -rf /important", "local")
+            finally:
+                os.environ.pop("HERMES_GATEWAY_SESSION", None)
+                os.environ.pop("HERMES_EXEC_ASK", None)
+                os.environ.pop("HERMES_SESSION_KEY", None)
+                reset_current_session_key(token)
+                unregister_gateway_resume(session_key)
+                unregister_gateway_notify(session_key)
+
+        assert notified
+        assert result["approved"] is False
+        assert result["outcome"] == "timeout"
+        assert resumed == ["working"]
+
+    def test_blocking_approval_deny(self):
+        """check_all_command_guards returns BLOCKED when denied."""
+        from tools.approval import (
+            register_gateway_notify, unregister_gateway_notify,
+            resolve_gateway_approval, check_all_command_guards,
+        )
+
+        session_key = "e2e-deny"
+        notified = []
+        register_gateway_notify(session_key, lambda d: notified.append(d))
+
+        result_holder = [None]
+
+        def agent_thread():
+            from tools.approval import reset_current_session_key, set_current_session_key
+
+            token = set_current_session_key(session_key)
+            os.environ["HERMES_GATEWAY_SESSION"] = "1"
+            os.environ["HERMES_EXEC_ASK"] = "1"
+            os.environ["HERMES_SESSION_KEY"] = session_key
+            try:
+                result_holder[0] = check_all_command_guards(
+                    "rm -rf /important", "local"
+                )
+            finally:
+                os.environ.pop("HERMES_GATEWAY_SESSION", None)
+                os.environ.pop("HERMES_EXEC_ASK", None)
+                os.environ.pop("HERMES_SESSION_KEY", None)
+                reset_current_session_key(token)
+
+        t = threading.Thread(target=agent_thread)
+        t.start()
+        for _ in range(50):
+            if notified:
+                break
+            time.sleep(0.05)
+
+        resolve_gateway_approval(session_key, "deny")
+        t.join(timeout=5)
+
+        assert result_holder[0]["approved"] is False
+        assert "BLOCKED" in result_holder[0]["message"]
+        unregister_gateway_notify(session_key)
 
     @pytest.mark.parametrize(
         "approval_config",

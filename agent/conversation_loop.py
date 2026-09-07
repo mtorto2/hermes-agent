@@ -3293,7 +3293,7 @@ def run_conversation(
                     if isinstance(getattr(agent, "client", None), Mock):
                         _use_streaming = False
 
-                def _perform_api_call(next_api_kwargs):
+                def _dispatch_api_call(next_api_kwargs):
                     if agent.api_mode == "codex_responses":
                         next_api_kwargs = agent._get_transport().preflight_kwargs(
                             next_api_kwargs,
@@ -3327,6 +3327,14 @@ def run_conversation(
                         },
                         defer_logical_completion=True,
                     )
+
+                def _perform_api_call(next_api_kwargs):
+                    try:
+                        return _dispatch_api_call(next_api_kwargs)
+                    finally:
+                        from agent.agent_runtime_helpers import restore_api_key_fallback
+
+                        restore_api_key_fallback(agent)
 
                 from hermes_cli.middleware import run_llm_execution_middleware
 

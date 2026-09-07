@@ -24,6 +24,7 @@ from tools.environments.base import (
     _popen_bash,
 )
 from tools.environments.path_utils import sanitize_task_id_for_path
+from tools.docker_mount_policy import validated_docker_mount_root
 from tools.environments.local import (
     _HERMES_PROVIDER_ENV_BLOCKLIST,
     _is_hermes_internal_secret,
@@ -1000,15 +1001,15 @@ class DockerEnvironment(BaseEnvironment):
             else:
                 logger.warning("Docker volume '%s' missing colon, skipping", vol)
 
-        host_cwd_abs = os.path.abspath(os.path.expanduser(host_cwd)) if host_cwd else ""
+        validated_host_cwd = (
+            validated_docker_mount_root(host_cwd) if auto_mount_cwd else None
+        )
         bind_host_cwd = (
-            auto_mount_cwd
-            and bool(host_cwd_abs)
-            and os.path.isdir(host_cwd_abs)
+            bool(validated_host_cwd)
             and not workspace_explicitly_mounted
         )
-        if auto_mount_cwd and host_cwd and not os.path.isdir(host_cwd_abs):
-            logger.debug("Skipping docker cwd mount: host_cwd is not a valid directory: %s", host_cwd)
+        if auto_mount_cwd and host_cwd and not validated_host_cwd:
+            logger.debug("Skipping docker cwd mount: host_cwd is not a valid mount root: %s", host_cwd)
 
         self._workspace_dir: Optional[str] = None
         self._home_dir: Optional[str] = None
@@ -1039,8 +1040,8 @@ class DockerEnvironment(BaseEnvironment):
             ])
 
         if bind_host_cwd:
-            logger.info("Mounting configured host cwd to /workspace: %s", host_cwd_abs)
-            volume_args = ["-v", f"{host_cwd_abs}:/workspace", *volume_args]
+            logger.info("Mounting configured host cwd to /workspace: %s", validated_host_cwd)
+            volume_args = ["-v", f"{validated_host_cwd}:/workspace", *volume_args]
         elif workspace_explicitly_mounted:
             logger.debug("Skipping docker cwd mount: /workspace already mounted by user config")
 

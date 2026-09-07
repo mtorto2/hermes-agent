@@ -254,6 +254,259 @@ def test_launch_tui_exports_model_provider_and_toolsets(monkeypatch, main_mod):
     assert env["NODE_ENV"] == "production"
 
 
+def test_launch_tui_pins_profile_home_and_identity_into_node_env(monkeypatch, main_mod, tmp_path):
+    import hermes_cli.profiles as profiles_mod
+
+    captured = {}
+    profile_home = tmp_path / ".hermes" / "profiles" / "personal"
+    profile_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    monkeypatch.delenv("HERMES_PROFILE", raising=False)
+    monkeypatch.setattr(profiles_mod, "_get_profiles_root", lambda: profile_home.parent)
+    monkeypatch.setattr(
+        main_mod,
+        "_make_tui_argv",
+        lambda tui_dir, tui_dev: (["node", "dist/entry.js"], Path(".")),
+    )
+    monkeypatch.setattr(
+        main_mod.subprocess,
+        "call",
+        lambda argv, cwd=None, env=None: captured.update({"env": env}) or 1,
+    )
+
+    with pytest.raises(SystemExit):
+        main_mod._launch_tui()
+
+    assert captured["env"]["HERMES_HOME"] == str(profile_home)
+    assert captured["env"]["HERMES_PROFILE"] == "personal"
+
+
+def test_launch_tui_worktree_validates_relative_python_against_final_cwd(
+    monkeypatch, main_mod, tmp_path
+):
+    import cli as cli_mod
+
+    parent_cwd = tmp_path / "parent"
+    parent_cwd.mkdir()
+    worktree = tmp_path / "worktree"
+    relative_python = Path(".review-venv") / "bin" / Path(sys.executable).name
+    python_path = worktree / relative_python
+    python_path.parent.mkdir(parents=True)
+    # copy2, not os.link: tmp_path may sit on a different filesystem than
+    # the venv (tmpfs /tmp vs disk home) where hard links raise EXDEV.
+    import shutil
+
+    shutil.copy2(sys.executable, python_path)
+    captured = {}
+
+    monkeypatch.setenv("HERMES_CWD", str(parent_cwd))
+    monkeypatch.setenv("HERMES_PYTHON", str(relative_python))
+    monkeypatch.setattr(cli_mod, "_git_repo_root", lambda: None)
+    monkeypatch.setattr(cli_mod, "_prune_stale_worktrees", lambda _repo: None)
+    monkeypatch.setattr(cli_mod, "_setup_worktree", lambda: {"path": str(worktree)})
+    monkeypatch.setattr(cli_mod, "_cleanup_worktree", lambda _info: None)
+    monkeypatch.setattr(
+        main_mod,
+        "_make_tui_argv",
+        lambda tui_dir, tui_dev: (["node", "dist/entry.js"], Path(".")),
+    )
+    monkeypatch.setattr(
+        main_mod.subprocess,
+        "call",
+        lambda argv, cwd=None, env=None: captured.update({"env": env}) or 1,
+    )
+
+    with pytest.raises(SystemExit):
+        main_mod._launch_tui(worktree=True)
+
+    assert captured["env"]["HERMES_CWD"] == str(worktree)
+    assert captured["env"]["HERMES_PYTHON"] == str(relative_python)
+
+
+def test_launch_tui_applies_terminal_backend_config(
+    monkeypatch, main_mod, _isolate_hermes_home
+):
+    captured = {}
+    config_path = Path(os.environ["HERMES_HOME"]) / "config.yaml"
+    config_path.write_text(
+        "\n".join(
+            [
+                "terminal:",
+                "  backend: docker",
+                "  docker_image: example/hermes-tools:latest",
+                "  docker_extra_args:",
+                "    - --network=host",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("TERMINAL_ENV", raising=False)
+    monkeypatch.delenv("TERMINAL_DOCKER_IMAGE", raising=False)
+    monkeypatch.delenv("TERMINAL_DOCKER_EXTRA_ARGS", raising=False)
+
+    monkeypatch.setattr(
+        main_mod,
+        "_make_tui_argv",
+        lambda tui_dir, tui_dev: (["node", "dist/entry.js"], Path(".")),
+    )
+    monkeypatch.setattr(
+        main_mod.subprocess,
+        "call",
+        lambda argv, cwd=None, env=None: captured.update({"env": env}) or 1,
+    )
+
+    with pytest.raises(SystemExit):
+        main_mod._launch_tui()
+
+    assert captured["env"]["TERMINAL_ENV"] == "docker"
+    assert captured["env"]["TERMINAL_DOCKER_IMAGE"] == "example/hermes-tools:latest"
+    assert captured["env"]["TERMINAL_DOCKER_EXTRA_ARGS"] == '["--network=host"]'
+
+
+def test_launch_tui_exit_code_42_relaunches_update(monkeypatch, main_mod):
+    from unittest.mock import patch
+
+    monkeypatch.setattr(
+        main_mod,
+        "_make_tui_argv",
+        lambda tui_dir, tui_dev: (["node", "dist/entry.js"], Path(".")),
+    )
+    monkeypatch.setattr(main_mod.subprocess, "call", lambda *args, **kwargs: 42)
+
+    with patch("hermes_cli.relaunch.relaunch") as mock_relaunch:
+        with pytest.raises(SystemExit) as exc:
+            main_mod._launch_tui()
+
+    assert exc.value.code == 42
+    mock_relaunch.assert_called_once_with(["update"], preserve_inherited=False)
+
+
+def test_launch_tui_drops_stale_resume_env_without_resume_arg(monkeypatch, main_mod):
+    captured = {}
+
+    monkeypatch.setenv("HERMES_TUI_RESUME", "stale-missing-session")
+    monkeypatch.setattr(
+        main_mod,
+        "_make_tui_argv",
+        lambda tui_dir, tui_dev: (["node", "dist/entry.js"], Path(".")),
+    )
+    monkeypatch.setattr(
+        main_mod.subprocess,
+        "call",
+        lambda argv, cwd=None, env=None: captured.update({"env": env}) or 1,
+    )
+
+    with pytest.raises(SystemExit):
+        main_mod._launch_tui()
+
+    assert "HERMES_TUI_RESUME" not in captured["env"]
+
+
+def test_launch_tui_sets_resume_env_from_resume_arg(monkeypatch, main_mod):
+    captured = {}
+
+    monkeypatch.setenv("HERMES_TUI_RESUME", "stale-missing-session")
+    monkeypatch.setattr(
+        main_mod,
+        "_make_tui_argv",
+        lambda tui_dir, tui_dev: (["node", "dist/entry.js"], Path(".")),
+    )
+    monkeypatch.setattr(
+        main_mod.subprocess,
+        "call",
+        lambda argv, cwd=None, env=None: captured.update({"env": env}) or 1,
+    )
+
+    with pytest.raises(SystemExit):
+        main_mod._launch_tui(resume_session_id="20260518_000000_goodid")
+
+    assert captured["env"]["HERMES_TUI_RESUME"] == "20260518_000000_goodid"
+
+
+def test_launch_tui_exports_input_compactor_path_from_config(monkeypatch, main_mod):
+    captured = {}
+
+    monkeypatch.delenv("HERMES_INPUT_COMPACTOR", raising=False)
+    monkeypatch.setattr(
+        main_mod,
+        "_make_tui_argv",
+        lambda tui_dir, tui_dev: (["node", "dist/entry.js"], Path(".")),
+    )
+    monkeypatch.setattr(
+        main_mod.subprocess,
+        "call",
+        lambda argv, cwd=None, env=None: captured.update({"env": env}) or 1,
+    )
+
+    import hermes_cli.config as config_mod
+
+    monkeypatch.setattr(
+        config_mod,
+        "load_config",
+        lambda: {
+            "display": {"input_compactor_path": "~/bin/display-compactor"},
+            "input_compactor_path": "~/bin/root-compactor",
+        },
+    )
+
+    with pytest.raises(SystemExit):
+        main_mod._launch_tui()
+
+    assert captured["env"]["HERMES_INPUT_COMPACTOR"] == os.path.expanduser("~/bin/display-compactor")
+
+
+def test_launch_tui_preserves_explicit_input_compactor_env(monkeypatch, main_mod):
+    captured = {}
+
+    monkeypatch.setenv("HERMES_INPUT_COMPACTOR", "/tmp/env-compactor")
+    monkeypatch.setattr(
+        main_mod,
+        "_make_tui_argv",
+        lambda tui_dir, tui_dev: (["node", "dist/entry.js"], Path(".")),
+    )
+    monkeypatch.setattr(
+        main_mod.subprocess,
+        "call",
+        lambda argv, cwd=None, env=None: captured.update({"env": env}) or 1,
+    )
+
+    import hermes_cli.config as config_mod
+
+    monkeypatch.setattr(
+        config_mod,
+        "load_config",
+        lambda: {"display": {"input_compactor_path": "~/bin/display-compactor"}},
+    )
+
+    with pytest.raises(SystemExit):
+        main_mod._launch_tui()
+
+    assert captured["env"]["HERMES_INPUT_COMPACTOR"] == "/tmp/env-compactor"
+
+
+def test_launch_tui_exports_input_compactor_root_fallback(monkeypatch, main_mod):
+    captured = {}
+
+    monkeypatch.delenv("HERMES_INPUT_COMPACTOR", raising=False)
+    monkeypatch.setattr(
+        main_mod,
+        "_make_tui_argv",
+        lambda tui_dir, tui_dev: (["node", "dist/entry.js"], Path(".")),
+    )
+    monkeypatch.setattr(
+        main_mod.subprocess,
+        "call",
+        lambda argv, cwd=None, env=None: captured.update({"env": env}) or 1,
+    )
+
+    import hermes_cli.config as config_mod
+
+    monkeypatch.setattr(config_mod, "load_config", lambda: {"input_compactor_path": "~/bin/root-compactor"})
+
+    with pytest.raises(SystemExit):
+        main_mod._launch_tui()
+
+    assert captured["env"]["HERMES_INPUT_COMPACTOR"] == os.path.expanduser("~/bin/root-compactor")
 
 
 def test_make_tui_argv_dev_prebuilds_hermes_ink(monkeypatch, main_mod, tmp_path):
@@ -282,7 +535,3 @@ def test_make_tui_argv_dev_prebuilds_hermes_ink(monkeypatch, main_mod, tmp_path)
     assert argv == [str(tsx), "src/entry.tsx"]
     assert cwd == tui_dir
     assert calls == [(["/usr/bin/npm", "run", "build"], str(ink_dir))]
-
-
-
-

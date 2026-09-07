@@ -614,6 +614,12 @@ def _(rid, params: dict) -> dict:
             return _err(rid, 4004, "usage: /queue <prompt>")
         return _ok(rid, {"type": "send", "message": arg})
 
+    # /nah remains a native TUI command. Alias resolution is intentionally
+    # repeated here: command.dispatch can be invoked directly by the frontend,
+    # bypassing slash.exec's alias/fallback path.
+    if name in {"nah", "tldr", "tl-dr", "tl_dr"}:
+        return _ok(rid, {"type": "send", "message": _build_nah_instruction(arg)})
+
     if name == "learn":
         # Open-ended: build the standards-guided prompt and submit it as a
         # normal agent turn. The live agent gathers whatever the user

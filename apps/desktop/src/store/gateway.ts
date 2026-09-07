@@ -128,6 +128,19 @@ const ACTIVATION_LEASE_MS = 30_000
 // an in-place hot update that preserves the sockets. Production strips
 // import.meta.hot, and a fresh page realm starts with an empty container, so the
 // runtime behavior is identical to plain module state.
+interface TurnReservation {
+  state: 'request' | 'queued' | 'started' | 'settled'
+}
+
+interface TurnLease {
+  (): void
+  awaitingIdle: boolean
+  pending: boolean
+  live: boolean
+  idle: boolean
+  reservations: Set<TurnReservation>
+}
+
 interface GatewayRegistryState {
   config: RegistryConfig | null
   primaryGateway: HermesGateway | null
@@ -140,7 +153,7 @@ interface GatewayRegistryState {
   /** Scopes that opened in this renderer generation, even if later pruned. */
   openedSecondaryScopes?: Set<string>
   /** Routed prompt sockets held until their terminal turn event arrives. */
-  turnLeases: Map<string, () => void>
+  turnLeases: Map<string, TurnLease>
   /** Debounced releases so an immediate chained turn can reuse its lease. */
   turnLeaseReleaseTimers: Map<string, ReturnType<typeof setTimeout>>
   $gateway: ReturnType<typeof atom<HermesGateway | null>>
@@ -159,7 +172,7 @@ function createRegistryState(): GatewayRegistryState {
     activationEpoch: 0,
     secondaries: new Map<string, Secondary>(),
     openedSecondaryScopes: new Set<string>(),
-    turnLeases: new Map<string, () => void>(),
+    turnLeases: new Map<string, TurnLease>(),
     turnLeaseReleaseTimers: new Map<string, ReturnType<typeof setTimeout>>(),
     // The active gateway instance, exposed for inline message-stream
     // components (inline ClarifyTool, model overlays) that call gateway
@@ -1220,45 +1233,110 @@ function releaseTurnLeasesForScope(scope: string): void {
  * 20-second orphan guard then interrupts it as `client_gone`. Hold one lease per
  * (route, runtime session) until message.complete/session.info settles the turn.
  */
+export interface SessionTurnLease {
+  (): void
+  acknowledge(result: unknown): void
+}
+
 export async function retainGatewayForSessionTurn(
   connectionId: null | string,
   profile: string,
   sessionId: string
-): Promise<() => void> {
+): Promise<SessionTurnLease> {
   const scope = registryBackendScopeKey(connectionId, normKey(profile))
   const key = turnLeaseKey(scope, sessionId)
 
   cancelTurnLeaseRelease(key)
 
-  // A busy-session redirect/queue can submit again while the original turn is
-  // still retained. The existing lease owns that turn; the extra submit must
-  // not replace or release it. The no-op means "another caller owns the
-  // shared lease", not "this caller acquired a separately releasable lease".
-  if (g.turnLeases.has(key)) {
-    return () => undefined
+  const existing = g.turnLeases.get(key)
+  if (existing) {
+    return sessionTurnRequestLease(key, existing)
   }
 
-  const releaseRoute = await retainGatewayForAgent(connectionId, profile)
   let released = false
-
-  const release = () => {
-    if (released) {
-      return
-    }
-
-    released = true
-
-    if (g.turnLeases.get(key) === release) {
-      g.turnLeases.delete(key)
-    }
-
-    cancelTurnLeaseRelease(key)
-    releaseRoute()
-  }
-
+  let releaseRoute: (() => void) | undefined
+  const release: TurnLease = Object.assign(
+    () => {
+      if (released) return
+      released = true
+      if (g.turnLeases.get(key) === release) {
+        g.turnLeases.delete(key)
+        cancelTurnLeaseRelease(key)
+      }
+      releaseRoute?.()
+    },
+    { awaitingIdle: false, pending: false, live: false, idle: false, reservations: new Set<TurnReservation>() }
+  )
+  // Publish before dialing: concurrent submits share exactly one route hold.
   g.turnLeases.set(key, release)
+  const requestLease = sessionTurnRequestLease(key, release)
+  try {
+    releaseRoute = await retainGatewayForAgent(connectionId, profile)
+    if (released) releaseRoute()
+  } catch (error) {
+    release()
+    throw error
+  }
+  return requestLease
+}
 
-  return release
+function reconcileTurnLease(key: string, lease: TurnLease): void {
+  if (g.turnLeases.get(key) !== lease || lease.live || lease.pending || lease.reservations.size) return
+  if (g.turnLeaseReleaseTimers.has(key)) return
+  if (!lease.idle) {
+    lease()
+    return
+  }
+  g.turnLeaseReleaseTimers.set(key, setTimeout(() => {
+    g.turnLeaseReleaseTimers.delete(key)
+    if (g.turnLeases.get(key) === lease && !lease.live && !lease.pending && !lease.reservations.size) lease()
+  }, TURN_LEASE_SETTLE_DELAY_MS))
+}
+
+function sessionTurnRequestLease(key: string, lease: TurnLease): SessionTurnLease {
+  const reservation: TurnReservation = { state: 'request' }
+  lease.reservations.add(reservation)
+  const isCurrent = () => g.turnLeases.get(key) === lease && reservation.state === 'request'
+  return Object.assign(
+    () => {
+      if (!isCurrent()) return
+      reservation.state = 'settled'
+      lease.reservations.delete(reservation)
+      reconcileTurnLease(key, lease)
+    },
+    {
+      acknowledge(result: unknown) {
+        if (!isCurrent()) return
+        const status = result && typeof result === 'object' && 'status' in result ? result.status : undefined
+        // Rejection never accepted work: release only this request's reservation.
+        if (status === 'rejected') {
+          reservation.state = 'settled'
+          lease.reservations.delete(reservation)
+          reconcileTurnLease(key, lease)
+          return
+        }
+        // Terminal ACKs leave the reservation for the caller's release.
+        if (status === 'error' || status === 'complete' || status === 'completed') return
+        if (status === 'queued') {
+          reservation.state = 'queued'
+        } else {
+          reservation.state = 'started'
+          lease.reservations.delete(reservation)
+          lease.live = true // includes older gateways with unstructured ACKs
+        }
+        cancelTurnLeaseRelease(key)
+      }
+    }
+  )
+}
+
+function consumeTurnReservation(lease: TurnLease, state: 'started' | 'settled'): void {
+  // Terminal/start frames carry no request identity. Set insertion order is
+  // submission order: consume only the oldest candidate, including queued ACKs.
+  const reservation = lease.reservations.values().next().value
+  if (!reservation) return
+  reservation.state = state
+  lease.reservations.delete(reservation)
 }
 
 function releaseTerminalTurnLease(scope: string, event: GatewayEvent): void {
@@ -1274,7 +1352,28 @@ function releaseTerminalTurnLease(scope: string, event: GatewayEvent): void {
     // The gateway emits settled session.info before immediately chaining a
     // queued/goal follow-up. Keep the same route alive for that next turn.
     cancelTurnLeaseRelease(key)
+    const lease = g.turnLeases.get(key)
+    if (lease) {
+      if (!lease.live) consumeTurnReservation(lease, 'started')
+      lease.awaitingIdle = false
+      lease.pending = false
+      lease.live = true
+      lease.idle = false
+    }
+    return
+  }
 
+  if (event.type === 'message.complete' || event.type === 'error') {
+    const lease = g.turnLeases.get(key)
+    if (lease) {
+      // A live predecessor's terminal edge does not settle a candidate request.
+      // After its idle edge, a pre-start terminal belongs to the candidate and
+      // must invalidate that candidate's delayed ACK.
+      if (!lease.live && !lease.awaitingIdle) consumeTurnReservation(lease, 'settled')
+      lease.awaitingIdle = true
+      lease.pending = false
+      // Hold through the parent's authoritative idle publication.
+    }
     return
   }
 
@@ -1286,17 +1385,25 @@ function releaseTerminalTurnLease(scope: string, event: GatewayEvent): void {
 
   const payload = event.payload as Record<string, unknown> | undefined
 
-  if (event.type === 'session.info' && payload?.running === false && !g.turnLeaseReleaseTimers.has(key)) {
-    // session.info(false) is the authoritative settled edge, but auto-followup
-    // emits message.start immediately after it. A short debounce lets that
-    // frame cancel release while still reclaiming ordinary completed turns.
-    g.turnLeaseReleaseTimers.set(
-      key,
-      setTimeout(() => {
-        g.turnLeaseReleaseTimers.delete(key)
-        g.turnLeases.get(key)?.()
-      }, TURN_LEASE_SETTLE_DELAY_MS)
-    )
+  if (event.type === 'session.info' && payload?.running === false) {
+    const lease = g.turnLeases.get(key)
+    if (!lease) return
+    // A terminal + idle pair describes one turn, not two FIFO candidates.
+    // Repeated idle snapshots likewise cannot settle unrelated requests.
+    const oldest = lease.reservations.values().next().value
+    const initialRequestIdle = !lease.idle && oldest?.state === 'request'
+    if (!lease.live && !lease.awaitingIdle && (initialRequestIdle || (lease.pending && payload.pending_turn === false))) {
+      consumeTurnReservation(lease, 'settled')
+    }
+    lease.awaitingIdle = false
+    lease.live = false
+    lease.idle = true
+    if (typeof payload.pending_turn === 'boolean') lease.pending = payload.pending_turn
+    if (lease.pending) {
+      cancelTurnLeaseRelease(key)
+      return
+    }
+    reconcileTurnLease(key, lease)
   }
 }
 

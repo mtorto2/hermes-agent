@@ -397,3 +397,66 @@ class TestLazySandboxBringUp:
 
         with pytest.raises(isrc.SourceNotFound):
             await isrc.resolve_image_source(str(secret), isrc.ResolveContext(task_id="t1"))
+
+    @pytest.mark.asyncio
+    async def test_container_read_uses_the_calling_sessions_cwd(self, tmp_path, monkeypatch):
+        """A shared sandbox must not resolve a relative image in another session's cwd."""
+        isrc = _reload(monkeypatch, tmp_path / "hermes")
+        monkeypatch.setenv("TERMINAL_ENV", "ssh")
+
+        import tools.terminal_tool as tt
+
+        monkeypatch.setattr(tt, "_session_cwd", {})
+        tt.record_session_cwd("acp-session", "/workspace/acp-project")
+        calls = {}
+
+        def fake_execute(cmd, **kwargs):
+            calls.update(kwargs)
+            return {"returncode": 0, "output": base64.b64encode(PNG).decode()}
+
+        monkeypatch.setattr(
+            isrc,
+            "_get_active_env",
+            lambda *_args: SimpleNamespace(execute=fake_execute),
+        )
+
+        result = await isrc.resolve_image_source(
+            "screenshot.png", isrc.ResolveContext(task_id="acp-session")
+        )
+
+        assert result.origin == "container"
+        assert calls["cwd"] == "/workspace/acp-project"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("session_cwd", ["/Users/matt/project", "relative-project"])
+    async def test_container_read_rejects_host_or_relative_session_cwd(
+        self, tmp_path, monkeypatch, session_cwd
+    ):
+        """Container reads must not execute with an ACP cwd absent from the sandbox."""
+        isrc = _reload(monkeypatch, tmp_path / "hermes")
+        monkeypatch.setenv("TERMINAL_ENV", "docker")
+        monkeypatch.setenv("TERMINAL_CWD", "/root")
+
+        import tools.terminal_tool as tt
+
+        monkeypatch.setattr(tt, "_session_cwd", {})
+        monkeypatch.setattr(tt, "ensure_task_env", lambda *_args, **_kwargs: None)
+        tt.record_session_cwd("acp-session", session_cwd)
+        calls = {}
+
+        def fake_execute(cmd, **kwargs):
+            calls.update(kwargs)
+            return {"returncode": 0, "output": base64.b64encode(PNG).decode()}
+
+        monkeypatch.setattr(
+            isrc,
+            "_get_active_env",
+            lambda *_args: SimpleNamespace(execute=fake_execute),
+        )
+
+        result = await isrc.resolve_image_source(
+            "screenshot.png", isrc.ResolveContext(task_id="acp-session")
+        )
+
+        assert result.origin == "container"
+        assert calls["cwd"] == "/root"

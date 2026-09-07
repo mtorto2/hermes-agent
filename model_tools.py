@@ -1251,6 +1251,7 @@ def handle_function_call(
     skip_tool_request_middleware: bool = False,
     skip_tool_execution_middleware: bool = False,
     tool_request_middleware_trace: Optional[List[Dict[str, Any]]] = None,
+    agent: Any = None,
     enabled_toolsets: Optional[List[str]] = None,
     disabled_toolsets: Optional[List[str]] = None,
 ) -> str:
@@ -1390,6 +1391,7 @@ def handle_function_call(
                 skip_tool_request_middleware=skip_tool_request_middleware,
                 skip_tool_execution_middleware=skip_tool_execution_middleware,
                 tool_request_middleware_trace=list(_tool_middleware_trace),
+                agent=agent,
                 enabled_toolsets=enabled_toolsets,
                 disabled_toolsets=disabled_toolsets,
             )
@@ -1548,6 +1550,7 @@ def handle_function_call(
                         task_id=task_id,
                         session_id=session_id,
                         enabled_tools=sandbox_enabled,
+                        agent=agent,
                     )
             else:
                 def _dispatch(next_args: Dict[str, Any]) -> Any:
@@ -1556,6 +1559,7 @@ def handle_function_call(
                         task_id=task_id,
                         session_id=session_id,
                         user_task=user_task,
+                        agent=agent,
                     )
             if skip_tool_execution_middleware:
                 result = _dispatch(function_args)

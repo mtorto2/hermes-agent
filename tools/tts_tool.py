@@ -3201,7 +3201,11 @@ def _text_to_speech_single(
     # always outputs MP3 and needs ffmpeg for conversion.
     from gateway.session_context import get_session_env
     platform = get_session_env("HERMES_SESSION_PLATFORM", "").lower()
-    want_opus = platform in OPUS_VOICE_PLATFORMS
+    cron_delivery_platform = get_session_env("HERMES_CRON_AUTO_DELIVER_PLATFORM", "").lower()
+    want_opus = (
+        platform in OPUS_VOICE_PLATFORMS
+        or cron_delivery_platform in OPUS_VOICE_PLATFORMS
+    )
 
     # Determine output path
     if output_path:

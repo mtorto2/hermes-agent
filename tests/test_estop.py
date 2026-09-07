@@ -173,6 +173,18 @@ def test_kanban_dispatch_blocked_when_engaged(hermes_home):
     assert _kanban_dispatch_allowed() is True
 
 
+def test_kanban_dispatch_uses_the_assignee_profiles_estop(hermes_home):
+    """A shared Kanban board must obey the selected worker profile's pause."""
+    from gateway.kanban_watchers import _kanban_dispatch_allowed
+
+    worker_home = hermes_home / "profiles" / "worker"
+    worker_home.mkdir(parents=True)
+    estop.engage(reason="worker maintenance", home=worker_home)
+
+    assert _kanban_dispatch_allowed("default") is True
+    assert _kanban_dispatch_allowed("worker") is False
+
+
 # ── gateway turn-start integration ──────────────────────────────────────────
 
 
@@ -404,3 +416,104 @@ def test_profile_gateway_honors_canonical_root_estop(tmp_path, monkeypatch):
     assert estop.is_engaged() is True  # still held by profile sentinel
     estop.disengage()
     assert estop.is_engaged() is False
+
+
+# ── Blue/Green composition: per-profile pause + fleet-root sentinel ─────────
+
+
+@pytest.fixture
+def fleet(tmp_path, monkeypatch):
+    """A fleet root as HERMES_HOME with two profile homes beneath it."""
+    root = tmp_path / "hermes-root"
+    worker = root / "profiles" / "worker"
+    analyst = root / "profiles" / "analyst"
+    worker.mkdir(parents=True)
+    analyst.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    estop._reset_log_state_for_tests()
+    return root, worker, analyst
+
+
+def test_fleet_root_sentinel_binds_every_profile_home(fleet):
+    """Green's fleet-wide stop must bind Blue's home-parameterized checks."""
+    root, worker, analyst = fleet
+
+    assert estop.is_engaged(worker) is False
+    assert estop.is_engaged(analyst) is False
+
+    estop.engage(reason="fleet freeze")  # operator seat writes <root>/ESTOP
+    assert (root / "ESTOP").exists()
+
+    assert estop.is_engaged(worker) is True
+    assert estop.is_engaged(analyst) is True
+    assert estop.get_state(worker) == {
+        "reason": "fleet freeze",
+        "engaged_at": estop.get_state(worker)["engaged_at"],
+    }
+    assert estop.get_state(worker)["reason"] == "fleet freeze"
+
+
+def test_profile_pause_does_not_bind_a_sibling_profile(fleet):
+    """Blue's per-profile pause stays scoped when no fleet sentinel is set."""
+    root, worker, analyst = fleet
+
+    estop.engage(reason="worker maintenance", home=worker)
+    assert (worker / "ESTOP").exists()
+    assert not (root / "ESTOP").exists()
+
+    assert estop.is_engaged(worker) is True
+    assert estop.is_engaged(analyst) is False
+    assert estop.get_state(analyst) is None
+    assert estop.get_state(worker)["reason"] == "worker maintenance"
+
+
+def test_profile_resume_never_lifts_the_fleet_root_pause(fleet):
+    """A profile operator cannot clear a fleet-wide emergency stop."""
+    root, worker, analyst = fleet
+
+    estop.engage(reason="fleet freeze")
+    estop.engage(reason="worker maintenance", home=worker)
+    assert estop.is_engaged(worker) is True
+    assert estop.is_engaged(analyst) is True
+
+    assert estop.disengage(home=worker) is True
+    assert not (worker / "ESTOP").exists()
+    assert (root / "ESTOP").exists()
+    assert estop.is_engaged(worker) is True
+    assert estop.is_engaged(analyst) is True
+
+    assert estop.disengage() is True
+    assert not (root / "ESTOP").exists()
+    assert estop.is_engaged(worker) is False
+    assert estop.is_engaged(analyst) is False
+
+
+def test_is_engaged_with_home_fails_safe_on_stat_error(fleet):
+    """An unreadable profile sentinel holds the pause (fail closed)."""
+    _root, worker, _analyst = fleet
+
+    class _BoomPath:
+        def exists(self):
+            raise OSError("permission denied")
+
+    original = estop.sentinel_path
+    estop.sentinel_path = lambda home=None: (
+        _BoomPath() if home is not None else original()
+    )
+    try:
+        assert estop.is_engaged(worker) is True
+    finally:
+        estop.sentinel_path = original
+
+
+def test_check_paused_with_home_honors_the_fleet_sentinel(fleet, caplog):
+    """Dispatch loops scoped to a profile still stop on the fleet pause."""
+    root, worker, _analyst = fleet
+    logger = logging.getLogger("test.estop.composition")
+
+    assert estop.check_paused("worker-dispatch", logger, home=worker) is False
+
+    estop.engage(reason="fleet freeze")
+    with caplog.at_level(logging.INFO, logger="test.estop.composition"):
+        assert estop.check_paused("worker-dispatch", logger, home=worker) is True
+    assert "fleet freeze" in caplog.text

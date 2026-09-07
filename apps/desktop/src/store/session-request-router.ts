@@ -114,6 +114,7 @@ async function withRoutedTurnLease<T>(
 
   try {
     const result = await request()
+    release.acknowledge(result)
 
     if (!turnKeepsRunning(result)) {
       release()

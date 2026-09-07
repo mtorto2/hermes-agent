@@ -56,6 +56,14 @@ from agent.thread_scoped_output import thread_scoped_silence
 # available on every platform Hermes itself runs on.
 logger = logging.getLogger(__name__)
 
+
+def _redact_execute_code_error_text(value: object) -> str:
+    """Force-redact exception text before a model-visible JSON envelope."""
+    from agent.redact import redact_sensitive_text
+
+    return redact_sensitive_text("" if value is None else str(value), force=True)
+
+
 SANDBOX_AVAILABLE = True
 
 # The 7 tools allowed inside the sandbox. The intersection of this list
@@ -862,110 +870,22 @@ def _rpc_server_loop(
 # Remote execution support (file-based RPC via terminal backend)
 # ---------------------------------------------------------------------------
 
-def _get_or_create_env(task_id: str):
-    """Get or create the terminal environment for *task_id*.
+def _get_or_create_env(task_id: str, *, environment_plan=None):
+    """Return the shared task environment for remote ``execute_code``.
 
-    Reuses the same environment (container/sandbox/SSH session) that the
-    terminal and file tools use, creating one if it doesn't exist yet.
-    Returns ``(env, env_type)`` tuple.
+    The terminal module owns task planning, cache/lock coordination, and
+    sandbox creation.  Remote code execution must not reconstruct a partial
+    version of that policy, because it would let its approval decision and its
+    actual Docker bind/CWD diverge.  The entry-point-approved plan is threaded
+    through when available, so the capability check and creation use one object.
     """
     from tools.terminal_tool import (
-        _active_environments, _env_lock, _create_environment,
-        _get_env_config, _last_activity, _start_cleanup_thread,
-        _creation_locks, _creation_locks_lock, _task_env_overrides,
-        _resolve_container_task_id, _resolve_task_host_cwd,
+        _get_or_create_task_environment,
+        _prepare_task_environment,
     )
 
-    effective_task_id = _resolve_container_task_id(task_id)
-
-    # Fast path: environment already exists
-    with _env_lock:
-        if effective_task_id in _active_environments:
-            _last_activity[effective_task_id] = time.time()
-            return _active_environments[effective_task_id], _get_env_config()["env_type"]
-
-    # Slow path: create environment (same pattern as file_tools._get_file_ops)
-    with _creation_locks_lock:
-        if effective_task_id not in _creation_locks:
-            _creation_locks[effective_task_id] = threading.Lock()
-        task_lock = _creation_locks[effective_task_id]
-
-    with task_lock:
-        with _env_lock:
-            if effective_task_id in _active_environments:
-                _last_activity[effective_task_id] = time.time()
-                return _active_environments[effective_task_id], _get_env_config()["env_type"]
-
-        config = _get_env_config()
-        env_type = config["env_type"]
-        overrides = _task_env_overrides.get(effective_task_id, {})
-
-        if env_type == "docker":
-            image = overrides.get("docker_image") or config["docker_image"]
-        elif env_type == "singularity":
-            image = overrides.get("singularity_image") or config["singularity_image"]
-        elif env_type == "modal":
-            image = overrides.get("modal_image") or config["modal_image"]
-        elif env_type == "daytona":
-            image = overrides.get("daytona_image") or config["daytona_image"]
-        else:
-            image = ""
-
-        cwd = overrides.get("cwd") or config["cwd"]
-
-        container_config = None
-        from tools.terminal_tool import _is_container_backend as _is_container
-
-        if _is_container(env_type):
-            container_config = {
-                "container_cpu": config.get("container_cpu", 1),
-                "container_memory": config.get("container_memory", 5120),
-                "container_disk": config.get("container_disk", 51200),
-                "container_persistent": config.get("container_persistent", True),
-                "vercel_runtime": config.get("vercel_runtime", ""),
-                "docker_volumes": config.get("docker_volumes", []),
-                "docker_run_as_host_user": config.get("docker_run_as_host_user", False),
-                "docker_network": config.get("docker_network", True),
-            }
-
-        ssh_config = None
-        if env_type == "ssh":
-            ssh_config = {
-                "host": config.get("ssh_host", ""),
-                "user": config.get("ssh_user", ""),
-                "port": config.get("ssh_port", 22),
-                "key": config.get("ssh_key", ""),
-                "persistent": config.get("ssh_persistent", False),
-            }
-
-        local_config = None
-        if env_type == "local":
-            local_config = {
-                "persistent": config.get("local_persistent", False),
-            }
-
-        logger.info("Creating new %s environment for execute_code task %s...",
-                     env_type, effective_task_id[:8])
-        env = _create_environment(
-            env_type=env_type,
-            image=image,
-            cwd=cwd,
-            timeout=config["timeout"],
-            ssh_config=ssh_config,
-            container_config=container_config,
-            local_config=local_config,
-            task_id=effective_task_id,
-            host_cwd=_resolve_task_host_cwd(config, task_id),
-        )
-
-        with _env_lock:
-            _active_environments[effective_task_id] = env
-            _last_activity[effective_task_id] = time.time()
-
-        _start_cleanup_thread()
-        logger.info("%s environment ready for execute_code task %s",
-                     env_type, effective_task_id[:8])
-        return env, env_type
+    plan = environment_plan or _prepare_task_environment(task_id)
+    return _get_or_create_task_environment(plan), plan.env_type
 
 
 def _ship_file_to_remote(env, remote_path: str, content: str) -> None:
@@ -1213,6 +1133,7 @@ def _execute_remote(
     task_id: Optional[str],
     enabled_tools: Optional[List[str]],
     reset: bool = False,
+    environment_plan=None,
 ) -> str:
     """Run code on the remote terminal backend.
 
@@ -1233,7 +1154,10 @@ def _execute_remote(
         sandbox_tools = SANDBOX_ALLOWED_TOOLS
 
     effective_task_id = task_id or "default"
-    env, env_type = _get_or_create_env(effective_task_id)
+    env, env_type = _get_or_create_env(
+        effective_task_id,
+        environment_plan=environment_plan,
+    )
 
     sandbox_id = uuid.uuid4().hex[:12]
     temp_dir = _env_temp_dir(env)
@@ -1365,7 +1289,7 @@ def _execute_remote(
         )
         return json.dumps({
             "status": "error",
-            "error": str(exc),
+            "error": _redact_execute_code_error_text(exc),
             "tool_calls_made": tool_call_counter[0],
             "duration_seconds": duration,
         }, ensure_ascii=False)
@@ -1578,9 +1502,14 @@ def execute_code(
             )
 
     # Dispatch: remote backends use file-based RPC, local uses UDS
-    from tools.terminal_tool import _get_env_config, _docker_has_host_access
-    _env_config = _get_env_config()
-    env_type = _env_config["env_type"]
+    from tools.terminal_tool import (
+        _docker_has_host_access,
+        _prepare_task_environment,
+    )
+    _environment_plan = _prepare_task_environment(task_id)
+    _env_config = _environment_plan.config
+    env_type = _environment_plan.env_type
+    _effective_host_cwd = _environment_plan.host_cwd
 
     # execute_code runs arbitrary Python (subprocess/os.system/...) that never
     # passes through terminal()/DANGEROUS_PATTERNS, so guard the whole script
@@ -1591,7 +1520,7 @@ def execute_code(
     from tools.approval import check_execute_code_guard
     _guard = check_execute_code_guard(
         code, env_type,
-        has_host_access=_docker_has_host_access(_env_config),
+        has_host_access=_docker_has_host_access(_env_config, _effective_host_cwd),
     )
     if not _guard.get("approved", False):
         return json.dumps({
@@ -1612,7 +1541,13 @@ def execute_code(
         clear_current_thread_interrupt()
 
     if env_type != "local":
-        return _execute_remote(code, task_id, enabled_tools, reset=bool(reset))
+        return _execute_remote(
+            code,
+            task_id,
+            enabled_tools,
+            reset=bool(reset),
+            environment_plan=_environment_plan,
+        )
 
     # --- Local execution path (UDS) --- below this line is unchanged ---
 
@@ -1970,7 +1905,7 @@ def execute_code(
         )
         return json.dumps({
             "status": "error",
-            "error": str(exc),
+            "error": _redact_execute_code_error_text(exc),
             "tool_calls_made": tool_call_counter[0],
             "duration_seconds": duration,
         }, ensure_ascii=False)

@@ -5101,6 +5101,34 @@ class MatrixAdapter(BasePlatformAdapter):
         while i < len(lines):
             line = lines[i]
 
+            # Markdown table (header row + separator row + body rows).
+            if (
+                i + 1 < len(lines)
+                and "|" in line
+                and re.match(r"^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$", lines[i + 1])
+            ):
+                def _cells(row: str) -> list[str]:
+                    row = row.strip()
+                    if row.startswith("|"):
+                        row = row[1:]
+                    if row.endswith("|"):
+                        row = row[:-1]
+                    return [cell.strip() for cell in row.split("|")]
+
+                headers = _cells(line)
+                body_rows: list[list[str]] = []
+                i += 2
+                while i < len(lines) and "|" in lines[i] and lines[i].strip():
+                    body_rows.append(_cells(lines[i]))
+                    i += 1
+                thead = "".join(f"<th>{cell}</th>" for cell in headers)
+                tbody = "".join(
+                    "<tr>" + "".join(f"<td>{cell}</td>" for cell in row) + "</tr>"
+                    for row in body_rows
+                )
+                out_lines.append(f"<table><thead><tr>{thead}</tr></thead><tbody>{tbody}</tbody></table>")
+                continue
+
             # Horizontal rule
             if re.match(r"^[\s]*([-*_])\s*\1\s*\1[\s\-*_]*$", line):
                 out_lines.append("<hr>")

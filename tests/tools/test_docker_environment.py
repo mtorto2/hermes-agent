@@ -102,6 +102,45 @@ def test_auto_mount_host_cwd_adds_volume(monkeypatch, tmp_path):
     assert f"{project_dir}:/workspace" in run_args_str
 
 
+@pytest.mark.parametrize("host_cwd", ["/workspace", "/root"])
+def test_auto_mount_rejects_container_internal_host_root(monkeypatch, host_cwd):
+    """A direct Docker caller cannot bind a known container root from the host."""
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    monkeypatch.setattr(docker_env.os.path, "abspath", lambda path: path)
+    monkeypatch.setattr(docker_env.os.path, "isdir", lambda path: path == host_cwd)
+    calls = _mock_subprocess_run(monkeypatch)
+
+    _make_dummy_env(cwd="/workspace", host_cwd=host_cwd, auto_mount_cwd=True)
+
+    run_calls = [c for c in calls if isinstance(c[0], list) and len(c[0]) >= 2 and c[0][1] == "run"]
+    assert run_calls, "docker run should have been called"
+    assert f"{host_cwd}:/workspace" not in " ".join(run_calls[0][0])
+
+
+def test_mapping_volume_configuration_is_not_forwarded_as_a_docker_argument(monkeypatch):
+    """DockerEnvironment rejects malformed mapping-shaped volume configuration."""
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    calls = _mock_subprocess_run(monkeypatch)
+
+    _make_dummy_env(volumes={"./host:/data": True})
+
+    run_calls = [call for call in calls if isinstance(call[0], list) and call[0][1:2] == ["run"]]
+    assert run_calls, "docker run should have been called"
+    assert "./host:/data" not in run_calls[0][0]
+
+
+def test_mapping_extra_args_remain_forwarded_as_docker_arguments(monkeypatch):
+    """Policy hardening must not silently alter existing Docker extra-arg shape."""
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    calls = _mock_subprocess_run(monkeypatch)
+
+    _make_dummy_env(extra_args={"--privileged": True})
+
+    run_calls = [call for call in calls if isinstance(call[0], list) and call[0][1:2] == ["run"]]
+    assert run_calls, "docker run should have been called"
+    assert "--privileged" in run_calls[0][0]
+
+
 def test_non_persistent_cleanup_removes_container(monkeypatch):
     """When persist_across_processes=false, cleanup() must docker stop AND
     docker rm so containers don't leak across hermes processes.

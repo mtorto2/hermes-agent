@@ -244,6 +244,8 @@ from plugins.platforms.telegram.telegram_network import (
     parse_fallback_ip_env,
     tcp_keepalive_socket_options,
 )
+from gateway.wiz_light import WiZNotificationLightConfig, set_wiz_notification_light
+from agent.light_cues import LightCueMode, LightCueService, WiZLightCueBackend
 from utils import atomic_replace, env_float, env_int
 
 _TELEGRAM_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
@@ -831,6 +833,21 @@ class TelegramAdapter(BasePlatformAdapter):
         self._forum_command_registered: set[int] = set()
         # Lock per la registrazione sicura dei comandi nei forum supergroup
         self._forum_lock = asyncio.Lock()
+        _notification_light_cfg = (
+            self.config.extra.get("notification_light")
+            or self.config.extra.get("wiz_notification_light")
+            or {}
+        )
+        self._notification_light_config = WiZNotificationLightConfig.from_mapping(
+            _notification_light_cfg
+        )
+        self._light_cue_service = LightCueService(
+            backend=WiZLightCueBackend(
+                self._notification_light_config,
+                setter=lambda cfg, mode: set_wiz_notification_light(cfg, mode),
+            )
+        )
+
         # Status indicator: when enabled, the bot's short description (the line
         # shown under its name in the profile) is set to "Online" on connect and
         # "Offline" on clean disconnect, so users can tell whether the gateway is
@@ -6558,6 +6575,56 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.warning("[%s] send_slash_confirm failed: %s", self.name, _redact_telegram_error_text(e))
             return SendResult(success=False, error=_redact_telegram_error_text(e))
 
+    async def send_light_cue_menu(
+        self,
+        chat_id: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send a Telegram inline menu for selecting the shared light cue mode."""
+        if not self._bot:
+            return SendResult(success=False, error="Bot not connected")
+        service = self._get_light_cue_service()
+        try:
+            from agent.light_cues import load_light_cue_mode
+
+            service.mode = load_light_cue_mode(service.mode)
+        except Exception:
+            pass
+        current = service.mode
+        labels = {
+            LightCueMode.DEFAULT: "Default",
+            LightCueMode.NIGHT: "Night",
+            LightCueMode.DIM_DEFAULT: "Dim default",
+            LightCueMode.NO_LIGHT: "No light",
+        }
+        light_cue_modes = (
+            LightCueMode.DEFAULT,
+            LightCueMode.NIGHT,
+            LightCueMode.DIM_DEFAULT,
+            LightCueMode.NO_LIGHT,
+        )
+        rows = []
+        for mode in light_cue_modes:
+            marker = "✅ " if mode is current else ""
+            rows.append([
+                InlineKeyboardButton(
+                    f"{marker}{labels[mode]}",
+                    callback_data=f"lc:{mode.value}",
+                )
+            ])
+        kwargs = {
+            "chat_id": int(chat_id) if str(chat_id).lstrip("-").isdigit() else chat_id,
+            "text": f"Light cue mode: {labels[current]}",
+            "reply_markup": InlineKeyboardMarkup(rows),
+        }
+        kwargs.update(self._thread_kwargs_for_send(chat_id, None, metadata))
+        try:
+            msg = await self._send_message_with_thread_fallback(**kwargs)
+            return SendResult(success=True, message_id=str(msg.message_id))
+        except Exception as e:
+            logger.warning("[%s] send_light_cue_menu failed: %s", self.name, e)
+            return SendResult(success=False, error=str(e))
+
     async def send_clarify(
         self,
         chat_id: str,
@@ -7277,6 +7344,46 @@ class TelegramAdapter(BasePlatformAdapter):
             # Catch-all (e.g. page counter button "mx:noop")
             await query.answer()
 
+
+    async def _handle_light_cue_callback(
+        self,
+        query,
+        data: str,
+        *,
+        query_chat_id=None,
+        query_chat_type=None,
+        query_thread_id=None,
+        query_user_name=None,
+    ) -> None:
+        """Handle lc:<mode> inline callbacks for the light cue menu."""
+        caller_id = str(getattr(query.from_user, "id", ""))
+        if not self._is_callback_user_authorized(
+            caller_id,
+            chat_id=query_chat_id,
+            chat_type=str(query_chat_type) if query_chat_type is not None else None,
+            thread_id=str(query_thread_id) if query_thread_id is not None else None,
+            user_name=query_user_name,
+        ):
+            await query.answer(text="⛔ You are not authorized to change light cues.")
+            return
+        raw_mode = data.split(":", 1)[1] if ":" in data else ""
+        mode = LightCueMode.from_value(raw_mode)
+        self._get_light_cue_service().set_mode(mode)
+        label = {
+            LightCueMode.DEFAULT: "Default",
+            LightCueMode.NIGHT: "Night",
+            LightCueMode.DIM_DEFAULT: "Dim default",
+            LightCueMode.NO_LIGHT: "No light",
+        }[mode]
+        await query.answer(text=f"Light cue mode set to {label}.")
+        try:
+            await query.edit_message_text(
+                text=f"Light cue mode: {label}",
+                reply_markup=None,
+            )
+        except Exception:
+            pass
+
     async def _notify_clarify_expired(self, query, user_display: str) -> None:
         """Tell the user a clarify tap arrived too late to be delivered.
 
@@ -7297,6 +7404,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     "<i>⚠️ This question expired or the session reset — please /retry.</i>"
                 ),
                 parse_mode=ParseMode.HTML,
+
                 reply_markup=None,
             )
         except Exception:
@@ -7403,6 +7511,18 @@ class TelegramAdapter(BasePlatformAdapter):
         query_chat_type = getattr(query_chat, "type", None)
         query_thread_id = getattr(query_message, "message_thread_id", None)
         query_user_name = getattr(query.from_user, "first_name", None)
+
+        # --- Light cue mode callbacks (lc:mode) ---
+        if data.startswith("lc:"):
+            await self._handle_light_cue_callback(
+                query,
+                data,
+                query_chat_id=query_chat_id,
+                query_chat_type=query_chat_type,
+                query_thread_id=query_thread_id,
+                query_user_name=query_user_name,
+            )
+            return
 
         # --- Model picker callbacks ---
         if data.startswith(("mp:", "mpg:", "mpv:", "mm:", "mc:", "mb", "mx", "mg:")):
@@ -9507,6 +9627,33 @@ class TelegramAdapter(BasePlatformAdapter):
             "and use observed context only when the current message asks for it."
         )
 
+    def _telegram_current_message_addressing_prompt(self, message: Any) -> Optional[str]:
+        """Describe why this group message reached this bot after trigger stripping."""
+        if not message or not self._is_group_chat(message):
+            return None
+
+        username = (getattr(getattr(self, "_bot", None), "username", None) or "").lstrip("@")
+        addressed_by: list[str] = []
+        if self._message_mentions_bot(message):
+            addressed_by.append("explicitly addressed this bot via @mention")
+        if self._is_reply_to_bot(message):
+            addressed_by.append("replied to this bot")
+        if self._message_matches_mention_patterns(message):
+            addressed_by.append("matched a configured wake pattern")
+        if not addressed_by:
+            return None
+
+        parts = ["Current message addressing:", f"- Trigger: {'; '.join(addressed_by)}."]
+        if username:
+            parts.append(
+                f"- This bot's visible handle is @{username}; it may have been stripped from "
+                "the current message text before the agent saw it."
+            )
+        mentioned = sorted(self._extract_bot_mention_usernames(message))
+        if mentioned:
+            parts.append("- Explicit bot handles in the original Telegram message: " + ", ".join(f"@{name}" for name in mentioned))
+        return "\n".join(parts)
+
     def _apply_telegram_group_observe_attribution(self, event: MessageEvent) -> MessageEvent:
         """Align triggered group turns with observed-history attribution."""
         if not self._telegram_observe_unmentioned_group_messages():
@@ -9519,7 +9666,11 @@ class TelegramAdapter(BasePlatformAdapter):
         if not allowed or chat_id_str not in allowed:
             return event
         shared_source = self._telegram_group_observe_shared_source(event.source)
-        observe_prompt = self._telegram_group_observe_channel_prompt()
+        prompt_parts = [self._telegram_group_observe_channel_prompt()]
+        addressing_prompt = self._telegram_current_message_addressing_prompt(raw_message)
+        if addressing_prompt:
+            prompt_parts.append(addressing_prompt)
+        observe_prompt = "\n\n".join(prompt_parts)
         channel_prompt = f"{event.channel_prompt}\n\n{observe_prompt}" if event.channel_prompt else observe_prompt
         if event.message_type == MessageType.COMMAND:
             # Commands must retain the original source (with user_id) so
@@ -9933,7 +10084,7 @@ class TelegramAdapter(BasePlatformAdapter):
         await self._ensure_forum_commands(update.message)
 
         event = self._build_message_event(msg, MessageType.TEXT, update_id=update.update_id)
-        event.text = self._clean_bot_trigger_text(event.text)
+        event.text = self._clean_bot_trigger_text(event.text) or ""
         await self._cache_replied_media(msg, event)
         event = self._apply_telegram_group_observe_attribution(event)
         self._enqueue_text_event(event)
@@ -9955,8 +10106,26 @@ class TelegramAdapter(BasePlatformAdapter):
         await self._ensure_forum_commands(msg)
 
         event = self._build_message_event(msg, MessageType.COMMAND, update_id=update.update_id)
-        event.text = self._clean_bot_trigger_text(event.text)
+        event.text = self._clean_bot_trigger_text(event.text) or ""
         await self._cache_replied_media(msg, event)
+        if (event.text or "").strip().split(maxsplit=1)[0].lower() in {"/light", "/lights", "/lightcue", "/lightcues"}:
+            if not self._is_callback_user_authorized(
+                getattr(event.source, "user_id", "") or "",
+                chat_id=getattr(event.source, "chat_id", None),
+                chat_type=getattr(event.source, "chat_type", None),
+                thread_id=getattr(event.source, "thread_id", None),
+                user_name=getattr(event.source, "user_name", None),
+            ):
+                logger.info("[%s] Ignoring unauthorized light cue menu command", self.name)
+                return
+            await self.send_light_cue_menu(
+                str(getattr(event.source, "chat_id", "")),
+                metadata={
+                    "thread_id": getattr(event.source, "thread_id", None),
+                    "telegram_reply_to_message_id": getattr(event, "message_id", None),
+                },
+            )
+            return
         event = self._apply_telegram_group_observe_attribution(event)
         # Telegram clients split messages above 4096 chars into multiple
         # updates.  A long command paste (e.g. ``/queue <huge prompt>``)
@@ -10797,11 +10966,18 @@ class TelegramAdapter(BasePlatformAdapter):
         # Determine chat type.  Normalize through ``str`` so tests/mocks and
         # python-telegram-bot enum values both work (``ChatType.CHANNEL`` is
         # string-like, but mocks often provide plain strings).
-        telegram_chat_type = str(getattr(chat, "type", "")).split(".")[-1].lower()
+        raw_chat_type = getattr(chat, "type", "")
+        raw_chat_type = getattr(raw_chat_type, "value", raw_chat_type)
+        telegram_chat_type = str(raw_chat_type).split(".")[-1].lower()
+        # Some tests install MagicMock telegram constants after this module has
+        # already imported PTB.  In that case ``str(ChatType.SUPERGROUP)`` can
+        # include the full mock path rather than the bare value; substring
+        # matching keeps the runtime path and mixed test order robust.
+        chat_type_text = str(raw_chat_type).lower()
         chat_type = "dm"
-        if telegram_chat_type in {"group", "supergroup"}:
+        if telegram_chat_type in {"group", "supergroup"} or "supergroup" in chat_type_text:
             chat_type = "group"
-        elif telegram_chat_type == "channel":
+        elif telegram_chat_type == "channel" or "channel" in chat_type_text:
             chat_type = "channel"
 
         # Resolve routable thread id for DM topics and forum group topics via
@@ -10988,8 +11164,18 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.debug("[%s] clear reactions failed: %s", self.name, _redact_telegram_error_text(e))
             return False
 
+    def _light_cue_applies_to_chat(self, chat_id: Any) -> bool:
+        """Preserve Telegram WiZ notification-light chat scoping."""
+        config = getattr(self, "_notification_light_config", None)
+        if not isinstance(config, WiZNotificationLightConfig):
+            return False
+        return config.applies_to_chat(chat_id)
+
     async def on_processing_start(self, event: MessageEvent) -> None:
         """Add an in-progress reaction when message processing begins."""
+        # WiZ busy animation starts immediately on inbound Telegram updates instead of
+        # processing start so the light does not change during internal agent
+        # progress/tool activity.
         if not self._reactions_enabled():
             return
         chat_id = getattr(event.source, "chat_id", None)
@@ -11010,10 +11196,10 @@ class TelegramAdapter(BasePlatformAdapter):
         another agent run to swap it to 👍/👎 — which never happens if the
         cancellation was the last activity in the chat.
         """
-        if not self._reactions_enabled():
-            return
         chat_id = getattr(event.source, "chat_id", None)
         message_id = getattr(event, "message_id", None)
+        if not self._reactions_enabled():
+            return
         if not (chat_id and message_id):
             return
         if outcome == ProcessingOutcome.CANCELLED:

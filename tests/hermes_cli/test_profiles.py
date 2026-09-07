@@ -861,6 +861,92 @@ class TestProfileIsolation:
         assert alpha_dir / "config.yaml" != beta_dir / "config.yaml"
         assert str(alpha_dir) not in str(beta_dir)
 
+    def test_default_tate_aurelius_runtime_config_branding_and_child_env_are_scoped(
+        self, profile_env, monkeypatch,
+    ):
+        """Each profile's HERMES_HOME owns its runtime config and branding.
+
+        The Default root, business/Tate, and personal/Aurelius may coexist in
+        one process. A profile must not read the root config/skin, and a child
+        spawned from a context-scoped profile must receive that profile's home
+        rather than silently falling back to Default.
+        """
+        from hermes_constants import (
+            get_hermes_home,
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+        from hermes_cli.config import get_config_path, load_config
+        from hermes_cli.skin_engine import (
+            get_active_skin,
+            init_skin_from_config,
+            set_active_skin,
+        )
+        from tools.environments.local import build_subprocess_env
+
+        default_home = profile_env / ".hermes"
+        tate_home = create_profile("business", no_alias=True)
+        aurelius_home = create_profile("personal", no_alias=True)
+
+        default_home.joinpath("config.yaml").write_text(
+            "model: default-model\ndisplay:\n  skin: default\n",
+            encoding="utf-8",
+        )
+        tate_home.joinpath("config.yaml").write_text(
+            "model: tate-model\ndisplay:\n  skin: tate\n",
+            encoding="utf-8",
+        )
+        aurelius_home.joinpath("config.yaml").write_text(
+            "model: aurelius-model\ndisplay:\n  skin: aurelius\n",
+            encoding="utf-8",
+        )
+        tate_home.joinpath("skins", "tate.yaml").write_text(
+            "name: tate\nbranding:\n  agent_name: Tate\n",
+            encoding="utf-8",
+        )
+        aurelius_home.joinpath("skins", "aurelius.yaml").write_text(
+            "name: aurelius\nbranding:\n  agent_name: Aurelius\n",
+            encoding="utf-8",
+        )
+
+        for expected_profile, profile_home, expected_model, expected_skin, expected_name in (
+            ("default", default_home, "default-model", "default", "Hermes Agent"),
+            ("business", tate_home, "tate-model", "tate", "Tate"),
+            ("personal", aurelius_home, "aurelius-model", "aurelius", "Aurelius"),
+        ):
+            monkeypatch.setenv("HERMES_HOME", str(profile_home))
+            assert get_hermes_home() == profile_home
+            assert get_active_profile_name() == expected_profile
+            assert get_config_path() == profile_home / "config.yaml"
+            config = load_config()
+            assert config["model"] == expected_model
+            init_skin_from_config(config)
+            skin = get_active_skin()
+            assert skin.name == expected_skin
+            assert skin.get_branding("agent_name") == expected_name
+
+        # A context-scoped turn runs inside the default process, but its
+        # config, branding, and child environment must stay in Tate's lane.
+        monkeypatch.setenv("HERMES_HOME", str(default_home))
+        token = set_hermes_home_override(tate_home)
+        try:
+            assert get_hermes_home() == tate_home
+            assert get_active_profile_name() == "business"
+            assert get_config_path() == tate_home / "config.yaml"
+            tate_config = load_config()
+            assert tate_config["model"] == "tate-model"
+            init_skin_from_config(tate_config)
+            assert get_active_skin().get_branding("agent_name") == "Tate"
+
+            child_env = build_subprocess_env(
+                base={"HERMES_HOME": str(default_home), "HOME": str(profile_env)},
+                scrub_secrets=False,
+            )
+            assert child_env["HERMES_HOME"] == str(tate_home)
+        finally:
+            reset_hermes_home_override(token)
+            set_active_skin("default")
+
 
 # ===================================================================
 # TestGetProfilesRoot / TestGetDefaultHermesHome (internal helpers)
@@ -1127,11 +1213,6 @@ class TestProfilesToServe:
         assert serve["worker"] == get_profile_dir("worker")
 
 
-
-        assert set(serve) == {"default", "worker"}
-        assert serve["worker"] == get_profile_dir("worker")
-
-
 # ---------------------------------------------------------------------------
 # resolve_profile_env spelling preservation (#82581 junction follow-up)
 # ---------------------------------------------------------------------------
@@ -1175,5 +1256,3 @@ class TestResolveProfileEnvSpelling:
         # No HERMES_HOME: the platform default root applies (existing contract).
         monkeypatch.delenv("HERMES_HOME", raising=False)
         assert Path(resolve_profile_env("default")) == _get_default_hermes_home()
-
-

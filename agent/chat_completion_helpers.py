@@ -34,6 +34,7 @@ from agent.error_classifier import (
     PROVIDER_STREAM_NON_JSON_ERROR_CODE,
 )
 from agent.errors import EmptyStreamError
+from agent.agent_runtime_helpers import api_key_fallback_attempt
 from agent.turn_context import substitute_api_content
 from agent.gemini_native_adapter import is_native_gemini_base_url
 from agent.model_metadata import is_local_endpoint
@@ -933,6 +934,11 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
     interrupt, abort, cancellation, and close semantics stay in the callers —
     this helper only issues the request.
     """
+    with api_key_fallback_attempt(agent):
+        return _dispatch_nonstreaming_api_attempt(agent, api_kwargs, make_client=make_client)
+
+
+def _dispatch_nonstreaming_api_attempt(agent, api_kwargs: dict, *, make_client):
     if agent.api_mode == "codex_responses":
         request_client = make_client("codex_stream_request")
         return agent._run_codex_stream(
@@ -4884,19 +4890,20 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     raise InterruptedError("Agent interrupted before stream retry")
                 _emit_stream_start()
                 try:
-                    if agent.api_mode == "anthropic_messages":
-                        # #67142: per-request client (credential refresh happens
-                        # inside _create_request_anthropic_client) registered so
-                        # the watchdog aborts its socket, not the shared client.
-                        request_client = _set_request_client(
-                            agent._create_request_anthropic_client(
-                                reason="anthropic_stream_request"
-                            ),
-                            kind="anthropic_messages",
-                        )
-                        result["response"] = _call_anthropic(request_client)
-                    else:
-                        result["response"] = _call_chat_completions(stream_attempt_id)
+                    with api_key_fallback_attempt(agent):
+                        if agent.api_mode == "anthropic_messages":
+                            # #67142: per-request client (credential refresh happens
+                            # inside _create_request_anthropic_client) registered so
+                            # the watchdog aborts its socket, not the shared client.
+                            request_client = _set_request_client(
+                                agent._create_request_anthropic_client(
+                                    reason="anthropic_stream_request"
+                                ),
+                                kind="anthropic_messages",
+                            )
+                            result["response"] = _call_anthropic(request_client)
+                        else:
+                            result["response"] = _call_chat_completions(stream_attempt_id)
                     _emit_stream_end(
                         final_text=_stream_final_text(result["response"]),
                         finished=True,

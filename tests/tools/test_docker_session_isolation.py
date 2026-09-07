@@ -139,13 +139,18 @@ class TestSessionScopedMountResolution:
             "host_cwd": host_cwd,
         }
 
-    def test_shared_mode_keeps_legacy_host_cwd(self, monkeypatch):
+    def test_shared_mode_keeps_validated_legacy_host_cwd(self, monkeypatch, tmp_path):
         _disable_isolation(monkeypatch)
-        cfg = self._config()
+        cfg = self._config(host_cwd=str(tmp_path))
         assert (
             terminal_tool._resolve_task_host_cwd(cfg, "tui:sess-1")
-            == "/Users/prev/dev/oldrepo"
+            == str(tmp_path)
         )
+
+    def test_shared_mode_rejects_missing_configured_mount_root(self, monkeypatch):
+        _disable_isolation(monkeypatch)
+        cfg = self._config(host_cwd="/Users/prev/dev/missing")
+        assert terminal_tool._resolve_task_host_cwd(cfg, "tui:sess-1") is None
 
     def test_isolation_refuses_process_global_mount(self, monkeypatch, tmp_path):
         """The reported leak: a fresh session with NO attached workspace must
@@ -202,13 +207,13 @@ class TestSessionScopedMountResolution:
         cfg = self._config(mount=False)
         assert terminal_tool._resolve_task_host_cwd(cfg, "tui:sess-new") is None
 
-    def test_default_task_keeps_legacy_behavior_under_isolation(self, monkeypatch):
-        """The single-session CLI parent ("default") keeps the legacy mount."""
+    def test_default_task_keeps_validated_legacy_behavior_under_isolation(self, monkeypatch, tmp_path):
+        """The single-session CLI parent keeps its validated configured mount."""
         _enable_isolation(monkeypatch)
-        cfg = self._config()
+        cfg = self._config(host_cwd=str(tmp_path))
         assert (
             terminal_tool._resolve_task_host_cwd(cfg, None)
-            == "/Users/prev/dev/oldrepo"
+            == str(tmp_path)
         )
 
     def test_non_docker_backend_never_mounts(self, monkeypatch):
@@ -234,6 +239,21 @@ class TestRecordedHostCwdDiscardedOnContainers:
         )
         assert cwd == "/workspace"
 
+    def test_exact_host_root_record_discarded_for_docker(self):
+        terminal_tool.record_session_cwd("sess-1", "/home")
+        cwd = terminal_tool._resolve_command_cwd(
+            workdir=None, default_cwd="/root",
+            session_key="sess-1", env_type="docker",
+        )
+        assert cwd == "/root"
+
+    def test_exact_host_root_explicit_workdir_discarded_for_docker(self):
+        cwd = terminal_tool._resolve_command_cwd(
+            workdir="/Users", default_cwd="/root",
+            session_key="sess-1", env_type="docker",
+        )
+        assert cwd == "/root"
+
     def test_container_record_honored_for_docker(self):
         """A legitimate in-container cd is the session's state — keep it."""
         terminal_tool.record_session_cwd("sess-1", "/workspace/subdir")
@@ -258,6 +278,79 @@ class TestRecordedHostCwdDiscardedOnContainers:
             session_key="sess-1", env_type="docker",
         )
         assert cwd == "/workspace/b"
+
+    def test_explicit_host_workdir_remaps_to_mounted_workspace(self):
+        cwd = terminal_tool._resolve_command_cwd(
+            workdir="/Users/me/dev/repo", default_cwd="/root",
+            session_key="sess-1", env_type="docker",
+            host_cwd="/Users/me/dev/repo",
+        )
+        assert cwd == "/workspace"
+
+    def test_explicit_relative_workdir_maps_beneath_mounted_workspace(self):
+        cwd = terminal_tool._resolve_command_cwd(
+            workdir="src/", default_cwd="/root",
+            session_key="sess-1", env_type="docker",
+            host_cwd="/Users/me/dev/repo",
+        )
+        assert cwd == "/workspace/src"
+
+    def test_explicit_unrelated_host_workdir_falls_back_even_with_a_mount(self):
+        cwd = terminal_tool._resolve_command_cwd(
+            workdir="/Users/me/private", default_cwd="/root",
+            session_key="sess-1", env_type="docker",
+            host_cwd="/Users/me/dev/repo",
+        )
+        assert cwd == "/root"
+
+    def test_explicit_dot_segment_host_escape_falls_back_even_with_a_mount(self):
+        cwd = terminal_tool._resolve_command_cwd(
+            workdir="/Users/me/dev/repo/../private", default_cwd="/root",
+            session_key="sess-1", env_type="docker",
+            host_cwd="/Users/me/dev/repo",
+        )
+        assert cwd == "/root"
+
+    def test_explicit_host_workdir_falls_back_without_a_mount(self):
+        cwd = terminal_tool._resolve_command_cwd(
+            workdir="/Users/me/dev/repo", default_cwd="/root",
+            session_key="sess-1", env_type="docker", host_cwd=None,
+        )
+        assert cwd == "/root"
+
+    def test_plugin_container_workdirs_fall_back_without_a_mount(self):
+        """Plugin containers use the same host/relative CWD boundary as Docker."""
+        from agent import terminal_env_registry as registry
+        from agent.terminal_env_provider import TerminalEnvironmentProvider
+
+        class _PluginContainer(TerminalEnvironmentProvider):
+            is_container = True
+
+            @property
+            def name(self) -> str:
+                return "cwd_testbox"
+
+            def is_available(self) -> bool:
+                return True
+
+            def create_environment(
+                self, *, cwd, timeout, task_id="default", image=None,
+                container_config=None, **_kwargs,
+            ):
+                return None
+
+        provider = _PluginContainer()
+        previous = registry.snapshot_registration(provider.name)
+        registry.register_provider(provider)
+        try:
+            for workdir in ("/Users/me/dev/repo", "src/"):
+                cwd = terminal_tool._resolve_command_cwd(
+                    workdir=workdir, default_cwd="/root",
+                    session_key="sess-1", env_type=provider.name, host_cwd=None,
+                )
+                assert cwd == "/root"
+        finally:
+            registry.restore_registration(provider.name, provider, previous)
 
     def test_no_env_type_keeps_previous_behavior(self):
         """Callers that don't pass env_type (legacy sites) are unchanged."""
@@ -325,3 +418,106 @@ class TestSessionScopedContainerLifecycle:
         )
         assert captured["persist_across_processes"] is True
         assert getattr(env, "_session_scoped", False) is False
+
+
+class TestEnvironmentCwdComposition:
+    """``_resolve_environment_cwd``: one owner for the environment-creation cwd.
+
+    Blue routes every environment cwd through ``_sanitize_environment_cwd`` so
+    a host/relative path recorded by ACP/desktop can never reach
+    ``docker run -w``. Green additionally remaps such a path to ``/workspace``
+    when THIS session's workspace is actually bind-mounted there, instead of
+    dropping the user to the image default. Both must hold.
+    """
+
+    def _cfg(self, env_type="docker", default_cwd="/workspace"):
+        return {"env_type": env_type, "cwd": default_cwd}
+
+    def test_host_cwd_remaps_to_workspace_when_session_workspace_is_mounted(self):
+        cwd = terminal_tool._resolve_environment_cwd(
+            "/Users/me/dev/repo", self._cfg(default_cwd="/root"),
+            host_cwd="/Users/me/dev/repo",
+        )
+        assert cwd == "/workspace", "a mounted session workspace lands at /workspace"
+
+    def test_relative_cwd_maps_beneath_mounted_workspace(self):
+        cwd = terminal_tool._resolve_environment_cwd(
+            "src/", self._cfg(default_cwd="/root"), host_cwd="/Users/me/dev/repo",
+        )
+        assert cwd == "/workspace/src"
+
+    def test_mounted_host_descendant_maps_beneath_workspace(self):
+        cwd = terminal_tool._resolve_environment_cwd(
+            "/Users/me/dev/repo/src", self._cfg(default_cwd="/root"),
+            host_cwd="/Users/me/dev/repo",
+        )
+        assert cwd == "/workspace/src"
+
+    def test_unrelated_host_cwd_falls_back_even_when_workspace_is_mounted(self):
+        cwd = terminal_tool._resolve_environment_cwd(
+            "/Users/me/private", self._cfg(default_cwd="/root"),
+            host_cwd="/Users/me/dev/repo",
+        )
+        assert cwd == "/root"
+
+    def test_posix_rooted_cwd_does_not_map_under_windows_mount(self):
+        cwd = terminal_tool._resolve_environment_cwd(
+            "/Users/me/private", self._cfg(default_cwd="/root"),
+            host_cwd=r"C:\repo",
+        )
+        assert cwd == "/root"
+
+    def test_escaping_relative_cwd_falls_back_even_when_workspace_is_mounted(self):
+        cwd = terminal_tool._resolve_environment_cwd(
+            "../private", self._cfg(default_cwd="/root"),
+            host_cwd="/Users/me/dev/repo",
+        )
+        assert cwd == "/root"
+
+    def test_dot_segment_host_escape_falls_back_even_when_workspace_is_mounted(self):
+        cwd = terminal_tool._resolve_environment_cwd(
+            "/Users/me/dev/repo/../private", self._cfg(default_cwd="/root"),
+            host_cwd="/Users/me/dev/repo",
+        )
+        assert cwd == "/root"
+
+    def test_dot_segment_host_descendant_maps_to_normalized_workspace_child(self):
+        cwd = terminal_tool._resolve_environment_cwd(
+            "/Users/me/dev/repo/src/../child", self._cfg(default_cwd="/root"),
+            host_cwd="/Users/me/dev/repo",
+        )
+        assert cwd == "/workspace/child"
+
+    def test_dot_segment_relative_child_maps_to_normalized_workspace_child(self):
+        cwd = terminal_tool._resolve_environment_cwd(
+            "src/../child", self._cfg(default_cwd="/root"),
+            host_cwd="/Users/me/dev/repo",
+        )
+        assert cwd == "/workspace/child"
+
+    def test_host_cwd_falls_back_to_config_default_without_a_mount(self):
+        cwd = terminal_tool._resolve_environment_cwd(
+            "/Users/me/dev/repo", self._cfg(default_cwd="/root"), host_cwd=None,
+        )
+        assert cwd == "/root", "no mount means the host path must be discarded"
+
+    def test_in_container_cwd_passes_through_untouched(self):
+        for host_cwd in (None, "/Users/me/dev/repo"):
+            assert terminal_tool._resolve_environment_cwd(
+                "/workspace/subdir", self._cfg(), host_cwd=host_cwd,
+            ) == "/workspace/subdir"
+            assert terminal_tool._resolve_environment_cwd(
+                "/root", self._cfg(), host_cwd=host_cwd,
+            ) == "/root"
+
+    def test_local_backend_keeps_the_host_path(self):
+        cwd = terminal_tool._resolve_environment_cwd(
+            "/Users/me/dev/repo", self._cfg(env_type="local", default_cwd="/tmp"),
+            host_cwd=None,
+        )
+        assert cwd == "/Users/me/dev/repo"
+
+    def test_empty_cwd_is_left_to_the_caller_default(self):
+        assert terminal_tool._resolve_environment_cwd(
+            "", self._cfg(), host_cwd="/Users/me/dev/repo",
+        ) == ""

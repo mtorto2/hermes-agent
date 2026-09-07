@@ -99,6 +99,11 @@ class _HostTransport:
                 sid = str(((obj.get("params") or {}).get("session_id")) or "")
         except Exception:
             sid = ""
+        if sid:
+            from tui_gateway import server
+            turn_id = (server._sessions.get(sid) or {}).get("_compute_turn_id")
+            if turn_id:
+                obj = {**obj, "params": {**obj["params"], "compute_turn_id": turn_id}}
         self._emit({"type": "rpc", "sid": sid, "message": obj})
         return True
 
@@ -158,6 +163,7 @@ class ComputeHost:
         # it can leave those sessions unfinalized; a bare set cannot answer that.
         self._turn_futures: dict[concurrent.futures.Future, str] = {}
         self._turn_futures_lock = threading.Lock()
+        self._pending_real_turns: dict[str, dict[str, Any]] = {}
         self._transport = _HostTransport(self.emit)
         self._heartbeat_secs = (
             float(heartbeat_secs)
@@ -272,6 +278,14 @@ class ComputeHost:
             self._handle_turn_start(frame)
         elif kind == "interrupt":
             self._handle_interrupt(frame)
+        elif kind == "notification.received":
+            from tui_gateway import server
+            session = server._sessions.get(str(frame.get("sid") or ""))
+            if session is not None:
+                with session.setdefault("_compute_notification_lock", threading.RLock()):
+                    receipts = session.get("_compute_notification_receipts") or {}
+                    if receipts.get(frame.get("id")) == frame.get("turn_id"):
+                        receipts.pop(frame["id"], None)
         elif kind == "respond":
             self._handle_respond(frame)
         elif kind == "reload_mcp":
@@ -326,7 +340,11 @@ class ComputeHost:
         if sid in self._sessions:
             self._handle_spike_turn_start(frame)
             return
-        future = self._executor.submit(self._run_real_turn, dict(frame))
+        request_id = str(frame.get("request_id") or uuid.uuid4().hex)
+        frame = {**frame, "request_id": request_id}
+        with self._turn_futures_lock:
+            self._pending_real_turns[request_id] = {"sid": sid, "cancelled": False}
+        future = self._executor.submit(self._run_real_turn, frame)
         self._track_turn_future(future, sid)
 
     def _handle_spike_turn_start(self, frame: dict[str, Any]) -> None:
@@ -361,15 +379,27 @@ class ComputeHost:
         try:
             from tui_gateway import server
 
+            target = frame.get("target_turn_id")
+            pending_cancelled = False
+            with getattr(self, "_turn_futures_lock", threading.Lock()):
+                pending = getattr(self, "_pending_real_turns", {}).get(target)
+                if pending is not None and pending["sid"] == sid:
+                    pending["cancelled"] = True
+                    pending_cancelled = True
             session = server._sessions.get(sid)
             if session is None:
-                self.emit({"type": "interrupt.ack", "sid": sid, "request_id": frame.get("request_id"), "applied": False})
+                self.emit({"type": "interrupt.ack", "sid": sid, "request_id": frame.get("request_id"), "applied": pending_cancelled})
+                return
+            if (frame.get("target_turn_id") is not None
+                    and frame["target_turn_id"] != session.get("_compute_turn_id")):
+                self.emit({"type": "interrupt.ack", "sid": sid,
+                           "request_id": frame.get("request_id"), "applied": pending_cancelled})
                 return
             # In the child, `_session_uses_compute_host()` is false, so the
             # shared helper interrupts the local agent and releases this
             # process's pending clarify Event. The parent has only a metadata
             # mirror and cannot release the prompt that is blocking the turn.
-            server._interrupt_session_turn(sid, session)
+            server._interrupt_session_turn(sid, session, expected_turn_id=frame.get("target_turn_id"))
             self.emit({"type": "interrupt.ack", "sid": sid, "request_id": frame.get("request_id"), "applied": True, "applied_ns": now_ns()})
         except Exception as exc:
             self.emit({"type": "interrupt.ack", "sid": sid, "request_id": frame.get("request_id"), "applied": False, "message": str(exc)})
@@ -486,65 +516,99 @@ class ComputeHost:
         if not sid:
             self.emit({"type": "turn.error", "sid": sid, "request_id": request_id, "message": "sid required"})
             return
+        claimed = False
+        terminal_emitted = False
+        notification = None
+        delivery_claim = None
         try:
             from tui_gateway import server
 
             session = self._ensure_server_session(server, frame)
-            with session["history_lock"]:
-                queued_prompt_generation = frame.get("queued_prompt_generation")
-                if (
-                    queued_prompt_generation is not None
-                    and int(session.get("_queued_prompt_generation", 0))
-                    != int(queued_prompt_generation)
-                ):
-                    self.emit(
-                        {
-                            "type": "turn.end",
-                            "sid": sid,
-                            "request_id": request_id,
-                            "interrupted": True,
-                            "ended_ns": now_ns(),
-                        }
-                    )
-                    return
-                if session.get("running"):
-                    self.emit({"type": "turn.error", "sid": sid, "request_id": request_id, "message": "session busy"})
-                    return
-                session["running"] = True
-                session["_turn_cancel_requested"] = False
-                session["last_active"] = time.time()
-                server._start_inflight_turn(session, frame.get("text") if "text" in frame else frame.get("prompt"))
+            with getattr(self, "_turn_futures_lock", threading.Lock()):
+                with session["history_lock"]:
+                    # Parent admission is authoritative. Local interrupt generations
+                    # describe the old worker turn, never a newly accepted user.
+                    session["_parent_owned_turns"] = True
+                    pending = getattr(self, "_pending_real_turns", {}).get(request_id) or {}
+                    cancelled = pending.get("cancelled", False)
+                    claimed = not cancelled and server._claim_turn_locked(session)
+                    if claimed:
+                        session["_compute_turn_id"] = request_id
+                        session.pop("_compute_followup", None)
+                        session["last_active"] = time.time()
+                        server._start_inflight_turn(session, frame.get("text") if "text" in frame else frame.get("prompt"))
+            if not claimed:
+                self.emit({"type": "turn.error", "sid": sid, "request_id": request_id,
+                           "message": "turn cancelled before agent readiness" if cancelled else "session busy or closing"})
+                return
             self.emit({"type": "turn.started", "sid": sid, "request_id": request_id, "started_ns": now_ns()})
-            try:
-                server._ensure_session_db_row(session)
-            except Exception:
-                pass
+            if server._ensure_session_db_row(session) is False:
+                raise RuntimeError("session storage unavailable; message was not saved")
             try:
                 import hermes_undo
 
                 hermes_undo.on_user_message_appended(session["session_key"])
             except Exception:
                 pass
-            try:
-                server._persist_branch_seed(session)
-            except Exception:
-                pass
+            server._persist_branch_seed(session)
             text = frame.get("text") if "text" in frame else frame.get("prompt", "")
-            server._run_prompt_submit(
+            notification_id = frame.get("notification_id")
+            if notification_id:
+                with session.setdefault("_compute_notification_lock", threading.RLock()):
+                    notification = (session.get("_compute_notifications") or {}).get(notification_id)
+                    if notification is None:
+                        receipt = (session.get("_compute_notification_receipts") or {}).get(notification_id)
+                        if receipt:
+                            server._emit("compute.notification.accepted", sid,
+                                         {"id": notification_id, "turn_id": receipt})
+                        raise RuntimeError("notification proposal is no longer available")
+                    session["_compute_notification_delivering"] = notification_id
+                    text = notification["text"]
+                from tools.async_delegation import claim_event_delivery
+                delivery_claim = claim_event_delivery(notification["event"], "tui-compute")
+                if delivery_claim is None:
+                    # Another durable consumer owns delivery. Match the in-process
+                    # claim contract: never inject the same completion twice.
+                    with session["_compute_notification_lock"]:
+                        session["_compute_notifications"].pop(notification_id, None)
+                        session.setdefault("_compute_notification_receipts", {})[notification_id] = request_id
+                    server._emit("compute.notification.accepted", sid,
+                                 {"id": notification_id, "turn_id": request_id})
+                    raise RuntimeError("notification delivery already claimed")
+            started = server._run_prompt_submit(
                 request_id,
                 sid,
                 session,
                 text,
                 display_kind=frame.get("display_kind") or None,
+                **({"display_metadata": server._async_delegation_display_metadata(notification["event"])}
+                   if notification and notification["event"].get("type") == "async_delegation" else {}),
             )
+            if notification is not None and started is not False:
+                with session["_compute_notification_lock"]:
+                    notification["accepted_turn_id"] = request_id
+                    notification["claim"] = delivery_claim
+                    delivery_claim = None  # accepted work must never be re-injected on ACK failure
+                try:
+                    server._commit_compute_notification(session, notification_id)
+                    server._emit("compute.notification.accepted", sid,
+                                 {"id": notification_id, "turn_id": request_id})
+                except Exception:
+                    server.logger.warning("compute notification acceptance bookkeeping failed; retained for retry",
+                                          exc_info=True)
             run_thread = session.get("_run_thread")
             if run_thread is not None and hasattr(run_thread, "join"):
                 run_thread.join()
+            terminal_emitted = True
             with session["history_lock"]:
                 history_version = int(session.get("history_version", 0))
                 message_count = len(session.get("history") or [])
                 interrupted = bool(session.get("_turn_cancel_requested"))
                 session_key = str(session.get("session_key") or "")
+                queued = ([session.pop("queued_prompt")] if session.get("queued_prompt") else [])
+                queued += session.pop("queued_prompts", [])
+                queued = [{k: entry[k] for k in ("text", "image_paths") if k in entry}
+                          for entry in queued]
             session_info = server._session_info(session.get("agent"), session)
             self._bump_progress()
             self.emit(
@@ -559,20 +623,27 @@ class ComputeHost:
                     "ended_ns": now_ns(),
                     "session_info": session_info,
                     "session_info_emitted": True,
+                    "followup": session.pop("_compute_followup", None),
+                    "queued_prompts": queued,
                 }
             )
         except Exception as exc:
-            try:
-                from tui_gateway import server
-
-                session = server._sessions.get(sid)
-                if session is not None:
-                    with session.get("history_lock", threading.Lock()):
-                        session["running"] = False
-                        server._clear_inflight_turn(session)
-            except Exception:
-                pass
-            self.emit({"type": "turn.error", "sid": sid, "request_id": request_id, "reason": "exception", "message": str(exc)})
+            if claimed and not terminal_emitted:
+                server._emit_terminal_turn_error(sid, session, exc)
+                server._settle_turn(request_id, sid, session)
+                terminal_emitted = True
+            self.emit({"type": "turn.error", "sid": sid, "request_id": request_id,
+                       "reason": "exception", "message": str(exc),
+                       "message_complete_emitted": terminal_emitted,
+                       "session_info_emitted": terminal_emitted})
+        finally:
+            if notification is not None and delivery_claim is not None:
+                from tools.async_delegation import release_event_delivery
+                release_event_delivery(notification["event"], delivery_claim)
+            if claimed:
+                session.pop("_compute_notification_delivering", None)
+            with getattr(self, "_turn_futures_lock", threading.Lock()):
+                getattr(self, "_pending_real_turns", {}).pop(request_id, None)
 
     def _ensure_server_session(self, server: Any, frame: dict[str, Any]) -> dict:
         sid = str(frame.get("sid") or "")

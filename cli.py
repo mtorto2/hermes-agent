@@ -38,7 +38,9 @@ import tempfile
 import time
 import uuid
 import textwrap
+import subprocess
 from collections import deque
+from dataclasses import dataclass
 from urllib.parse import unquote, urlparse
 from contextlib import contextmanager
 from pathlib import Path
@@ -46,6 +48,82 @@ from datetime import datetime
 from typing import List, Dict, Any, Optional, Mapping
 
 logger = logging.getLogger(__name__)
+
+INPUT_COMPACTOR_STATUS = "Compacting input draft..."
+
+
+@dataclass(frozen=True)
+class InputCompactionSource:
+    start: int
+    text: str
+
+
+@dataclass(frozen=True)
+class InputCompactionResult:
+    text: str
+    compacted_up_to: int
+    cursor_position: int
+
+
+def input_compaction_notice(text: str) -> str | None:
+    """Return a user-facing skip reason for non-empty text."""
+    if not text.strip():
+        return None
+    if text.lstrip().startswith("/"):
+        return "Input compactor skipped slash command."
+    return None
+
+
+def input_compaction_source(text: str, *, compacted_up_to: int = 0, whole_buffer: bool = False) -> InputCompactionSource | None:
+    """Choose the text slice to compact for Ctrl+T segment or Alt+T whole-buffer mode."""
+    if not text.strip() or input_compaction_notice(text):
+        return None
+    if whole_buffer:
+        return InputCompactionSource(start=0, text=text)
+    start = max(0, min(compacted_up_to, len(text)))
+    source = text[start:]
+    if not source.strip():
+        return None
+    return InputCompactionSource(start=start, text=source)
+
+
+def splice_input_compaction_result(original: str, *, start: int, compacted: str) -> InputCompactionResult:
+    """Splice a compacted segment back into the original buffer and mark it compacted."""
+    prefix = original[: max(0, min(start, len(original)))]
+    result = prefix + compacted.strip()
+    return InputCompactionResult(text=result, compacted_up_to=len(result), cursor_position=len(result))
+
+
+def input_compaction_result_is_stale(
+    original: str,
+    current: str,
+    *,
+    start_version: int,
+    current_version: int,
+) -> bool:
+    """Return true when the user touched the draft after async compaction started."""
+    return current != original or current_version != start_version
+
+
+def refresh_input_compaction_offset(text: str, *, compacted_prefix: str = "", compacted_up_to: int = 0) -> tuple[int, str]:
+    """Keep the segment offset only while the already-compacted prefix is unchanged."""
+    if not compacted_prefix or text.startswith(compacted_prefix):
+        next_up_to = min(compacted_up_to, len(text))
+        return next_up_to, text[:next_up_to]
+    return 0, ""
+
+
+def resolve_input_compactor_path(config: Dict[str, Any] | None = None) -> Path | None:
+    """Resolve the configured input compactor path without baking in a machine-specific default."""
+    raw = os.environ.get("HERMES_INPUT_COMPACTOR")
+    if not raw and isinstance(config, dict):
+        display = config.get("display")
+        if isinstance(display, dict):
+            raw = display.get("input_compactor_path")
+        raw = raw or config.get("input_compactor_path")
+    if not raw:
+        return None
+    return Path(str(raw)).expanduser()
 
 # Suppress startup messages for clean CLI experience
 os.environ["HERMES_QUIET"] = "1"  # Our own modules
@@ -97,6 +175,9 @@ except Exception:
     pass
 import threading
 import queue
+
+from agent.light_cues import LightCueEvent, LightCueService, build_light_cue_service_from_config
+
 
 def CanonicalUsage(*args, **kwargs):
     from agent.usage_pricing import CanonicalUsage as _CanonicalUsage
@@ -229,7 +310,12 @@ from hermes_cli.browser_connect import (
     try_launch_chrome_debug,
 )
 from hermes_cli.env_loader import load_hermes_dotenv
-from utils import base_url_host_matches, base_url_hostname, fast_safe_load
+from utils import (
+    base_url_host_matches,
+    base_url_hostname,
+    fast_safe_load,
+    is_truthy_value,
+)
 
 _hermes_home = get_hermes_home()
 _project_env = Path(__file__).parent / '.env'
@@ -334,6 +420,18 @@ def _assistant_content_as_text(content: Any) -> str:
 
 def _assistant_copy_text(content: Any) -> str:
     return _strip_reasoning_tags(_assistant_content_as_text(content))
+
+
+def _build_nah_instruction(style: str = "") -> str:
+    style = (style or "").strip()
+    instruction = (
+        "Summarize your immediately previous assistant reply into the shortest useful TL;DR. "
+        "Do not mention this instruction or any skill. Do not re-answer the original task. "
+        "No tools. Default to 1-3 bullets unless one sentence is enough."
+    )
+    if style:
+        instruction += f" Extra style request: {style}"
+    return instruction
 
 
 # =============================================================================
@@ -467,10 +565,6 @@ def load_cli_config() -> Dict[str, Any]:
             "inactivity_timeout": 120,  # Auto-cleanup inactive browser sessions after 2 min
             "record_sessions": False,  # Auto-record browser sessions as WebM videos
             "engine": "auto",  # Browser engine: auto (Chrome), lightpanda, chrome
-            "camofox": {
-                "rewrite_loopback_urls": False,
-                "loopback_host_alias": "host.docker.internal",
-            },
         },
         "compression": {
             "enabled": True,      # Auto-compress when approaching context limit
@@ -673,6 +767,8 @@ def load_cli_config() -> Dict[str, Any]:
         "container_memory": "TERMINAL_CONTAINER_MEMORY",
         "container_disk": "TERMINAL_CONTAINER_DISK",
         "container_persistent": "TERMINAL_CONTAINER_PERSISTENT",
+        "docker_persist_across_processes": "TERMINAL_DOCKER_PERSIST_ACROSS_PROCESSES",
+        "docker_orphan_reaper": "TERMINAL_DOCKER_ORPHAN_REAPER",
         "docker_volumes": "TERMINAL_DOCKER_VOLUMES",
         "docker_env": "TERMINAL_DOCKER_ENV",
         "docker_extra_args": "TERMINAL_DOCKER_EXTRA_ARGS",
@@ -680,9 +776,7 @@ def load_cli_config() -> Dict[str, Any]:
         "docker_mount_cwd_to_workspace": "TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE",
         "docker_network": "TERMINAL_DOCKER_NETWORK",
         "docker_run_as_host_user": "TERMINAL_DOCKER_RUN_AS_HOST_USER",
-        "docker_persist_across_processes": "TERMINAL_DOCKER_PERSIST_ACROSS_PROCESSES",
         "docker_shared_container_key": "TERMINAL_DOCKER_SHARED_CONTAINER_KEY",
-        "docker_orphan_reaper": "TERMINAL_DOCKER_ORPHAN_REAPER",
         "sandbox_dir": "TERMINAL_SANDBOX_DIR",
         # Persistent shell (non-local backends)
         "persistent_shell": "TERMINAL_PERSISTENT_SHELL",
@@ -935,6 +1029,8 @@ def _sync_process_session_id(session_id: str) -> None:
     from gateway.session_context import set_current_session_id
 
     set_current_session_id(session_id)
+    if session_id:
+        os.environ["HERMES_SESSION_ID"] = session_id
 
 # Cron job system for scheduled tasks (execution is handled by the gateway)
 def get_job(*args, **kwargs):
@@ -4499,9 +4595,8 @@ def _apply_backslash_line_continuation(text: str) -> str:
 def _preserve_ctrl_enter_newline() -> bool:
     """Detect environments where Ctrl+Enter must produce a newline, not submit.
 
-    Windows Terminal, WSL, SSH sessions, Ghostty, and some modern terminals
-    deliver Ctrl+Enter/Ctrl+J as bare LF (c-j). On those terminals c-j must
-    NOT be bound to submit;
+    Native Windows, WSL, SSH sessions, and Windows Terminal all send Ctrl+Enter
+    as bare LF (c-j). On those terminals c-j must NOT be bound to submit;
     binding it to submit makes Ctrl+Enter (intended as 'newline like Alt+Enter')
     submit instead. Local POSIX TTYs that deliver Enter as LF (docker exec,
     some thin PTYs without SSH) still need c-j bound to submit when
@@ -4515,9 +4610,10 @@ def _preserve_ctrl_enter_newline() -> bool:
         return True
     if os.environ.get("WT_SESSION"):
         return True
+    # Ghostty preserves these markers through tmux, where TERM_PROGRAM changes
+    # to "tmux". Its Ctrl+Enter/Ctrl+J encoding is also bare LF, so c-j must
+    # remain available for the newline binding rather than submit the prompt.
     if os.environ.get("GHOSTTY_RESOURCES_DIR") or os.environ.get("GHOSTTY_BIN_DIR"):
-        return True
-    if os.environ.get("TERM", "").lower() == "xterm-ghostty":
         return True
     if os.environ.get("TERM_PROGRAM", "").lower() == "ghostty":
         return True
@@ -4551,6 +4647,9 @@ def _bind_prompt_submit_keys(
     Even when the setting is disabled, environments where Ctrl+Enter is known
     to arrive as c-j (Windows, WSL, SSH, Windows Terminal, Ghostty) keep c-j
     reserved for newline; otherwise Ctrl+Enter submits instead of composing.
+    In those terminals c-j is the wire encoding of Ctrl+Enter, a distinct
+    keystroke from plain Enter / c-m, so leaving c-j unbound lets the
+    separately registered c-j newline handler fire without terminal changes.
     See _preserve_ctrl_enter_newline() and issue #22379.
     """
     if multiline_shortcuts_enabled is None:
@@ -5729,6 +5828,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self._command_running = False
         self._command_blocks_input = False
         self._command_status = ""
+        self._input_compactor_compacted_up_to = 0
+        self._input_compactor_compacted_prefix = ""
+        self._input_compactor_lock = threading.Lock()
+        self._input_compactor_running = False
+        self._input_compactor_edit_version = 0
         # Petdex mascot (opt-in via display.pet). Kitty/Ghostty use Unicode
         # placeholders plus out-of-band image transmission; other terminals
         # use the truecolor half-block fallback.
@@ -6776,7 +6880,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         """
         try:
             from prompt_toolkit.utils import get_cwidth
-            return get_cwidth(text or "")
+            width = get_cwidth(text or "")
+            return width if isinstance(width, int) else len(text or "")
         except Exception:
             return len(text or "")
 
@@ -6869,9 +6974,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         """
         try:
             from prompt_toolkit.application import get_app
-            return get_app().output.get_size().columns
+            columns = get_app().output.get_size().columns
+            if isinstance(columns, int) and columns > 0:
+                return columns
         except Exception:
-            return shutil.get_terminal_size(default).columns
+            pass
+        return shutil.get_terminal_size(default).columns
 
     def _use_minimal_tui_chrome(self, width: Optional[int] = None) -> bool:
         """Hide low-value chrome on narrow/mobile terminals to preserve rows."""
@@ -10598,6 +10706,187 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         return True
 
 
+    def _handle_sessions_command(self, cmd_original: str) -> None:
+        """Handle /sessions [list|<id_or_title>] — browse or resume previous sessions.
+        Without arguments, prints the same recent-sessions table that /resume
+        shows when called without a target, and tells the user how to resume.
+        With an explicit subcommand or target, delegates to the resume flow so
+        ``/sessions <id>`` and ``/resume <id>`` behave identically.
+
+        The TUI ships an interactive picker overlay for this command; the
+        classic CLI prints an inline list because there is no equivalent
+        overlay primitive here. Without this handler the canonical name
+        ``sessions`` falls through ``process_command``'s elif chain and
+        prints ``Unknown command: sessions`` even though the command is
+        registered in the central COMMAND_REGISTRY.
+        """
+        parts = cmd_original.split(None, 1)
+        arg = parts[1].strip() if len(parts) > 1 else ""
+        sub = arg.lower()
+
+        # Bare /sessions or /sessions list — show recent sessions inline.
+        if not arg or sub in {"list", "ls", "browse"}:
+            if not self._session_db:
+                from hermes_state import format_session_db_unavailable
+                _cprint(f"  {format_session_db_unavailable()}")
+                return
+            if not self._show_recent_sessions(reason="sessions"):
+                _cprint("  (._.) No previous sessions yet.")
+            return
+
+        # /sessions <id_or_title> behaves the same as /resume <id_or_title>.
+        self._handle_resume_command(f"/resume {arg}")
+
+    def _handle_branch_command(self, cmd_original: str) -> None:
+        """Handle /branch [name] — fork the current session into a new independent copy.
+
+        Copies the full conversation history to a new session so the user can
+        explore a different approach without losing the original session state.
+        Inspired by Claude Code's /branch command.
+        """
+        if not self.conversation_history:
+            _cprint("  No conversation to branch — send a message first.")
+            return
+
+        if not self._session_db:
+            from hermes_state import format_session_db_unavailable
+            _cprint(f"  {format_session_db_unavailable()}")
+            return
+
+        parts = cmd_original.split(None, 1)
+        branch_name = parts[1].strip() if len(parts) > 1 else ""
+
+        # Generate the new session ID
+        now = datetime.now()
+        timestamp_str = now.strftime("%Y%m%d_%H%M%S")
+        short_uuid = uuid.uuid4().hex[:6]
+        new_session_id = f"{timestamp_str}_{short_uuid}"
+
+        # Determine branch title
+        if branch_name:
+            branch_title = branch_name
+        else:
+            # Auto-generate from the current session title
+            current_title = None
+            if self._session_db:
+                current_title = self._session_db.get_session_title(self.session_id)
+            base = current_title or "branch"
+            branch_title = self._session_db.get_next_title_in_lineage(base)
+
+        # Save the current session's state before branching
+        parent_session_id = self.session_id
+
+        # Persist any current-turn messages before closing the parent. Branching
+        # can be invoked while the agent has not yet performed its normal
+        # end-of-turn flush; ending first would otherwise lose that transcript
+        # from the preserved parent and the copied child (#47202).
+        if self.agent:
+            try:
+                self.agent._flush_messages_to_session_db(
+                    self.conversation_history,
+                    conversation_history=self.conversation_history,
+                )
+            except Exception:
+                pass  # Best-effort; branch creation remains available.
+
+        # End the old session
+        try:
+            self._session_db.end_session(self.session_id, "branched")
+        except Exception:
+            pass
+
+        # Create the new session with parent link.
+        # Persist a stable ``_branched_from`` marker in model_config so
+        # list_sessions_rich() can keep the branch visible in /resume and
+        # /sessions even after the parent is reopened and re-ended with a
+        # different end_reason (e.g. tui_shutdown overwriting 'branched').
+        try:
+            self._session_db.create_session(
+                session_id=new_session_id,
+                source=os.environ.get("HERMES_SESSION_SOURCE", "cli"),
+                model=self.model,
+                model_config={
+                    "max_iterations": self.max_turns,
+                    "reasoning_config": self.reasoning_config,
+                    "_branched_from": parent_session_id,
+                },
+                parent_session_id=parent_session_id,
+            )
+        except Exception as e:
+            _cprint(f"  Failed to create branch session: {e}")
+            return
+
+        # Copy conversation history to the new session
+        for msg in self.conversation_history:
+            try:
+                self._session_db.append_message(
+                    session_id=new_session_id,
+                    role=msg.get("role", "user"),
+                    content=msg.get("content"),
+                    tool_name=msg.get("tool_name") or msg.get("name"),
+                    tool_calls=msg.get("tool_calls"),
+                    tool_call_id=msg.get("tool_call_id"),
+                    reasoning=msg.get("reasoning"),
+                    reasoning_details=msg.get("reasoning_details"),
+                    codex_reasoning_items=msg.get("codex_reasoning_items"),
+                    codex_message_items=msg.get("codex_message_items"),
+                )
+            except Exception:
+                pass  # Best-effort copy
+
+        # Set title on the branch
+        try:
+            self._session_db.set_session_title(new_session_id, branch_title)
+        except Exception:
+            pass
+
+        # Switch to the new session
+        self.session_id = new_session_id
+        self.session_start = now
+        self._pending_title = None
+        self._resumed = True  # Prevents auto-title generation
+        _sync_process_session_id(new_session_id)
+
+        # Sync the agent
+        if self.agent:
+            self.agent.session_id = new_session_id
+            self.agent.session_start = now
+            self.agent.reset_session_state()
+            if hasattr(self.agent, "_last_flushed_db_idx"):
+                self.agent._last_flushed_db_idx = len(self.conversation_history)
+            if hasattr(self.agent, "_todo_store"):
+                try:
+                    from tools.todo_tool import TodoStore
+                    self.agent._todo_store = TodoStore()
+                except Exception:
+                    pass
+            if hasattr(self.agent, "_invalidate_system_prompt"):
+                self.agent._invalidate_system_prompt()
+
+            # Notify memory providers that session_id forked to a new branch.
+            # reset=False — the branched session carries the transcript
+            # forward, so provider state tracks the lineage. parent_session_id
+            # links the branch back to the original. See #6672.
+            try:
+                _mm = getattr(self.agent, "_memory_manager", None)
+                if _mm is not None:
+                    _mm.on_session_switch(
+                        new_session_id,
+                        parent_session_id=parent_session_id or "",
+                        reset=False,
+                        reason="branch",
+                    )
+            except Exception:
+                pass
+
+        msg_count = len([m for m in self.conversation_history if m.get("role") == "user"])
+        _cprint(
+            f"  ⑂ Branched session \"{branch_title}\""
+            f" ({msg_count} user message{'s' if msg_count != 1 else ''})"
+        )
+        _cprint(f"  Original session: {parent_session_id}")
+        _cprint(f"  Branch session:   {new_session_id}")
+
     def save_conversation(self, cmd: str = "/save"):
         """Handle /save — export the current session to json, md, or html.
 
@@ -12035,7 +12324,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 _cprint("  /model <name> --once                 switch for the next turn only")
                 _cprint("  /model <name> --session              switch for this session only")
                 _cprint("  /model --provider <slug>             switch provider")
-                _cprint("  /model --refresh                     re-fetch live model lists")
                 return
 
             self._open_model_picker(
@@ -12320,6 +12608,75 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         except Exception:
             return False
 
+    def _should_handle_queue_delete_command_inline(self, text: str, has_images: bool = False) -> bool:
+        """Return True when /queue delete should mutate the pending queue immediately.
+
+        Queue deletion must bypass normal _pending_input routing while the agent
+        is running; otherwise the deletion command is enqueued behind the prompt
+        it is trying to remove.
+        """
+        if not text or has_images or not _looks_like_slash_command(text):
+            return False
+        if not getattr(self, "_agent_running", False):
+            return False
+        try:
+            from hermes_cli.commands import resolve_command
+            parts = text.split()
+            if len(parts) < 2 or parts[1].lower() != "delete":
+                return False
+            base = parts[0].lower().lstrip('/')
+            cmd = resolve_command(base)
+            return bool(cmd and cmd.name == "queue")
+        except Exception:
+            return False
+
+    def _delete_queued_prompt(self, selector: str = "") -> None:
+        """Delete a queued prompt from _pending_input.
+
+        Bare delete removes the only queued prompt. If multiple prompts are
+        queued, require a 1-based selector so we don't guess wrong.
+        """
+        pending = getattr(self, "_pending_input", None)
+        if pending is None:
+            _cprint("  Queue unavailable.")
+            return
+        selector = (selector or "").strip()
+        with pending.mutex:
+            queued = list(pending.queue)
+            count = len(queued)
+            if count == 0:
+                _cprint("  Queue is empty.")
+                return
+            if selector:
+                try:
+                    index = int(selector)
+                except ValueError:
+                    _cprint("  Usage: /q delete [number]")
+                    return
+                if index < 1 or index > count:
+                    _cprint(f"  Queue item {index} not found. Choose 1-{count}.")
+                    return
+            elif count == 1:
+                index = 1
+            else:
+                _cprint("  Multiple prompts queued. Use /q delete <number>:")
+                for i, item in enumerate(queued, start=1):
+                    preview = item[0] if isinstance(item, tuple) else item
+                    preview = str(preview) if preview else "[attachment]"
+                    _cprint(f"    {i}. {preview[:80]}{'...' if len(preview) > 80 else ''}")
+                return
+
+            removed = queued.pop(index - 1)
+            pending.queue.clear()
+            pending.queue.extend(queued)
+            if getattr(pending, "unfinished_tasks", 0) > 0:
+                pending.unfinished_tasks = max(0, pending.unfinished_tasks - 1)
+            pending.not_full.notify()
+
+        preview = removed[0] if isinstance(removed, tuple) else removed
+        preview = str(preview) if preview else "[attachment]"
+        _cprint(f"  Deleted queued prompt {index}: {preview[:80]}{'...' if len(preview) > 80 else ''}")
+
     def _should_handle_background_command_inline(
         self, text: str, has_images: bool = False
     ) -> bool:
@@ -12350,7 +12707,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             return bool(cmd and cmd.name in ("bg", "btw"))
         except Exception:
             return False
-
     def _output_console(self):
         """Use prompt_toolkit-safe Rich rendering once the TUI is live."""
         if getattr(self, "_app", None):
@@ -12799,6 +13155,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self._show_gateway_status()
         elif canonical == "status":
             self._show_session_status()
+        elif canonical == "repos":
+            from hermes_cli.repo_status import format_repo_status_gateway
+            parts = cmd_original.split(maxsplit=1)
+            args = parts[1] if len(parts) > 1 else ""
+            self._console_print(
+                format_repo_status_gateway(args),
+                markup=False,
+                highlight=False,
+            )
         elif canonical == "context":
             self._show_context_breakdown(cmd_original)
         elif canonical == "egress":
@@ -12834,6 +13199,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self._handle_fast_command(cmd_original)
         elif canonical == "compress":
             self._manual_compress(cmd_original)
+        elif canonical == "nah":
+            parts = cmd_original.split(maxsplit=1)
+            style = parts[1].strip() if len(parts) > 1 else ""
+            if hasattr(self, '_pending_input'):
+                self._pending_input.put(_build_nah_instruction(style))
         elif canonical == "usage":
             self._handle_usage_command(cmd_original)
         elif canonical == "subscription":
@@ -12961,7 +13331,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             payload = parts[1].strip() if len(parts) > 1 else ""
             payload = self._expand_paste_references(payload)
             if not payload:
-                _cprint("  Usage: /queue <prompt>")
+                _cprint("  Usage: /queue <prompt> or /q delete [number]")
+            elif payload == "delete" or payload.startswith("delete "):
+                selector = payload.split(None, 1)[1] if " " in payload else ""
+                self._delete_queued_prompt(selector)
             else:
                 self._pending_input.put(payload)
                 if self._agent_running:
@@ -13765,19 +14138,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             pass
 
     def _transfer_session_yolo(self, old_session_id: str, new_session_id: str) -> None:
-        """Move YOLO bypass state from an old session key to a new one.
-
-        Called whenever ``self.session_id`` is reassigned mid-run — ``/branch``
-        forks into a new session, and auto-compression rotates the agent's
-        session id into a fresh continuation session. Without this transfer
-        the user's ``/yolo ON`` toggle would silently revert on the very next
-        turn (the same UX failure mode that motivated this entire fix), since
-        ``_session_yolo`` is keyed by session id.
-
-        Mirrors ``tui_gateway/server.py`` (~line 1297-1305) which performs the
-        same transfer for the TUI's session-rename path. No-op when YOLO
-        wasn't enabled or when the ids match.
-        """
+        """Move YOLO bypass state from an old session key to a new one."""
         if not old_session_id or not new_session_id or old_session_id == new_session_id:
             return
         try:
@@ -13799,15 +14160,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 _persist(new_session_id, True)
 
     def _is_session_yolo_active(self) -> bool:
-        """Whether YOLO bypass is currently enabled for this CLI session.
-
-        Reads from ``tools.approval._session_yolo`` (the same set that
-        ``enable_session_yolo`` / ``disable_session_yolo`` write to) so the
-        status bar reflects the actual bypass state instead of a stale env
-        var. Also honors the process-start ``--yolo`` flag, which freezes
-        ``HERMES_YOLO_MODE`` into ``_YOLO_MODE_FROZEN`` before tool imports
-        happen.
-        """
+        """Whether YOLO bypass is currently enabled for this CLI session."""
         try:
             from tools.approval import (
                 _YOLO_MODE_FROZEN,
@@ -13817,29 +14170,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             return False
         if _YOLO_MODE_FROZEN:
             return True
-        # Use ``getattr`` so test fixtures that build a CLI via ``__new__``
-        # (skipping ``__init__``) don't trip an AttributeError here; the
-        # status-bar builders swallow exceptions silently but lose every
-        # field after the failure.
         session_key = getattr(self, "session_id", None) or "default"
         return is_session_yolo_enabled(session_key)
 
     def _toggle_yolo(self):
-        """Toggle YOLO mode — skip all dangerous command approval prompts.
-
-        Per-session toggle that mirrors the gateway and TUI ``/yolo`` handlers
-        (see ``gateway/run.py:_handle_yolo_command`` and
-        ``tui_gateway/server.py`` key=="yolo"). We deliberately do NOT mutate
-        ``HERMES_YOLO_MODE`` here — that env var is read once at module import
-        time into ``tools.approval._YOLO_MODE_FROZEN`` to keep prompt-injected
-        skills from flipping the bypass mid-session, so setting it after CLI
-        startup is a silent no-op. Routing through ``enable_session_yolo`` /
-        ``disable_session_yolo`` gives the same auditable, per-session bypass
-        the other surfaces have. ``run_conversation`` binds
-        ``self.session_id`` as the active approval session key via
-        ``set_current_session_key`` so the bypass takes effect on the very
-        next dangerous command in this run.
-        """
+        """Toggle per-session YOLO approval bypass."""
         from hermes_cli.colors import Colors as _Colors
         from tools.approval import (
             _YOLO_MODE_FROZEN,
@@ -15118,8 +15453,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         if not reqs.get("stt_available", reqs.get("stt_key_set")):
             raise RuntimeError(
                 "Voice mode requires an STT provider for transcription.\n"
-                "Option 1: uv pip install faster-whisper  "
-                "(free, local; `pip install faster-whisper` also works if pip is on PATH)\n"
+                "Option 1: pip install faster-whisper  (free, local)\n"
                 "Option 2: Set GROQ_API_KEY (free tier)\n"
                 "Option 3: Set VOICE_TOOLS_OPENAI_KEY (paid)"
             )
@@ -16103,6 +16437,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # multi-select support: only active when multi_select is True and choices exist
         effective_multi = multi_select and not is_open_ended
 
+        self._emit_light_cue(LightCueEvent.HUMAN_INTERVENTION)
         self._clarify_state = {
             "question": question,
             "choices": choices if not is_open_ended else [],
@@ -16132,6 +16467,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 result = response_queue.get(timeout=1)
                 self._clarify_deadline = None
                 self._persist_prompt_summary("?", "Clarify", question, str(result))
+                self._emit_light_cue(LightCueEvent.WORKING)
                 return result
             except queue.Empty:
                 # None deadline = unlimited: never auto-skip, just keep polling.
@@ -16151,6 +16487,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self._clarify_multi_base = None
         self._paint_now()
         _cprint(f"\n{_DIM}(clarify timed out after {timeout}s — agent will decide){_RST}")
+        self._emit_light_cue(LightCueEvent.WORKING)
         return (
             "The user did not provide a response within the time limit. "
             "Use your best judgement to make the choice and proceed."
@@ -16413,6 +16750,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             timeout = int(CLI_CONFIG.get("approvals", {}).get("timeout", 300))
             response_queue = queue.Queue()
 
+            self._emit_light_cue(LightCueEvent.HUMAN_INTERVENTION)
             self._approval_state = {
                 "command": command,
                 "description": description,
@@ -16451,6 +16789,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         "⚠", "Approval", command,
                         _outcome_labels.get(result, str(result)),
                     )
+                    self._emit_light_cue(LightCueEvent.WORKING)
                     return result
                 except queue.Empty:
                     remaining = self._approval_deadline - _time.monotonic()
@@ -16468,6 +16807,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self._persist_prompt_summary(
                 "⚠", "Approval", command, "timed out (no response)",
             )
+            self._emit_light_cue(LightCueEvent.WORKING)
             return "timeout"
 
     def _approval_choices(self, command: str, *, allow_permanent: bool = True,
@@ -16798,6 +17138,46 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             except Exception:
                 pass
 
+    def _get_light_cue_service(self) -> LightCueService:
+        """Return the shared light cue service for terminal surfaces."""
+        service = getattr(self, "_light_cue_service", None)
+        if not isinstance(service, LightCueService):
+            service = build_light_cue_service_from_config(getattr(self, "config", {}), auto_assign_slot=True)
+            self._light_cue_service = service
+        return service
+
+    def _emit_light_cue(self, event: LightCueEvent | str) -> None:
+        """Best-effort terminal light cue emission."""
+        try:
+            self._get_light_cue_service().emit(event)
+        except Exception:
+            logger.debug("Terminal light cue emission failed", exc_info=True)
+
+    def _update_agent_lights_context(self, *, current_context: Optional[str] = None, chat_summary: Optional[str] = None) -> None:
+        """Best-effort per-slot context sidecar update for the Agent Lights menu."""
+        try:
+            service = self._get_light_cue_service()
+            service.update_slot_context(
+                session_id=getattr(self, "session_id", None),
+                current_context=self._agent_lights_compact_text(current_context),
+                chat_summary=self._agent_lights_compact_text(chat_summary),
+                provider=getattr(self, "provider", None),
+                model_name=getattr(self, "model", None),
+            )
+        except Exception:
+            logger.debug("Agent Lights context update failed", exc_info=True)
+
+    @staticmethod
+    def _agent_lights_compact_text(value: Any, *, limit: int = 220) -> Optional[str]:
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            value = str(value)
+        text = " ".join(value.strip().split())
+        if not text:
+            return None
+        return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
     def chat(self, message, images: list = None, voice_input: bool = False) -> Optional[str]:
         """
         Send a message to the agent and get a response.
@@ -16984,6 +17364,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         try:
             # Run the conversation with interrupt monitoring
             result = None
+            self._emit_light_cue(LightCueEvent.WORKING)
+            self._update_agent_lights_context(
+                current_context=f"Working on: {message}" if isinstance(message, str) else "Working on multimodal input",
+                chat_summary="Turn in progress",
+            )
+            last_context_refresh_at = time.time()
 
             # Reset streaming display state for this turn
             self._reset_stream_state()
@@ -17098,23 +17484,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     set_secret_capture_callback(self._secret_capture_callback)
                 except Exception:
                     pass
-                # Bind this turn's approval session key into the contextvar so
-                # ``tools.approval.is_current_session_yolo_enabled()`` resolves
-                # against the same key that ``/yolo`` toggles under (see
-                # ``_toggle_yolo`` → ``enable_session_yolo(self.session_id)``).
-                # Mirrors ``tui_gateway/server.py`` and ``gateway/run.py`` which
-                # bind the same contextvar before invoking the agent.
-                try:
-                    from tools.approval import (
-                        reset_current_session_key,
-                        set_current_session_key,
-                    )
-                    _approval_session_token = set_current_session_key(
-                        self.session_id or "default"
-                    )
-                except Exception:
-                    reset_current_session_key = None  # type: ignore[assignment]
-                    _approval_session_token = None
                 agent_message = _voice_prefix + message if _voice_prefix else message
                 # Prepend pending notes via _prepend_note_to_message, which
                 # handles both plain-string and multimodal content-parts list
@@ -17152,6 +17521,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     self, "_pending_one_turn_model_restore", None
                 )
                 self._pending_one_turn_model_restore = None
+                from tools.approval import (
+                    reset_current_session_key,
+                    set_current_session_key,
+                )
+
+                approval_token = set_current_session_key(self.session_id)
                 try:
                     result = self.agent.run_conversation(
                         user_message=agent_message,
@@ -17181,6 +17556,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         "error": _summary,
                     }
                 finally:
+                    reset_current_session_key(approval_token)
                     if _one_turn_model_restore:
                         self._restore_model_runtime_snapshot(_one_turn_model_restore)
                     # Surface any credit notices queued during the turn (cold-start
@@ -17196,15 +17572,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         set_secret_capture_callback(None)
                     except Exception:
                         pass
-                    # Release the per-turn approval session key. ``_session_yolo``
-                    # state itself is preserved across turns (so /yolo persists
-                    # for the whole CLI run); we just unbind the contextvar so a
-                    # reused thread doesn't see stale identity on its next run.
-                    if _approval_session_token is not None and reset_current_session_key is not None:
-                        try:
-                            reset_current_session_key(_approval_session_token)
-                        except Exception:
-                            pass
 
             # Start agent in background thread (daemon so it cannot keep the
             # process alive when the user closes the terminal tab — SIGHUP
@@ -17245,6 +17612,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             # so we skip interrupt processing to avoid stealing that input.
             interrupt_msg = None
             while agent_thread.is_alive():
+                now = time.time()
+                if now - last_context_refresh_at >= 300:
+                    self._update_agent_lights_context(
+                        current_context=f"Still working on: {message}" if isinstance(message, str) else "Still working on multimodal input",
+                        chat_summary="Turn still in progress",
+                    )
+                    last_context_refresh_at = now
                 if hasattr(self, '_interrupt_queue'):
                     try:
                         interrupt_msg = self._interrupt_queue.get(timeout=0.1)
@@ -17385,6 +17759,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
             # Get the final response
             response = result.get("final_response", "") if result else ""
+            if response:
+                self._update_agent_lights_context(
+                    current_context=f"Latest ask: {message}" if isinstance(message, str) else "Latest ask included multimodal input",
+                    chat_summary=f"Latest answer: {response}",
+                )
 
             # Session titling now runs at TURN START (agent/turn_context.py)
             # from the user's message alone, so it is already done — or in
@@ -17472,6 +17851,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     else:
                         display_reasoning = reasoning.strip()
                     _cprint(f"\n{r_top}\n{_DIM}{display_reasoning}{_RST}\n{r_bot}")
+
+            if result and (result.get("failed") or result.get("partial")):
+                self._emit_light_cue(LightCueEvent.ERROR)
+            elif response and not _interrupted_this_turn:
+                self._emit_light_cue(LightCueEvent.FINAL_ANSWER)
 
             if response and not response_previewed:
                 # Use skin engine for label/color with fallback
@@ -17625,6 +18009,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             return response
             
         except Exception as e:
+            self._emit_light_cue(LightCueEvent.ERROR)
             print(f"Error: {e}")
             return None
         finally:
@@ -17936,6 +18321,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             return _state_fragment("class:prompt-working", "?")
         if self._command_running:
             return _state_fragment("class:prompt-working", self._command_spinner_frame())
+        if getattr(self, "_input_compactor_running", False):
+            return _state_fragment("class:prompt-working", self._command_spinner_frame())
         if self._agent_running:
             return _state_fragment("class:prompt-working", "⚕")
         if self._voice_mode:
@@ -18100,6 +18487,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             pass
 
         self.show_banner()
+        try:
+            self._get_light_cue_service().mark_slot_online()
+        except Exception:
+            logger.debug("Terminal startup slot idle mark failed", exc_info=True)
         # Surface any active supply-chain security advisories right after the
         # welcome banner. Quiet/single-query paths call this themselves.
         self._show_security_advisories()
@@ -18353,7 +18744,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
         if os.environ.get("HERMES_DEFER_AGENT_STARTUP") != "1":
             self._ensure_tirith_security()
-        
+
         # Key bindings for the input area
         kb = KeyBindings()
 
@@ -18399,6 +18790,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             Commands (starting with /) always go to _pending_input so they're
             handled as commands, not sent as interrupt text to the agent.
             """
+            def _reset_input_compactor_state() -> None:
+                self._input_compactor_compacted_up_to = 0
+                self._input_compactor_compacted_prefix = ""
+
             # --- Sudo password prompt: submit the typed password ---
             if self._sudo_state:
                 text = event.app.current_buffer.text
@@ -18565,6 +18960,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         self._should_exit = True
                         if event.app.is_running:
                             event.app.exit()
+                    _reset_input_compactor_state()
                     event.app.current_buffer.reset(append_to_history=True)
                     # Force a repaint: process_command() prints through
                     # patch_stdout (scrolls output above the prompt) and never
@@ -18572,6 +18968,18 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     # keep showing the submitted text until some unrelated
                     # redraw fires. Every other early-return branch in this
                     # handler invalidates after reset — match them.
+                    event.app.invalidate()
+                    return
+
+                # Handle /queue delete while the agent is running immediately on
+                # the UI thread. Queuing this command would put it behind the
+                # pending prompt it is trying to remove.
+                if self._should_handle_queue_delete_command_inline(text, has_images=has_images):
+                    self.process_command(text)
+                    _reset_input_compactor_state()
+                    event.app.current_buffer.reset(append_to_history=True)
+                    # Commands print through patch_stdout, which does not cause
+                    # prompt_toolkit to repaint the cleared input buffer.
                     event.app.invalidate()
                     return
 
@@ -18583,6 +18991,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 # agent.steer() is thread-safe (holds _pending_steer_lock).
                 if self._should_handle_steer_command_inline(text, has_images=has_images):
                     self.process_command(text)
+                    _reset_input_compactor_state()
                     event.app.current_buffer.reset(append_to_history=True)
                     # Force a repaint after clearing the buffer.  /steer is
                     # dispatched mid-run while the agent streams output through
@@ -18707,6 +19116,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 # History stores real pasted content, not the placeholder, so
                 # up-arrow recall restores the actual text.
                 self._inline_pastes(event.app.current_buffer)
+                _reset_input_compactor_state()
                 event.app.current_buffer.reset(append_to_history=True)
 
         _bind_prompt_submit_keys(
@@ -18754,6 +19164,128 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             """Ctrl+G (or Alt+G in VSCode/Cursor) opens the current draft in an external editor."""
             cli_ref._open_external_editor(event.current_buffer)
 
+        def _compact_current_buffer(event, *, whole_buffer: bool = False):
+            """Compact the current input draft natively, preserving review before submit."""
+            buf = event.current_buffer
+            original = buf.text
+            notice = input_compaction_notice(original)
+            if notice:
+                _cprint(f"\n{_DIM}{notice}{_RST}")
+                return
+
+            compactor_lock = cli_ref._input_compactor_lock
+            if not compactor_lock.acquire(blocking=False):
+                return
+
+            offset, compacted_prefix = refresh_input_compaction_offset(
+                original,
+                compacted_prefix=cli_ref._input_compactor_compacted_prefix,
+                compacted_up_to=cli_ref._input_compactor_compacted_up_to,
+            )
+            cli_ref._input_compactor_compacted_up_to = offset
+            cli_ref._input_compactor_compacted_prefix = compacted_prefix
+            source = input_compaction_source(original, compacted_up_to=offset, whole_buffer=whole_buffer)
+            if source is None:
+                compactor_lock.release()
+                return
+
+            compactor = resolve_input_compactor_path(getattr(cli_ref, "config", None))
+            if compactor is None:
+                compactor_lock.release()
+                _cprint(f"\n{_DIM}Set HERMES_INPUT_COMPACTOR or input_compactor_path to enable input compaction.{_RST}")
+                return
+            if not compactor.exists():
+                compactor_lock.release()
+                _cprint(f"\n{_DIM}Input compactor not found: {compactor}{_RST}")
+                return
+
+            cursor = buf.cursor_position
+            start_version = cli_ref._input_compactor_edit_version
+            app = event.app
+
+            def _call_on_ui(callback):
+                loop = getattr(app, "loop", None)
+                if loop is not None and getattr(loop, "is_running", lambda: False)():
+                    loop.call_soon_threadsafe(callback)
+                    return True
+                return False
+
+            previous_status = getattr(cli_ref, "_command_status", "")
+            cli_ref._input_compactor_running = True
+            cli_ref._command_status = INPUT_COMPACTOR_STATUS
+            app.invalidate()
+
+            def _run_compactor():
+                try:
+                    proc = subprocess.run(
+                        [str(compactor), "--stdin"],
+                        input=source.text,
+                        text=True,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        timeout=90,
+                        check=False,
+                    )
+                    if proc.returncode != 0:
+                        err = (proc.stderr or proc.stdout or "compactor failed").strip().splitlines()
+                        message = err[-1] if err else "compactor failed"
+                        raise RuntimeError(message[:300])
+                    compacted = proc.stdout.strip()
+                    if not compacted:
+                        raise RuntimeError("compactor returned empty output")
+
+                    def _apply_result():
+                        # Do not clobber if the user kept typing while the compactor ran.
+                        if input_compaction_result_is_stale(
+                            original,
+                            buf.text,
+                            start_version=start_version,
+                            current_version=cli_ref._input_compactor_edit_version,
+                        ):
+                            _cprint(f"\n{_DIM}Compactor finished, but draft changed; leaving current input untouched.{_RST}")
+                            return
+                        result = splice_input_compaction_result(original, start=source.start, compacted=compacted)
+                        buf.text = result.text
+                        buf.cursor_position = result.cursor_position
+                        cli_ref._input_compactor_compacted_up_to = result.compacted_up_to
+                        cli_ref._input_compactor_compacted_prefix = result.text[: result.compacted_up_to]
+
+                    _call_on_ui(_apply_result)
+                except Exception as exc:
+                    error_message = str(exc)
+
+                    def _show_error():
+                        _cprint(f"\n{_DIM}Input compactor failed: {error_message}{_RST}")
+                        if buf.text == original:
+                            buf.cursor_position = min(cursor, len(buf.text))
+
+                    _call_on_ui(_show_error)
+                finally:
+                    def _finish():
+                        if getattr(cli_ref, "_command_status", "") == INPUT_COMPACTOR_STATUS:
+                            cli_ref._command_status = previous_status
+                        cli_ref._input_compactor_running = False
+                        compactor_lock.release()
+                        app.invalidate()
+
+                    if not _call_on_ui(_finish):
+                        cli_ref._input_compactor_running = False
+                        if getattr(cli_ref, "_command_status", "") == INPUT_COMPACTOR_STATUS:
+                            cli_ref._command_status = previous_status
+                        compactor_lock.release()
+
+            threading.Thread(target=_run_compactor, daemon=True).start()
+
+        @kb.add('c-t', filter=_editor_filter, eager=True)
+        def handle_compact_latest_input_segment(event):
+            """Ctrl+T compacts only the latest uncompacted input segment."""
+            _compact_current_buffer(event, whole_buffer=False)
+
+        @kb.add('escape', 't', filter=_editor_filter)
+        @kb.add('escape', 'T', filter=_editor_filter)
+        def handle_compact_whole_input_buffer(event):
+            """Alt+T compacts the whole current draft buffer."""
+            _compact_current_buffer(event, whole_buffer=True)
         # --- Ctrl+S prompt stash -------------------------------------------
         # Park a half-written draft, send something else, then bring the draft
         # back.  Suppressed while a modal prompt owns the composer (sudo /
@@ -19727,6 +20259,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # EEXIST. The suffix keeps markdown highlighting without that bug.
         input_area.buffer.tempfile_suffix = '.md'
 
+        def _note_input_compactor_edit(_buffer) -> None:
+            cli_ref._input_compactor_edit_version += 1
+
+        input_area.buffer.on_text_changed += _note_input_compactor_edit
+
         # Dynamic height: accounts for both explicit newlines AND visual
         # wrapping of long lines so the input area always fits its content.
         def _input_height():
@@ -19853,7 +20390,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 return "type your answer here and press Enter"
             if cli_ref._clarify_state:
                 return ""
-            if cli_ref._command_running:
+            if cli_ref._command_running or cli_ref._input_compactor_running:
                 frame = cli_ref._command_spinner_frame()
                 status = cli_ref._command_status or "Processing command..."
                 return f"{frame} {status}"
@@ -19939,11 +20476,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 return [
                     ('class:hint', f'  {frame} command in progress · {detail}'),
                 ]
+            if cli_ref._input_compactor_running:
+                frame = cli_ref._command_spinner_frame()
+                return [('class:hint', f'  {frame} {INPUT_COMPACTOR_STATUS}')]
 
             return []
 
         def get_hint_height():
-            if cli_ref._sudo_state or cli_ref._secret_state or cli_ref._approval_state or cli_ref._slash_confirm_state or cli_ref._clarify_state or cli_ref._command_running:
+            if cli_ref._sudo_state or cli_ref._secret_state or cli_ref._approval_state or cli_ref._slash_confirm_state or cli_ref._clarify_state or cli_ref._command_running or cli_ref._input_compactor_running:
                 return 1
             # Keep a spacer while the agent runs on roomy terminals, but reclaim
             # the row on narrow/mobile screens where every line matters.

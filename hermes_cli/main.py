@@ -2067,6 +2067,9 @@ catches.
 """
 
 
+_TUI_INSTALL_MARKER = ".hermes-tui-install.json"
+
+
 def _workspace_root(dir: Path) -> Path:
     """Return the npm workspace root for *dir*.
 
@@ -2092,6 +2095,78 @@ def _workspace_root(dir: Path) -> Path:
     ):
         return dir.parent
     return dir
+
+
+def _tui_install_marker_path(root: Path) -> Path:
+    """Return the per-workspace marker written after a successful TUI install."""
+    return _workspace_root(root) / "node_modules" / _TUI_INSTALL_MARKER
+
+
+def _tui_install_fingerprint(root: Path) -> str:
+    """Fingerprint files that should invalidate a TUI workspace install.
+
+    The TUI launch only runs ``npm install --workspace ui-tui`` in desktop
+    mode. npm's hidden lockfile is workspace-root scoped and may not include
+    desktop/web packages when only the TUI workspace was installed. A successful
+    install marker prevents those unrelated root-workspace packages from
+    triggering a false-positive reinstall on every launch, while this
+    fingerprint still invalidates after lockfile or TUI manifest changes.
+    """
+    ws_root = _workspace_root(root)
+    h = hashlib.sha256()
+    candidates = [
+        ws_root / "package-lock.json",
+        ws_root / "package.json",
+        root / "package.json",
+    ]
+    packages_dir = root / "packages"
+    if packages_dir.is_dir():
+        for child in sorted(packages_dir.iterdir()):
+            if child.is_dir():
+                candidates.append(child / "package.json")
+    for path in candidates:
+        try:
+            label = path.relative_to(ws_root).as_posix()
+        except ValueError:
+            label = str(path)
+        h.update(label.encode("utf-8"))
+        h.update(b"\0")
+        try:
+            h.update(path.read_bytes())
+        except OSError:
+            h.update(b"<missing>")
+        h.update(b"\0")
+    return h.hexdigest()
+
+
+def _tui_install_marker_matches(root: Path) -> bool:
+    try:
+        data = json.loads(_tui_install_marker_path(root).read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    return data.get("fingerprint") == _tui_install_fingerprint(root)
+
+
+def _write_tui_install_marker(root: Path) -> None:
+    marker = _tui_install_marker_path(root)
+    try:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "fingerprint": _tui_install_fingerprint(root),
+                    "workspace": str(_workspace_root(root)),
+                },
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+    except OSError:
+        # Marker is an optimization only. If it cannot be written, keep launch
+        # functional and fall back to lockfile checks next time.
+        pass
 
 
 def _termux_workspace_install_context(
@@ -2270,6 +2345,8 @@ def _tui_need_npm_install(root: Path) -> bool:
     ink = ws_root / "node_modules" / "@hermes" / "ink" / "package.json"
     if not ink.is_file():
         return True
+    if _tui_install_marker_matches(root):
+        return False
     if not lock.is_file():
         return False
     marker = ws_root / "node_modules" / ".package-lock.json"
@@ -2707,6 +2784,7 @@ def _make_tui_argv(tui_dir: Path, tui_dev: bool) -> tuple[list[str], Path]:
                 print(preview)
             sys.exit(1)
         did_install = True
+        _write_tui_install_marker(tui_dir)
 
     if tui_dev:
         # Keep the local @hermes/ink package exports in sync with source.
@@ -2927,12 +3005,54 @@ def _launch_tui(
         apply_terminal_config_to_env(env=env)
     except Exception:
         logger.debug("Failed to apply terminal config bridge for TUI launch", exc_info=True)
+    # Pin profile identity in the child environment. Node passes this through to
+    # tui_gateway.entry, keeping concurrent Default/Tate/Aurelius TUI launches
+    # isolated and letting shared Agent Lights slots identify their owning lane.
+    from hermes_cli.profiles import get_active_profile_name
+
+    env["HERMES_HOME"] = str(get_hermes_home())
+    env["HERMES_PROFILE"] = get_active_profile_name()
     active_session_fd, active_session_file = tempfile.mkstemp(
         prefix="hermes-tui-active-session-", suffix=".json"
     )
     os.close(active_session_fd)
     env["HERMES_TUI_ACTIVE_SESSION_FILE"] = active_session_file
     env.setdefault("NODE_ENV", "development" if tui_dev else "production")
+    try:
+        import json
+        from hermes_cli.config import load_config
+        from hermes_cli.skin_engine import get_active_skin, init_skin_from_config
+
+        init_skin_from_config(load_config())
+        initial_skin = get_active_skin()
+        env["HERMES_TUI_INITIAL_SKIN"] = json.dumps(
+            {
+                "name": initial_skin.name,
+                "colors": initial_skin.colors,
+                "branding": initial_skin.branding,
+                "banner_logo": initial_skin.banner_logo,
+                "banner_hero": initial_skin.banner_hero,
+                "tool_prefix": initial_skin.tool_prefix,
+                "help_header": (initial_skin.branding or {}).get("help_header", ""),
+            }
+        )
+    except Exception:
+        logger.debug("Failed to seed initial TUI skin", exc_info=True)
+    if not env.get("HERMES_INPUT_COMPACTOR"):
+        try:
+            from hermes_cli.config import load_config
+
+            cfg = load_config()
+            raw_compactor = None
+            if isinstance(cfg, dict):
+                display_cfg = cfg.get("display")
+                if isinstance(display_cfg, dict):
+                    raw_compactor = display_cfg.get("input_compactor_path")
+                raw_compactor = raw_compactor or cfg.get("input_compactor_path")
+            if raw_compactor:
+                env["HERMES_INPUT_COMPACTOR"] = os.path.expanduser(str(raw_compactor))
+        except Exception:
+            pass
 
     wt_info = None
     if worktree:

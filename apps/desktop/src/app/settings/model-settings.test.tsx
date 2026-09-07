@@ -22,6 +22,7 @@ const saveMoaModels = vi.fn()
 const setEnvVar = vi.fn()
 const getHermesConfigRecord = vi.fn()
 const saveHermesConfig = vi.fn()
+const setApiRequestProfile = vi.fn()
 const startManualLocalEndpoint = vi.fn()
 const startManualOnboarding = vi.fn()
 const startManualProviderOAuth = vi.fn()
@@ -39,8 +40,8 @@ vi.mock('@/hermes', () => ({
   saveMoaModels: (body: unknown) => saveMoaModels(body),
   setEnvVar: (key: string, value: string) => setEnvVar(key, value),
   getHermesConfigRecord: () => getHermesConfigRecord(),
-  saveHermesConfig: (config: unknown) => saveHermesConfig(config),
-  setApiRequestProfile: () => {}
+  setApiRequestProfile: (profile: string) => setApiRequestProfile(profile),
+  saveHermesConfig: (config: unknown) => saveHermesConfig(config)
 }))
 
 vi.mock('@/store/onboarding', () => ({
@@ -65,6 +66,15 @@ beforeEach(() => {
         models: ['hermes-4', 'hermes-4-mini'],
         authenticated: true,
         capabilities: { 'hermes-4': { reasoning: true, fast: true } }
+      },
+      // An unconfigured api_key provider — surfaced by the full-universe payload.
+      {
+        name: 'DeepSeek',
+        slug: 'deepseek',
+        models: [],
+        authenticated: false,
+        auth_type: 'api_key',
+        key_env: 'DEEPSEEK_API_KEY'
       }
     ]
   })
@@ -126,19 +136,42 @@ describe('ModelSettings profile scope', () => {
 })
 
 describe('ModelSettings', () => {
-  it('loads the current main model and lists configured providers only', async () => {
+  it('loads the current main model and lists the full provider universe', async () => {
     await renderModelSettings()
 
     await waitFor(() => expect(getGlobalModelInfo).toHaveBeenCalled())
     await waitFor(() => expect(getGlobalModelOptions).toHaveBeenCalled())
 
-    // Open the provider Select — only configured providers should be listed.
+    // Open the provider Select — every provider from the full payload should be
+    // listed, including the unconfigured one that can be activated inline.
     const triggers = await screen.findAllByRole('combobox')
     fireEvent.click(triggers[0])
 
-    // "Nous" shows in both the trigger and the open list.
+    // "Nous" shows in both the trigger and the open list; DeepSeek proves the
+    // picker exposes the full provider universe rather than configured-only rows.
     expect((await screen.findAllByText('Nous')).length).toBeGreaterThan(0)
-    expect(screen.queryByText(/DeepSeek/)).toBeNull()
+    expect(await screen.findByText(/DeepSeek/)).toBeTruthy()
+  })
+
+  it('activates an unconfigured api_key provider inline by saving its key', async () => {
+    await renderModelSettings()
+
+    await waitFor(() => expect(getGlobalModelOptions).toHaveBeenCalled())
+
+    // Open the provider Select and pick the unconfigured provider.
+    const triggers = screen.getAllByRole('combobox')
+    fireEvent.click(triggers[0])
+    const deepseekOption = await screen.findByText(/DeepSeek/)
+    fireEvent.click(deepseekOption)
+
+    // The inline key input appears for an api_key provider that needs setup.
+    const keyInput = await screen.findByPlaceholderText(/Paste DEEPSEEK_API_KEY/)
+    fireEvent.change(keyInput, { target: { value: 'sk-test-123' } })
+
+    const activate = await screen.findByRole('button', { name: /Activate/ })
+    fireEvent.click(activate)
+
+    await waitFor(() => expect(setEnvVar).toHaveBeenCalledWith('DEEPSEEK_API_KEY', 'sk-test-123'))
   })
 
   it.each(['custom', 'local', 'custom:lab'])(

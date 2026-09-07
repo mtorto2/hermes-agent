@@ -139,6 +139,63 @@ class TestBusyInputMode:
 
 
 
+    def test_q_delete_removes_only_queued_prompt_by_default(self):
+        """/q delete should remove the sole queued prompt instead of queuing text."""
+        cli = _make_cli()
+        cli._pending_input.put("do not run")
+        assert cli.process_command("/q delete") is True
+        assert cli._pending_input.empty()
+
+    def test_q_delete_number_removes_selected_queued_prompt(self):
+        """/q delete N should remove the 1-based selected queued prompt and keep order."""
+        cli = _make_cli()
+        cli._pending_input.put("first")
+        cli._pending_input.put("second")
+        cli._pending_input.put("third")
+        assert cli.process_command("/q delete 2") is True
+        assert cli._pending_input.get_nowait() == "first"
+        assert cli._pending_input.get_nowait() == "third"
+        assert cli._pending_input.empty()
+
+    def test_q_delete_requires_number_when_multiple_prompts_are_queued(self):
+        """Bare /q delete should not guess when multiple prompts are queued."""
+        cli = _make_cli()
+        cli._pending_input.put("first")
+        cli._pending_input.put("second")
+        assert cli.process_command("/q delete") is True
+        assert cli._pending_input.get_nowait() == "first"
+        assert cli._pending_input.get_nowait() == "second"
+        assert cli._pending_input.empty()
+
+    def test_queue_delete_alias_removes_selected_queued_prompt(self):
+        """The long /queue delete N form should match /q delete N."""
+        cli = _make_cli()
+        cli._pending_input.put("first")
+        cli._pending_input.put("second")
+        assert cli.process_command("/queue delete 1") is True
+        assert cli._pending_input.get_nowait() == "second"
+        assert cli._pending_input.empty()
+
+    def test_q_delete_is_handled_inline_while_agent_running(self):
+        """While busy, /q delete must bypass FIFO pending-input routing."""
+        cli = _make_cli()
+        cli._agent_running = True
+        assert cli._should_handle_queue_delete_command_inline("/q delete") is True
+        assert cli._should_handle_queue_delete_command_inline("/queue delete 2") is True
+        assert cli._should_handle_queue_delete_command_inline("/q follow up") is False
+
+    def test_queue_mode_routes_busy_enter_to_pending(self):
+        """In queue mode, Enter while busy should go to _pending_input, not _interrupt_queue."""
+        cli = _make_cli(config_overrides={"display": {"busy_input_mode": "queue"}})
+        cli._agent_running = True
+        # Simulate what handle_enter does for non-command input while busy
+        text = "follow up"
+        if cli.busy_input_mode == "queue":
+            cli._pending_input.put(text)
+        else:
+            cli._interrupt_queue.put(text)
+        assert cli._pending_input.get_nowait() == "follow up"
+        assert cli._interrupt_queue.empty()
 
     def test_interrupt_mode_routes_busy_enter_to_interrupt(self):
         """In interrupt mode (default), Enter while busy goes to _interrupt_queue."""
@@ -151,6 +208,30 @@ class TestBusyInputMode:
             cli._interrupt_queue.put(text)
         assert cli._interrupt_queue.get_nowait() == "redirect"
         assert cli._pending_input.empty()
+
+
+class TestMergedSlashCommandCompatibility:
+    def test_local_commands_coexist_with_upstream_busy_metadata_and_slack_cap(self):
+        """Keep Matt-local CLI behavior without displacing upstream gateway policy."""
+        from hermes_cli.commands import (
+            COMMANDS,
+            resolve_command,
+            slack_native_slashes,
+            slack_subcommand_map,
+        )
+
+        assert "/nah" in COMMANDS
+        assert "/repos" in COMMANDS
+        assert "delete [number]" in COMMANDS["/queue"]
+        egress = resolve_command("egress")
+        context = resolve_command("context")
+        assert egress is not None and egress.busy_policy == "dispatch"
+        assert context is not None and context.busy_policy == "dispatch"
+
+        native_slashes = {name for name, _description, _hint in slack_native_slashes()}
+        assert "nah" in native_slashes
+        assert "repos" not in native_slashes
+        assert slack_subcommand_map()["repos"] == "/repos"
 
 
 class TestPromptToolkitTerminalCompatibility:

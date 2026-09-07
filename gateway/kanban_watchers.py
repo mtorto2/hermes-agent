@@ -81,20 +81,29 @@ def _resolve_auto_decompose_settings(
     return enabled, per_tick
 
 
-def _kanban_dispatch_allowed() -> bool:
-    """Return False while the global emergency stop (`hermes pause`) is engaged.
+def _kanban_dispatch_allowed(assignee: Optional[str] = None) -> bool:
+    """Return False while the relevant profile's ESTOP is engaged.
 
-    Checked every dispatcher tick BEFORE spawning new workers so a pause takes
-    effect on the next tick without a gateway restart. In-flight workers are
-    never touched — this only stops NEW spawns. Fails open: if the estop
-    module is unimportable, dispatch proceeds (the sentinel gate must not
-    become a new crash surface for the dispatcher).
+    The shared board can dispatch tasks to multiple profiles, so each task is
+    checked against its assignee's home rather than the gateway process's
+    active profile. With no assignee this checks the process profile, used for
+    gateway-owned auto-decompose. In-flight workers are never touched.
     """
     try:
         from agent.estop import check_paused
     except ImportError:
         return True
-    return not check_paused("kanban", logger)
+    home = None
+    component = "kanban"
+    if assignee:
+        try:
+            from hermes_cli.profiles import get_profile_dir
+
+            home = get_profile_dir(assignee)
+            component = f"kanban:{assignee}"
+        except Exception:
+            return True
+    return not check_paused(component, logger, home=home)
 
 
 def _run_in_fresh_context(func: Callable[..., Any], /, *args: Any) -> Any:
@@ -1573,6 +1582,7 @@ class GatewayKanbanWatchersMixin:
                     default_assignee=default_assignee,
                     max_in_progress_per_profile=max_in_progress_per_profile,
                     reconcile_orphans=reconcile_orphans,
+                    dispatch_allowed=_kanban_dispatch_allowed,
                 )
             except sqlite3.DatabaseError as exc:
                 if _is_corrupt_board_db_error(exc):
@@ -1656,9 +1666,13 @@ class GatewayKanbanWatchersMixin:
                 conn = None
                 try:
                     conn = _kb.connect(board=slug)
-                    if _kb.has_spawnable_ready(conn):
+                    if _kb.has_spawnable_ready(
+                        conn, dispatch_allowed=_kanban_dispatch_allowed
+                    ):
                         return True
-                    if _review_probe and _kb.has_spawnable_review(conn):
+                    if _review_probe and _kb.has_spawnable_review(
+                        conn, dispatch_allowed=_kanban_dispatch_allowed
+                    ):
                         return True
                 except Exception:
                     continue
@@ -1784,43 +1798,40 @@ class GatewayKanbanWatchersMixin:
                 logger.exception("kanban dispatcher: zombie reaper failed")
 
             try:
-                # Global emergency stop (`hermes pause`): skip auto-decompose
-                # and dispatch entirely — no new workers while paused. Running
-                # workers finish naturally; zombie reaping above still runs.
-                if not _kanban_dispatch_allowed():
-                    ready_pending = False
-                    bad_ticks = 0
-                else:
-                    # Re-read the auto-decompose toggle live each tick so a user
-                    # flipping kanban.auto_decompose=false to STOP runaway fan-out
-                    # takes effect on the next tick, not on gateway restart (#49638).
+                # Auto-decompose belongs to this gateway's own profile, while
+                # worker admission is checked per assignee below. A paused
+                # default dispatcher must not silence unpaused specialist work
+                # on the shared board.
+                if _kanban_dispatch_allowed():
                     _ad_enabled, _ad_per_tick = _read_auto_decompose_settings()
                     if _ad_enabled:
                         await _to_thread_process_service(_auto_decompose_tick, _ad_per_tick)
-                    results = await _to_thread_process_service(_tick_once)
-                    any_spawned = False
-                    for slug, res in (results or []):
-                        if res is not None and getattr(res, "spawned", None):
-                            any_spawned = True
-                            # Quiet by default — only log when something actually
-                            # happened, so an idle gateway stays silent.
-                            logger.info(
-                                "kanban dispatcher [%s]: spawned=%d reclaimed=%d "
-                                "crashed=%d timed_out=%d promoted=%d auto_blocked=%d",
-                                slug,
-                                len(res.spawned),
-                                res.reclaimed,
-                                len(res.crashed) if hasattr(res.crashed, "__len__") else 0,
-                                len(res.timed_out) if hasattr(res.timed_out, "__len__") else 0,
-                                res.promoted,
-                                len(res.auto_blocked) if hasattr(res.auto_blocked, "__len__") else 0,
-                            )
-                    # Health telemetry (aggregate across boards)
-                    ready_pending = await _to_thread_process_service(_ready_nonempty)
-                    if ready_pending and not any_spawned:
-                        bad_ticks += 1
-                    else:
-                        bad_ticks = 0
+
+                results = await _to_thread_process_service(_tick_once)
+                any_spawned = False
+                for slug, res in (results or []):
+                    if res is not None and getattr(res, "spawned", None):
+                        any_spawned = True
+                        # Quiet by default — only log when something actually
+                        # happened, so an idle gateway stays silent.
+                        logger.info(
+                            "kanban dispatcher [%s]: spawned=%d reclaimed=%d "
+                            "crashed=%d timed_out=%d promoted=%d auto_blocked=%d",
+                            slug,
+                            len(res.spawned),
+                            res.reclaimed,
+                            len(res.crashed) if hasattr(res.crashed, "__len__") else 0,
+                            len(res.timed_out) if hasattr(res.timed_out, "__len__") else 0,
+                            res.promoted,
+                            len(res.auto_blocked) if hasattr(res.auto_blocked, "__len__") else 0,
+                        )
+                # Health telemetry excludes work paused in its own profile,
+                # while still reporting queues that are genuinely spawnable.
+                ready_pending = await _to_thread_process_service(_ready_nonempty)
+                if ready_pending and not any_spawned:
+                    bad_ticks += 1
+                else:
+                    bad_ticks = 0
                 if bad_ticks >= HEALTH_WINDOW:
                     now = int(time.time())
                     if now - last_warn_at >= 300:

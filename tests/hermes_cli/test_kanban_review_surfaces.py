@@ -86,6 +86,35 @@ def test_review_tools_redact_handoff_and_route_changes(
         )
 
 
+def test_request_review_dispatch_persists_active_agent_usage(
+    review_worker: str,
+) -> None:
+    from types import SimpleNamespace
+
+    from model_tools import handle_function_call
+
+    agent = SimpleNamespace(
+        provider="openrouter",
+        model="anthropic/claude-sonnet-4",
+        session_input_tokens=10,
+    )
+
+    out = handle_function_call(
+        "kanban_request_review",
+        {"summary": "ready for review"},
+        agent=agent,
+    )
+    assert json.loads(out)["ok"] is True
+
+    with kb.connect() as conn:
+        run = kb.latest_run(conn, review_worker)
+        assert run is not None
+        usage = run.metadata["run_usage"]
+        assert usage["provider"] == "openrouter"
+        assert usage["model"] == "anthropic/claude-sonnet-4"
+        assert usage["input_tokens"] == 10
+
+
 def test_review_tools_are_gated_and_visible_to_kanban_workers(
     review_worker: str,
 ) -> None:

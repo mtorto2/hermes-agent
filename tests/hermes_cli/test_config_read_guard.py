@@ -127,3 +127,32 @@ def test_read_user_config_raw_exists_and_documented():
     doc = read_user_config_raw.__doc__ or ""
     assert "ONLY legal for write-back round-trips and raw-file diagnostics" in doc
     assert "load_config()" in doc
+
+
+def test_source_scan_ignores_when_an_ephemeral_cache_directory_disappears(
+    tmp_path, monkeypatch
+):
+    """A concurrent ``__pycache__`` cleanup must not abort the source guard."""
+    source = tmp_path / "hermes_cli" / "config_reader.py"
+    source.parent.mkdir()
+    source.write_text("pass\n")
+
+    def _ignore_disappearing_dir(path):
+        raise FileNotFoundError("simulated disappearing __pycache__")
+
+    original_scandir = os.scandir
+    monkeypatch.setitem(globals(), "REPO_ROOT", tmp_path)
+    monkeypatch.setitem(globals(), "EXCLUDED_DIR_PARTS", {"__pycache__"})
+
+    pycache = tmp_path / "__pycache__"
+    pycache.mkdir()
+    monkeypatch.setattr(
+        os,
+        "scandir",
+        lambda path: (
+            _ignore_disappearing_dir(path)
+            if Path(path) == pycache
+            else original_scandir(path)
+        ),
+    )
+    assert list(_iter_source_files()) == [(Path("hermes_cli/config_reader.py"), source)]

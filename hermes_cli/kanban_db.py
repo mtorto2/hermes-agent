@@ -87,7 +87,7 @@ import time
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Optional
+from typing import Any, Callable, Iterable, Mapping, Optional
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
@@ -4358,6 +4358,23 @@ def _end_run(
     if not row or not row["current_run_id"]:
         return None
     run_id = int(row["current_run_id"])
+    existing_meta_row = conn.execute(
+        "SELECT metadata FROM task_runs WHERE id = ?", (run_id,)
+    ).fetchone()
+    existing_metadata: Optional[dict] = None
+    if existing_meta_row and existing_meta_row["metadata"]:
+        try:
+            parsed_meta = json.loads(existing_meta_row["metadata"])
+            if isinstance(parsed_meta, dict):
+                existing_metadata = parsed_meta
+        except Exception:
+            existing_metadata = None
+    effective_metadata = metadata
+    if existing_metadata is not None:
+        if metadata:
+            effective_metadata = {**existing_metadata, **metadata}
+        else:
+            effective_metadata = existing_metadata
     conn.execute(
         """
         UPDATE task_runs
@@ -4378,7 +4395,7 @@ def _end_run(
             outcome,
             summary,
             error,
-            json.dumps(metadata, ensure_ascii=False) if metadata else None,
+            json.dumps(effective_metadata, ensure_ascii=False) if effective_metadata else None,
             now,
             run_id,
         ),
@@ -4394,6 +4411,151 @@ def _current_run_id(conn: sqlite3.Connection, task_id: str) -> Optional[int]:
         "SELECT current_run_id FROM tasks WHERE id = ?", (task_id,),
     ).fetchone()
     return int(row["current_run_id"]) if row and row["current_run_id"] else None
+
+
+def _int_or_none(value: Any) -> Optional[int]:
+    if value is None or value == "":
+        return None
+    try:
+        iv = int(value)
+    except (TypeError, ValueError):
+        return None
+    return iv if iv >= 0 else None
+
+
+def _float_or_none(value: Any) -> Optional[float]:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalize_run_usage(
+    raw: Optional[dict],
+    *,
+    started_at: Optional[int],
+    ended_at: Optional[int],
+) -> dict[str, Any]:
+    """Return compact, dashboard-ready usage metadata for a closed run."""
+    usage: dict[str, Any] = dict(raw) if isinstance(raw, dict) else {}
+
+    # Canonical runtime is the task_runs timestamp delta. Worker-supplied
+    # runtime hints may remain in other metadata fields, but run_usage uses
+    # the DB row as source of truth.
+    runtime_status = "not_available"
+    runtime_seconds: Optional[int] = None
+    if started_at is not None and ended_at is not None:
+        runtime_seconds = max(0, int(ended_at) - int(started_at))
+        runtime_status = "ok"
+    usage["runtime_seconds"] = runtime_seconds
+    usage["runtime_status"] = runtime_status
+
+    # Normalize token aliases while preserving the compact prompt/completion
+    # fields expected by OpenAI-style surfaces and the richer canonical fields
+    # used by Hermes accounting.
+    input_tokens = _int_or_none(usage.get("input_tokens"))
+    output_tokens = _int_or_none(usage.get("output_tokens"))
+    prompt_tokens = _int_or_none(usage.get("prompt_tokens"))
+    completion_tokens = _int_or_none(usage.get("completion_tokens"))
+    cache_read = _int_or_none(usage.get("cache_read_tokens")) or 0
+    cache_write = _int_or_none(usage.get("cache_write_tokens")) or 0
+    reasoning = _int_or_none(usage.get("reasoning_tokens"))
+    request_count = _int_or_none(usage.get("request_count"))
+
+    if input_tokens is None and prompt_tokens is not None:
+        input_tokens = max(0, prompt_tokens - cache_read - cache_write)
+    if output_tokens is None and completion_tokens is not None:
+        output_tokens = completion_tokens
+    if prompt_tokens is None:
+        prompt_tokens = (input_tokens or 0) + cache_read + cache_write
+    if completion_tokens is None and output_tokens is not None:
+        completion_tokens = output_tokens
+
+    token_values = [prompt_tokens, completion_tokens, cache_read, cache_write]
+    total_tokens = _int_or_none(usage.get("total_tokens"))
+    if total_tokens is None and any(v is not None and v > 0 for v in token_values):
+        total_tokens = (prompt_tokens or 0) + (completion_tokens or 0)
+
+    for key, val in (
+        ("input_tokens", input_tokens),
+        ("output_tokens", output_tokens),
+        ("prompt_tokens", prompt_tokens),
+        ("completion_tokens", completion_tokens),
+        ("cache_read_tokens", cache_read),
+        ("cache_write_tokens", cache_write),
+        ("reasoning_tokens", reasoning),
+        ("request_count", request_count),
+        ("total_tokens", total_tokens),
+    ):
+        if val is not None:
+            usage[key] = val
+
+    cost = _float_or_none(usage.get("estimated_cost_usd"))
+    if cost is not None:
+        usage["estimated_cost_usd"] = cost
+    if "cost_status" not in usage or usage.get("cost_status") in (None, ""):
+        usage["cost_status"] = "not_available"
+    if "cost_source" not in usage or usage.get("cost_source") in (None, ""):
+        usage["cost_source"] = "not_available"
+    return usage
+
+
+def _completion_metadata_with_run_usage(
+    conn: sqlite3.Connection,
+    task_id: str,
+    metadata: Optional[dict],
+    *,
+    ended_at: int,
+) -> dict:
+    out: dict[str, Any] = dict(metadata) if isinstance(metadata, dict) else {}
+    row = conn.execute(
+        """
+        SELECT tr.started_at
+          FROM tasks t
+          LEFT JOIN task_runs tr ON tr.id = t.current_run_id
+         WHERE t.id = ?
+        """,
+        (task_id,),
+    ).fetchone()
+    started_at = int(row["started_at"]) if row and row["started_at"] is not None else ended_at
+    existing = out.get("run_usage")
+    if isinstance(existing, dict):
+        out["run_usage"] = _normalize_run_usage(
+            existing,
+            started_at=started_at,
+            ended_at=ended_at,
+        )
+    return out
+
+
+def _append_run_usage_ledger(conn: sqlite3.Connection, run_id: Optional[int]) -> None:
+    if not run_id:
+        return
+    try:
+        run = get_run(conn, run_id)
+        if not run or not isinstance(run.metadata, dict):
+            return
+        usage = run.metadata.get("run_usage")
+        if not isinstance(usage, dict):
+            return
+        path = worker_logs_dir() / "run_usage.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        receipt = {
+            "task_id": run.task_id,
+            "run_id": run.id,
+            "profile": run.profile,
+            "status": run.status,
+            "outcome": run.outcome,
+            "started_at": run.started_at,
+            "ended_at": run.ended_at,
+            "run_usage": usage,
+        }
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(receipt, ensure_ascii=False, sort_keys=True) + "\n")
+    except Exception as exc:
+        _log.warning("failed to append kanban run usage ledger receipt: %s", exc)
 
 
 def _synthesize_ended_run(
@@ -5499,6 +5661,12 @@ def complete_task(
                     size=path.stat().st_size,
                     created_at=now,
                 )
+        metadata = _completion_metadata_with_run_usage(
+            conn,
+            task_id,
+            metadata,
+            ended_at=now,
+        )
         run_id = _end_run(
             conn, task_id,
             outcome="completed", status="done",
@@ -5586,6 +5754,7 @@ def complete_task(
     # just tracks "is there a current pathology the breaker should
     # care about", and a success resets that question.
     _clear_failure_counter(conn, task_id)
+    _append_run_usage_ledger(conn, run_id)
     # Recompute ready status for dependents (separate txn so children see done).
     recompute_ready(conn)
     # Clean up the scratch workspace and any stale tmux session for the worker.
@@ -5936,7 +6105,7 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
             _try_cleanup_parent_workspaces(conn, task_id)
             return
         import shutil
-        wp = Path(path)
+        wp = Path(path).expanduser()
         if wp.is_dir():
             # Containment guard (#28818): a board's ``default_workdir`` can
             # pair ``workspace_kind='scratch'`` with a user-supplied path
@@ -7902,6 +8071,165 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
     raise ValueError(f"unknown workspace_kind: {kind}")
 
 
+def _git_capture(cwd: Path, *args: str) -> tuple[Optional[str], Optional[str]]:
+    """Run a short git probe and return ``(stdout, error)``.
+
+    Dispatcher preflight must be best-effort and non-interactive: never hang
+    on credential prompts, never leak stderr as an exception traceback, and
+    keep errors as compact evidence for task/run metadata.
+    """
+    try:
+        res = subprocess.run(
+            ["git", "-C", str(cwd), *args],
+            text=True,
+            capture_output=True,
+            timeout=5,
+            check=False,
+            env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+        )
+    except Exception as exc:
+        return None, str(exc)
+    if res.returncode != 0:
+        err = (res.stderr or res.stdout or f"git exited {res.returncode}").strip()
+        return None, err[:500]
+    return res.stdout.strip(), None
+
+
+def collect_workspace_preflight(task: Task, workspace: Path | str) -> dict[str, Any]:
+    """Return dispatcher workspace-safety evidence for a claimed task.
+
+    ``result`` is one of:
+    - ``pass``: no blockers/advisories
+    - ``advisory``: safe to spawn, but noteworthy state exists (e.g. dirty
+      ``dir`` checkout)
+    - ``block``: dispatcher must not spawn the worker
+    """
+    kind = task.workspace_kind or "scratch"
+    p = Path(workspace).expanduser()
+    intended = {
+        "kind": kind,
+        "path": str(p),
+        "branch": task.branch_name,
+    }
+    actual: dict[str, Any] = {
+        "exists": p.exists(),
+        "is_dir": p.is_dir(),
+    }
+    blockers: list[str] = []
+    advisories: list[str] = []
+
+    def probe_git() -> None:
+        top, err = _git_capture(p, "rev-parse", "--show-toplevel")
+        actual["git_toplevel"] = top
+        if err:
+            actual["git_error"] = err
+            return
+        branch, _ = _git_capture(p, "branch", "--show-current")
+        status, _ = _git_capture(p, "status", "--short", "--branch")
+        porcelain, _ = _git_capture(p, "status", "--porcelain")
+        remotes, _ = _git_capture(p, "remote", "-v")
+        worktrees, _ = _git_capture(p, "worktree", "list", "--porcelain")
+        actual["branch"] = branch or None
+        actual["status_short_branch"] = status or ""
+        actual["dirty"] = bool((porcelain or "").strip())
+        actual["remotes"] = remotes or ""
+        actual["worktree_list"] = worktrees or ""
+        actual["git_dir_kind"] = (
+            "file" if (p / ".git").is_file()
+            else "directory" if (p / ".git").is_dir()
+            else "missing"
+        )
+
+    if kind == "worktree":
+        if not p.exists():
+            blockers.append(f"worktree path does not exist: {p}")
+        elif not p.is_dir():
+            blockers.append(f"worktree path is not a directory: {p}")
+        else:
+            probe_git()
+            if actual.get("git_toplevel") is None:
+                blockers.append(f"worktree path is not a git checkout: {p}")
+            else:
+                separate = actual.get("git_dir_kind") == "file"
+                actual["separate_worktree"] = separate
+                if not separate:
+                    blockers.append(
+                        f"workspace=worktree points at a main checkout, not a linked worktree: {p}"
+                    )
+                if task.branch_name and actual.get("branch") != task.branch_name:
+                    blockers.append(
+                        f"worktree branch mismatch: expected {task.branch_name}, "
+                        f"found {actual.get('branch') or '(detached)'}"
+                    )
+                if actual.get("dirty"):
+                    blockers.append(f"worktree checkout is dirty: {p}")
+    elif kind == "dir":
+        if p.exists() and p.is_dir():
+            probe_git()
+            if actual.get("git_toplevel") and actual.get("dirty"):
+                advisories.append(f"dir workspace git checkout is dirty: {p}")
+    result = "block" if blockers else "advisory" if advisories else "pass"
+    return {
+        "result": result,
+        "intended": intended,
+        "actual": actual,
+        "blockers": blockers,
+        "advisories": advisories,
+        "checked_at": int(time.time()),
+    }
+
+
+def record_workspace_preflight(
+    conn: sqlite3.Connection, task_id: str, evidence: dict[str, Any]
+) -> None:
+    """Merge workspace preflight evidence into the active run metadata."""
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT current_run_id FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if not row or row["current_run_id"] is None:
+            return
+        run_id = int(row["current_run_id"])
+        run = conn.execute(
+            "SELECT metadata FROM task_runs WHERE id = ?", (run_id,)
+        ).fetchone()
+        metadata: dict[str, Any] = {}
+        if run and run["metadata"]:
+            try:
+                parsed = json.loads(run["metadata"])
+                if isinstance(parsed, dict):
+                    metadata = parsed
+            except Exception:
+                metadata = {}
+        metadata["workspace_preflight"] = evidence
+        conn.execute(
+            "UPDATE task_runs SET metadata = ? WHERE id = ?",
+            (json.dumps(metadata, ensure_ascii=False), run_id),
+        )
+        _append_event(
+            conn,
+            task_id,
+            "workspace_preflight",
+            {
+                "result": evidence.get("result"),
+                "blockers": evidence.get("blockers") or [],
+                "advisories": evidence.get("advisories") or [],
+            },
+            run_id=run_id,
+        )
+
+
+def _preflight_workspace_for_spawn(
+    conn: sqlite3.Connection, task: Task, workspace: Path | str
+) -> dict[str, Any]:
+    evidence = collect_workspace_preflight(task, workspace)
+    record_workspace_preflight(conn, task.id, evidence)
+    if evidence.get("result") == "block":
+        blockers = evidence.get("blockers") or ["workspace preflight blocked"]
+        raise ValueError("; ".join(str(b) for b in blockers))
+    return evidence
+
+
 def set_workspace_path(
     conn: sqlite3.Connection, task_id: str, path: Path | str
 ) -> None:
@@ -9548,19 +9876,16 @@ def check_respawn_guard(
     return None
 
 
-def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
-    """Return True iff there is at least one ready+assigned+unclaimed task
-    whose assignee maps to a real Hermes profile.
+def has_spawnable_ready(
+    conn: sqlite3.Connection,
+    *,
+    dispatch_allowed: Optional[Callable[[str], bool]] = None,
+) -> bool:
+    """Return whether ready work has a real profile permitted to dispatch it.
 
-    Used by the gateway- and CLI-embedded dispatchers' health telemetry to
-    decide whether ``0 spawned`` is a "stuck" condition (real spawnable
-    work waiting) or a "correctly idle" condition (only control-plane
-    lanes like ``orion-cc`` / ``orion-research`` waiting on terminals
-    that pull tasks via ``claim_task`` directly).
-
-    Falls back to "any ready+assigned" if ``profile_exists`` is not
-    importable (e.g. partial install) — preserves the old behavior so
-    the warning still fires in degraded environments.
+    ``dispatch_allowed`` lets the embedded dispatcher exclude profile-paused
+    work from its stuck-queue health telemetry without changing ordinary CLI
+    dispatch semantics.
     """
     rows = conn.execute(
         "SELECT DISTINCT assignee FROM tasks "
@@ -9575,19 +9900,20 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
         # Can't introspect — assume spawnable, preserve legacy behavior.
         return True
     for row in rows:
-        if profile_exists(row["assignee"]):
+        assignee = row["assignee"]
+        if profile_exists(assignee) and (
+            dispatch_allowed is None or dispatch_allowed(assignee)
+        ):
             return True
     return False
 
 
-def has_spawnable_review(conn: sqlite3.Connection) -> bool:
-    """Return True iff there is at least one review+assigned+unclaimed task
-    whose assignee maps to a real Hermes profile.
-
-    Mirror of :func:`has_spawnable_ready` for the review column —
-    used by the health telemetry to decide whether the dispatcher
-    should have spawned a review agent.
-    """
+def has_spawnable_review(
+    conn: sqlite3.Connection,
+    *,
+    dispatch_allowed: Optional[Callable[[str], bool]] = None,
+) -> bool:
+    """Return whether review work has a real profile permitted to dispatch it."""
     rows = conn.execute(
         "SELECT DISTINCT assignee FROM tasks "
         "WHERE status = 'review' AND assignee IS NOT NULL "
@@ -9600,7 +9926,10 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
     except Exception:
         return True
     for row in rows:
-        if profile_exists(row["assignee"]):
+        assignee = row["assignee"]
+        if profile_exists(assignee) and (
+            dispatch_allowed is None or dispatch_allowed(assignee)
+        ):
             return True
     return False
 
@@ -9830,62 +10159,45 @@ def dispatch_once(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
+    dispatch_allowed: Optional[Callable[[str], bool]] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
-    Thin wrapper around :func:`_dispatch_once_locked`. It acquires a
-    non-blocking, board-scoped dispatch lock (issue #35240) so that two
-    dispatchers pointed at the same ``kanban.db`` — e.g. the service-
-    managed gateway and a shell-spawned orphan that escaped the service
-    cgroup — can never run a reclaim/spawn/write tick concurrently and
-    race on WAL frames. The losing dispatcher returns an empty
-    ``DispatchResult`` with ``skipped_locked=True`` and does no DB writes;
-    the holder is already making progress on the same board.
-
-    The lock is keyed off the board's resolved DB path, so unrelated
-    boards tick in parallel. See :func:`_dispatch_tick_lock` for the
-    cross-process / cross-platform mechanics.
+    ``dispatch_allowed`` is an optional pre-claim admission predicate. The
+    embedded gateway uses it for profile-scoped ESTOPs; CLI callers retain the
+    existing behavior by omitting it.
     """
+    kwargs = {
+        "spawn_fn": spawn_fn,
+        "ttl_seconds": ttl_seconds,
+        "dry_run": dry_run,
+        "max_spawn": max_spawn,
+        "max_in_progress": max_in_progress,
+        "failure_limit": failure_limit,
+        "stale_timeout_seconds": stale_timeout_seconds,
+        "board": board,
+        "default_assignee": default_assignee,
+        "max_in_progress_per_profile": max_in_progress_per_profile,
+        "reconcile_orphans": reconcile_orphans,
+        "dispatch_allowed": dispatch_allowed,
+    }
     try:
         db_path = kanban_db_path(board=board)
     except Exception:
         # Path resolution should never fail, but if it somehow does we
         # must not lose the tick — fall through to an unguarded dispatch
         # rather than dropping work.
-        result = _dispatch_once_locked(
-            conn,
-            spawn_fn=spawn_fn,
-            ttl_seconds=ttl_seconds,
-            dry_run=dry_run,
-            max_spawn=max_spawn,
-            max_in_progress=max_in_progress,
-            failure_limit=failure_limit,
-            stale_timeout_seconds=stale_timeout_seconds,
-            board=board,
-            default_assignee=default_assignee,
-            max_in_progress_per_profile=max_in_progress_per_profile,
-            reconcile_orphans=reconcile_orphans,
-        )
+        result = _dispatch_once_locked(conn, **kwargs)
+        # The dispatch lock could not be acquired (no db_path); fire the
+        # tick observer OUTSIDE any critical section, consistent with the
+        # guarded path below (#56066 / #64231).
         _fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
         return result
     with _dispatch_tick_lock(db_path) as held:
         if not held:
             result = DispatchResult(skipped_locked=True)
         else:
-            result = _dispatch_once_locked(
-                conn,
-                spawn_fn=spawn_fn,
-                ttl_seconds=ttl_seconds,
-                dry_run=dry_run,
-                max_spawn=max_spawn,
-                max_in_progress=max_in_progress,
-                failure_limit=failure_limit,
-                stale_timeout_seconds=stale_timeout_seconds,
-                board=board,
-                default_assignee=default_assignee,
-                max_in_progress_per_profile=max_in_progress_per_profile,
-                reconcile_orphans=reconcile_orphans,
-            )
+            result = _dispatch_once_locked(conn, **kwargs)
             # Still under the dispatch lock: run the periodic PASSIVE WAL
             # checkpoint (see _maybe_checkpoint_wal; the -wal file size is
             # bounded by journal_size_limit on the writer's natural reset).
@@ -9912,6 +10224,7 @@ def _dispatch_once_locked(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
+    dispatch_allowed: Optional[Callable[[str], bool]] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick.
 
@@ -10192,6 +10505,18 @@ def _dispatch_once_locked(
             # of human-pulled work.
             result.skipped_nonspawnable.append(row["id"])
             continue
+        if dispatch_allowed is not None:
+            try:
+                if not dispatch_allowed(row_assignee):
+                    continue
+            except Exception:
+                # This optional policy must not turn a profile-resolution
+                # problem into a dispatcher outage; preserve legacy dispatch.
+                _log.debug(
+                    "kanban dispatch admission check failed for %s",
+                    row_assignee,
+                    exc_info=True,
+                )
         # Per-profile concurrency cap (#21582): even if there's global
         # headroom, refuse to spawn for an assignee that's already at
         # its in-flight cap. Prevents one profile's local model / API
@@ -10256,6 +10581,16 @@ def _dispatch_once_locked(
                 result.auto_blocked.append(claimed.id)
             continue
         # Persist the resolved workspace path so the worker can cd there.
+        try:
+            _preflight_workspace_for_spawn(conn, claimed, workspace)
+        except Exception as exc:
+            auto = _record_spawn_failure(
+                conn, claimed.id, f"workspace: {exc}",
+                failure_limit=failure_limit,
+            )
+            if auto:
+                result.auto_blocked.append(claimed.id)
+            continue
         set_workspace_path(conn, claimed.id, str(workspace))
         if claimed.workspace_kind == "worktree":
             set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
@@ -10340,6 +10675,18 @@ def _dispatch_once_locked(
         if profile_exists is not None and not profile_exists(row["assignee"]):
             result.skipped_nonspawnable.append(row["id"])
             continue
+        if dispatch_allowed is not None:
+            try:
+                if not dispatch_allowed(row["assignee"]):
+                    continue
+            except Exception:
+                # This optional policy must not turn a profile-resolution
+                # problem into a dispatcher outage; preserve legacy dispatch.
+                _log.debug(
+                    "kanban review dispatch admission check failed for %s",
+                    row["assignee"],
+                    exc_info=True,
+                )
         if _per_profile_cap is not None:
             current = _per_profile_running.get(row["assignee"], 0)
             if current >= _per_profile_cap:
@@ -10383,6 +10730,16 @@ def _dispatch_once_locked(
                 result.auto_blocked.append(claimed.id)
             continue
         # Persist the resolved workspace path so the worker can cd there.
+        try:
+            _preflight_workspace_for_spawn(conn, claimed, workspace)
+        except Exception as exc:
+            auto = _record_spawn_failure(
+                conn, claimed.id, f"workspace: {exc}",
+                failure_limit=failure_limit,
+            )
+            if auto:
+                result.auto_blocked.append(claimed.id)
+            continue
         set_workspace_path(conn, claimed.id, str(workspace))
         if claimed.workspace_kind == "worktree":
             set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
@@ -10773,6 +11130,8 @@ def _default_spawn(
     if task.tenant:
         env["HERMES_TENANT"] = task.tenant
     env["HERMES_KANBAN_TASK"] = task.id
+    if task.title:
+        env["HERMES_KANBAN_TASK_TITLE"] = task.title
     env["HERMES_KANBAN_WORKSPACE"] = workspace
     # Tag the worker's session so it lands in state.db as `kanban`, not as an
     # untitled `cli` row. A worker is a dispatcher-owned run whose transcript is
@@ -10869,6 +11228,8 @@ def _default_spawn(
             if sk:
                 cmd.extend(["--skills", sk])
     if task.model_override:
+        env["HERMES_MODEL"] = task.model_override
+        env["HERMES_INFERENCE_MODEL"] = task.model_override
         cmd.extend(["-m", task.model_override])
         # Pin the provider too when the override names one, so the worker
         # resolves the model against the intended backend instead of the
@@ -12090,6 +12451,17 @@ def latest_run(conn: sqlite3.Connection, task_id: str) -> Optional[Run]:
         (task_id,),
     ).fetchone()
     return Run.from_row(row) if row else None
+
+
+def active_run(conn: sqlite3.Connection, task_id: str) -> Optional[Run]:
+    """Return the currently active run for ``task_id``, if any."""
+    row = conn.execute(
+        "SELECT current_run_id FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if not row or row["current_run_id"] is None:
+        return None
+    return get_run(conn, int(row["current_run_id"]))
 
 
 def latest_summary(conn: sqlite3.Connection, task_id: str) -> Optional[str]:

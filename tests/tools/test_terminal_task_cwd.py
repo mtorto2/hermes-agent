@@ -3,6 +3,7 @@
 import json
 from types import SimpleNamespace
 
+import pytest
 import tools.terminal_tool as terminal_tool
 
 
@@ -41,6 +42,234 @@ def test_foreground_command_uses_registered_task_cwd_for_existing_environment(mo
 
     assert result["exit_code"] == 0
     assert calls == [("pwd", {"timeout": 60, "cwd": "/workspace/acp", "bounded_capture": True})]
+
+
+def test_session_docker_mount_is_passed_to_approval_guard(monkeypatch, tmp_path):
+    """A session-resolved host bind must disable Docker's approval fast path."""
+    seen_host_access = []
+
+    class FakeEnv:
+        env = {}
+
+        def execute(self, command, **kwargs):
+            return {"output": "ok", "returncode": 0}
+
+    task_id = "isolated-mounted-session"
+    config = {
+        "env_type": "docker",
+        "docker_image": "python:3.11",
+        "cwd": "/workspace",
+        "host_cwd": None,
+        "docker_mount_cwd_to_workspace": True,
+        "docker_volumes": [],
+        "timeout": 60,
+        "lifetime_seconds": 3600,
+    }
+    monkeypatch.setattr(terminal_tool, "_active_environments", {task_id: FakeEnv()})
+    monkeypatch.setattr(terminal_tool, "_last_activity", {})
+    monkeypatch.setattr(terminal_tool, "_task_env_overrides", {})
+    monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: config)
+    monkeypatch.setattr(terminal_tool, "_resolve_container_task_id", lambda value: value)
+    monkeypatch.setattr(terminal_tool, "_resolve_task_host_cwd", lambda *_args: str(tmp_path))
+    monkeypatch.setattr(terminal_tool, "_start_cleanup_thread", lambda: None)
+
+    def guard(_command, _env_type, **kwargs):
+        seen_host_access.append(kwargs["has_host_access"])
+        return {"approved": True}
+
+    monkeypatch.setattr(terminal_tool, "_check_all_guards", guard)
+
+    result = json.loads(terminal_tool.terminal_tool(command="pwd", task_id=task_id))
+
+    assert result["exit_code"] == 0
+    assert seen_host_access == [True]
+
+
+@pytest.mark.parametrize(
+    "volume_spec",
+    [r"\\server\share:/data", ".:/data", "..:/data"],
+)
+def test_configured_host_path_volume_is_passed_to_approval_guard(
+    monkeypatch, volume_spec,
+):
+    """Configured host-relative and UNC binds disable Docker's approval fast path."""
+    seen_host_access = []
+
+    class FakeEnv:
+        env = {}
+
+        def execute(self, command, **kwargs):
+            return {"output": "ok", "returncode": 0}
+
+    task_id = "unc-volume-terminal"
+    config = {
+        "env_type": "docker",
+        "docker_image": "python:3.11",
+        "cwd": "/root",
+        "host_cwd": None,
+        "docker_mount_cwd_to_workspace": False,
+        "docker_volumes": [volume_spec],
+        "timeout": 60,
+        "lifetime_seconds": 3600,
+    }
+    monkeypatch.setattr(terminal_tool, "_active_environments", {task_id: FakeEnv()})
+    monkeypatch.setattr(terminal_tool, "_last_activity", {})
+    monkeypatch.setattr(terminal_tool, "_task_env_overrides", {})
+    monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: config)
+    monkeypatch.setattr(terminal_tool, "_resolve_container_task_id", lambda value: value)
+    monkeypatch.setattr(terminal_tool, "_resolve_task_host_cwd", lambda *_args: None)
+    monkeypatch.setattr(terminal_tool, "_start_cleanup_thread", lambda: None)
+    monkeypatch.setattr(
+        terminal_tool,
+        "_check_all_guards",
+        lambda _command, _env_type, **kwargs: (
+            seen_host_access.append(kwargs["has_host_access"]) or {"approved": True}
+        ),
+    )
+
+    result = json.loads(terminal_tool.terminal_tool(command="pwd", task_id=task_id))
+
+    assert result["exit_code"] == 0
+    assert seen_host_access == [True]
+
+
+def test_mapping_docker_volume_is_passed_to_terminal_approval_guard(monkeypatch):
+    """Nonempty malformed volume configuration must disable the fast path."""
+    seen_host_access = []
+
+    class FakeEnv:
+        env = {}
+
+        def execute(self, command, **kwargs):
+            return {"output": "ok", "returncode": 0}
+
+    task_id = "mapping-volume-terminal"
+    config = {
+        "env_type": "docker",
+        "docker_image": "python:3.11",
+        "cwd": "/root",
+        "host_cwd": None,
+        "docker_mount_cwd_to_workspace": False,
+        "docker_volumes": {"./host:/data": True},
+        "timeout": 60,
+        "lifetime_seconds": 3600,
+    }
+    monkeypatch.setattr(terminal_tool, "_active_environments", {task_id: FakeEnv()})
+    monkeypatch.setattr(terminal_tool, "_last_activity", {})
+    monkeypatch.setattr(terminal_tool, "_task_env_overrides", {})
+    monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: config)
+    monkeypatch.setattr(terminal_tool, "_resolve_container_task_id", lambda value: value)
+    monkeypatch.setattr(terminal_tool, "_resolve_task_host_cwd", lambda *_args: None)
+    monkeypatch.setattr(terminal_tool, "_start_cleanup_thread", lambda: None)
+    monkeypatch.setattr(
+        terminal_tool,
+        "_check_all_guards",
+        lambda _command, _env_type, **kwargs: (
+            seen_host_access.append(kwargs["has_host_access"]) or {"approved": True}
+        ),
+    )
+
+    result = json.loads(terminal_tool.terminal_tool(command="pwd", task_id=task_id))
+
+    assert result["exit_code"] == 0
+    assert seen_host_access == [True]
+
+
+@pytest.mark.parametrize(
+    "docker_extra_args",
+    [
+        ["--shm-size", "4g"],
+        ["-v", "/host:/data"],
+        ["--volume=/host:/data"],
+        ["--mount", "type=bind,source=/host,target=/data"],
+    ],
+)
+def test_configured_docker_extra_args_disable_terminal_approval_fast_path(
+    monkeypatch, docker_extra_args,
+):
+    """Any custom Docker run args conservatively count as host-capable."""
+    seen_host_access = []
+
+    class FakeEnv:
+        env = {}
+
+        def execute(self, command, **kwargs):
+            return {"output": "ok", "returncode": 0}
+
+    task_id = "extra-args-terminal"
+    config = {
+        "env_type": "docker",
+        "docker_image": "python:3.11",
+        "cwd": "/root",
+        "host_cwd": None,
+        "docker_mount_cwd_to_workspace": False,
+        "docker_volumes": [],
+        "docker_extra_args": docker_extra_args,
+        "timeout": 60,
+        "lifetime_seconds": 3600,
+    }
+    monkeypatch.setattr(terminal_tool, "_active_environments", {task_id: FakeEnv()})
+    monkeypatch.setattr(terminal_tool, "_last_activity", {})
+    monkeypatch.setattr(terminal_tool, "_task_env_overrides", {})
+    monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: config)
+    monkeypatch.setattr(terminal_tool, "_resolve_container_task_id", lambda value: value)
+    monkeypatch.setattr(terminal_tool, "_resolve_task_host_cwd", lambda *_args: None)
+    monkeypatch.setattr(terminal_tool, "_start_cleanup_thread", lambda: None)
+    monkeypatch.setattr(
+        terminal_tool,
+        "_check_all_guards",
+        lambda _command, _env_type, **kwargs: (
+            seen_host_access.append(kwargs["has_host_access"]) or {"approved": True}
+        ),
+    )
+
+    result = json.loads(terminal_tool.terminal_tool(command="pwd", task_id=task_id))
+
+    assert result["exit_code"] == 0
+    assert seen_host_access == [True]
+
+
+def test_mapping_docker_extra_args_disable_terminal_approval_fast_path(monkeypatch):
+    """Mapping keys forwarded as Docker flags must disable the fast path."""
+    seen_host_access = []
+
+    class FakeEnv:
+        env = {}
+
+        def execute(self, command, **kwargs):
+            return {"output": "ok", "returncode": 0}
+
+    task_id = "mapping-extra-terminal"
+    config = {
+        "env_type": "docker",
+        "docker_image": "python:3.11",
+        "cwd": "/root",
+        "host_cwd": None,
+        "docker_mount_cwd_to_workspace": False,
+        "docker_volumes": [],
+        "docker_extra_args": {"--privileged": True},
+        "timeout": 60,
+        "lifetime_seconds": 3600,
+    }
+    monkeypatch.setattr(terminal_tool, "_active_environments", {task_id: FakeEnv()})
+    monkeypatch.setattr(terminal_tool, "_last_activity", {})
+    monkeypatch.setattr(terminal_tool, "_task_env_overrides", {})
+    monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: config)
+    monkeypatch.setattr(terminal_tool, "_resolve_container_task_id", lambda value: value)
+    monkeypatch.setattr(terminal_tool, "_resolve_task_host_cwd", lambda *_args: None)
+    monkeypatch.setattr(terminal_tool, "_start_cleanup_thread", lambda: None)
+    monkeypatch.setattr(
+        terminal_tool,
+        "_check_all_guards",
+        lambda _command, _env_type, **kwargs: (
+            seen_host_access.append(kwargs["has_host_access"]) or {"approved": True}
+        ),
+    )
+
+    result = json.loads(terminal_tool.terminal_tool(command="pwd", task_id=task_id))
+
+    assert result["exit_code"] == 0
+    assert seen_host_access == [True]
 
 
 def test_explicit_workdir_still_wins_over_registered_task_cwd(monkeypatch):
@@ -217,7 +446,7 @@ def test_host_local_background_command_bypasses_configured_backend(tmp_path, mon
     monkeypatch.setattr(terminal_tool, "_task_env_overrides", {})
     monkeypatch.setattr(terminal_tool, "_start_cleanup_thread", lambda: None)
     monkeypatch.setattr(terminal_tool, "_resolve_container_task_id", lambda value: value)
-    monkeypatch.setattr(terminal_tool, "_docker_has_host_access", lambda config: False)
+    monkeypatch.setattr(terminal_tool, "_docker_has_host_access", lambda *_args: False)
     monkeypatch.setattr(
         terminal_tool,
         "_check_all_guards",

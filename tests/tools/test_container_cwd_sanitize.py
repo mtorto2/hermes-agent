@@ -36,6 +36,100 @@ class TestIsUnusableContainerCwd:
             {"docker", "singularity", "modal", "daytona", "vercel_sandbox"}
         )
 
+    def test_posix_host_roots_rejected(self):
+        for host_root in ("/Users", "/home"):
+            assert tt._is_unusable_container_cwd(host_root) is True
+
+    def test_drive_and_unc_paths_ignore_host_os_absolute_semantics(self, monkeypatch):
+        """Container classification is Linux-sandbox policy, not host policy."""
+        host_paths = (r"D:\work", "E:/data", r"\\server\share")
+        original_isabs = tt.os.path.isabs
+        monkeypatch.setattr(
+            tt.os.path,
+            "isabs",
+            lambda candidate: candidate in host_paths or original_isabs(candidate),
+        )
+        for host_path in host_paths:
+            assert tt._is_unusable_container_cwd(host_path) is True
+
+
+class TestConfiguredContainerCwd:
+    def test_drive_path_falls_back_when_host_os_calls_it_absolute(self, monkeypatch):
+        """The shared classifier also protects TERMINAL_CWD-derived config."""
+        host_path = r"D:\work"
+        original_isabs = tt.os.path.isabs
+        monkeypatch.setattr(
+            tt.os.path,
+            "isabs",
+            lambda candidate: candidate == host_path or original_isabs(candidate),
+        )
+        monkeypatch.setenv("TERMINAL_ENV", "modal")
+        monkeypatch.setenv("TERMINAL_CWD", host_path)
+        assert tt._get_env_config()["cwd"] == "/root"
+
+    def test_failed_docker_mount_request_still_sanitizes_host_cwd(self, monkeypatch):
+        """Mounting earns /workspace only after the host root is valid."""
+        host_path = r"D:\missing"
+        original_abspath = tt.os.path.abspath
+        original_isabs = tt.os.path.isabs
+        original_isdir = tt.os.path.isdir
+        monkeypatch.setattr(
+            tt.os.path,
+            "abspath",
+            lambda candidate: host_path if candidate == host_path else original_abspath(candidate),
+        )
+        monkeypatch.setattr(
+            tt.os.path,
+            "isabs",
+            lambda candidate: candidate == host_path or original_isabs(candidate),
+        )
+        monkeypatch.setattr(
+            tt.os.path,
+            "isdir",
+            lambda candidate: False if candidate == host_path else original_isdir(candidate),
+        )
+        monkeypatch.setenv("TERMINAL_ENV", "docker")
+        monkeypatch.setenv("TERMINAL_CWD", host_path)
+        monkeypatch.setenv("TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE", "true")
+        config = tt._get_env_config()
+        assert config["host_cwd"] is None
+        assert config["cwd"] == "/root"
+
+    def test_invalid_prefix_matched_mount_candidates_fall_back(self, monkeypatch):
+        """A familiar host prefix is not evidence that Docker can bind it."""
+        host_paths = ("/Users/missing", r"C:\missing")
+        original_abspath = tt.os.path.abspath
+        original_isabs = tt.os.path.isabs
+        original_isdir = tt.os.path.isdir
+        monkeypatch.setattr(
+            tt.os.path,
+            "abspath",
+            lambda candidate: candidate if candidate in host_paths else original_abspath(candidate),
+        )
+        monkeypatch.setattr(
+            tt.os.path,
+            "isabs",
+            lambda candidate: candidate in host_paths or original_isabs(candidate),
+        )
+        monkeypatch.setattr(
+            tt.os.path,
+            "isdir",
+            lambda candidate: False if candidate in host_paths else original_isdir(candidate),
+        )
+        monkeypatch.setenv("TERMINAL_ENV", "docker")
+        monkeypatch.setenv("TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE", "true")
+        for host_path in host_paths:
+            monkeypatch.setenv("TERMINAL_CWD", host_path)
+            config = tt._get_env_config()
+            assert config["host_cwd"] is None
+            assert config["cwd"] == "/root"
+
+    def test_exact_posix_host_roots_fall_back_in_container_config(self, monkeypatch):
+        monkeypatch.setenv("TERMINAL_ENV", "modal")
+        for host_root in ("/Users", "/home"):
+            monkeypatch.setenv("TERMINAL_CWD", host_root)
+            assert tt._get_env_config()["cwd"] == "/root"
+
 
 class TestOverrideCwdSanitizedAtCallSite:
     """E2E pin: a per-task cwd OVERRIDE that is a host path must NOT reach the

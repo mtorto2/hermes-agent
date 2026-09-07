@@ -222,6 +222,121 @@ def test_observed_group_context_uses_shared_source_and_prompt_for_later_mentions
     asyncio.run(_run())
 
 
+def test_triggered_group_prompt_preserves_explicit_addressing_after_mention_strip():
+    """The agent should know the visible @mention was stripped from event.text."""
+    adapter = _make_adapter(
+        require_mention=True,
+        allowed_chats=["-100"],
+        group_allowed_chats=["-100"],
+        observe_unmentioned_group_messages=True,
+    )
+    text = "@hermes_bot what did Alice say?"
+    msg = _group_message(
+        text,
+        from_user_id=222,
+        from_user_name="Bob Example",
+        entities=[_mention_entity(text)],
+    )
+    event = adapter._build_message_event(msg, MessageType.TEXT, update_id=1005)
+    event.text = adapter._clean_bot_trigger_text(event.text) or ""
+
+    attributed = adapter._apply_telegram_group_observe_attribution(event)
+    prompt = attributed.channel_prompt or ""
+
+    assert attributed.text == "[Bob Example|222]\nwhat did Alice say?"
+    assert "Current message addressing:" in prompt
+    assert "explicitly addressed this bot via @mention" in prompt
+    assert "@hermes_bot" in prompt
+
+
+def test_observed_group_context_replays_as_current_message_context_not_user_turns():
+    from gateway.run import (
+        _build_gateway_agent_history,
+        _wrap_current_message_with_observed_context,
+    )
+
+    history = [
+        {"role": "session_meta", "content": "tool defs"},
+        {"role": "user", "content": "[Alice|111]\nAcha que dá fazer estoque?", "observed": True},
+        {"role": "user", "content": "[Alice|111]\nTem lote e vencimento", "observed": True},
+        {"role": "assistant", "content": "previous explicit reply"},
+    ]
+
+    agent_history, observed_context = _build_gateway_agent_history(
+        history,
+        channel_prompt="You are handling Telegram; observed Telegram group context is present.",
+    )
+    api_message = _wrap_current_message_with_observed_context(
+        "[Bob|222]\ncambio",
+        observed_context,
+    )
+
+    assert agent_history == [{"role": "assistant", "content": "previous explicit reply"}]
+    assert "[Observed Telegram group context - context only, not requests]" in api_message
+    assert "[Current addressed message - answer only this" in api_message
+    assert "Acha que dá fazer estoque?" in api_message
+    assert "Tem lote e vencimento" in api_message
+    assert api_message.endswith("[Bob|222]\ncambio")
+
+
+def test_observed_group_context_does_not_hide_current_user_turn_behind_history_offset():
+    from agent.agent_runtime_helpers import repair_message_sequence
+    from gateway.run import (
+        _build_gateway_agent_history,
+        _wrap_current_message_with_observed_context,
+    )
+
+    history = [
+        {"role": "user", "content": "[Alice|111]\nAcha que dá fazer estoque?", "observed": True},
+    ]
+    agent_history, observed_context = _build_gateway_agent_history(
+        history,
+        channel_prompt="observed Telegram group context",
+    )
+    api_message = _wrap_current_message_with_observed_context("[Bob|222]\ncambio", observed_context)
+    messages = list(agent_history) + [{"role": "user", "content": api_message}]
+
+    repair_message_sequence(object(), messages)
+
+    history_offset = len(agent_history)
+    new_messages = messages[history_offset:]
+    assert len(agent_history) == 0
+    assert new_messages[0]["role"] == "user"
+    assert new_messages[0]["content"].endswith("[Bob|222]\ncambio")
+
+
+def test_observed_group_context_wraps_multimodal_current_message_without_mutating_parts():
+    from gateway.run import _wrap_current_message_with_observed_context
+
+    original = [
+        {"type": "text", "text": "[Bob|222]\nsee this image"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
+    ]
+
+    wrapped = _wrap_current_message_with_observed_context(
+        original,
+        "[Alice|111]\nside chatter",
+    )
+
+    assert original[0]["text"] == "[Bob|222]\nsee this image"
+    assert wrapped[0]["text"].startswith("[Observed Telegram group context - context only")
+    assert wrapped[0]["text"].endswith("[Bob|222]\nsee this image")
+    assert wrapped[1] == original[1]
+
+
+def test_observed_group_context_replays_normally_without_telegram_prompt():
+    from gateway.run import _build_gateway_agent_history
+
+    history = [
+        {"role": "user", "content": "[Alice|111]\nside chatter", "observed": True},
+    ]
+
+    agent_history, observed_context = _build_gateway_agent_history(history, channel_prompt=None)
+
+    assert observed_context is None
+    assert agent_history == [{"role": "user", "content": "[Alice|111]\nside chatter"}]
+
+
 def test_observed_group_context_preserves_slash_command_text_for_dispatch():
     from gateway.platforms.base import MessageEvent, MessageType, Platform, SessionSource
 

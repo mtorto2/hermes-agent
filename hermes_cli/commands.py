@@ -177,6 +177,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
                subcommands=("new", "list", "prune")),
     CommandDef("compress", "Compress conversation context (add 'here [N]' to keep recent N turns; --preview shows what would happen)", "Session",
                aliases=("compact",), args_hint="[here [N] | focus topic | --preview|--dry-run]"),
+    CommandDef("nah", "Summarize the previous assistant reply as briefly as possible", "Session",
+               aliases=("tldr", "tl-dr", "tl_dr"), args_hint="[style]"),
     CommandDef("rollback", "List or restore filesystem checkpoints (restores keep your hand-edits; --all overrides)", "Session",
                args_hint="[number] [--all]"),
     CommandDef("snapshot", "Create or restore state snapshots of Hermes config/state", "Session",
@@ -207,8 +209,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
                "Session", aliases=("learning", "memory-graph"), cli_only=True,
                args_hint="[list|delete <id>|edit <id>]",
                subcommands=("list", "delete", "edit")),
-    CommandDef("queue", "Queue a prompt for the next turn (doesn't interrupt)", "Session",
-               aliases=("q",), args_hint="<prompt>",
+    CommandDef("queue", "Queue a prompt for the next turn, or delete a queued prompt", "Session",
+               aliases=("q",), args_hint="<prompt>|delete [number]",
                busy_policy="dispatch", busy_handler="queue"),
     CommandDef("steer", "Inject a message after the next tool call without interrupting", "Session",
                args_hint="<prompt>", busy_policy="dispatch", busy_handler="steer"),
@@ -235,6 +237,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
                args_hint="[text | remove N | clear]", busy_policy="dispatch"),
     CommandDef("status", "Show session, model, token, and context info", "Session",
                busy_policy="dispatch"),
+    CommandDef("repos", "Show local git repository status", "Info",
+               aliases=("repo-status", "gitstatus"), args_hint="[all] [--paths]"),
     CommandDef("egress", "Show Docker egress proxy status", "Session",
                args_hint="[status]", subcommands=("status",),
                busy_policy="dispatch", busy_handler="egress",
@@ -358,7 +362,7 @@ COMMAND_REGISTRY: list[CommandDef] = [
                desktop="advanced"),
     CommandDef("kanban", "Multi-profile collaboration board (tasks, links, comments)",
                "Tools & Skills", args_hint="[subcommand]",
-               subcommands=("init", "boards", "create", "list", "ls", "show", "assign",
+               subcommands=("init", "boards", "board", "create", "list", "ls", "show", "assign",
                             "reclaim", "reassign", "diagnostics", "diag", "link", "unlink",
                             "claim", "comment", "complete", "edit", "block", "unblock",
                             "archive", "tail", "dispatch", "stats", "notify-subscribe",
@@ -1448,6 +1452,8 @@ _SLACK_PRIORITY_ALIASES: tuple[str, ...] = ()
 #     displacing existing native Slack slash commands at the 50-command cap.
 #   - debug: the log/report upload surface; reached via /hermes debug on Slack.
 #   - egress: Docker-only proxy status; reachable as /hermes egress on Slack.
+#   - repos: local working-tree status; reachable as /hermes repos on Slack
+#     so the command-cap priority keeps the Matt-native /nah slot available.
 #   - init: repo-scan AGENTS.md bootstrap — a cwd-centric dev command that is
 #     rare from Slack; reachable as /hermes init. Without this entry, adding
 #     /init clamps /version off the native list and breaks Telegram parity.
@@ -1461,6 +1467,10 @@ _SLACK_PRIORITY_ALIASES: tuple[str, ...] = ()
 #     /hermes update on Slack. Demoted to free the native slot /approvals now
 #     claims — without this entry /approvals tips the registry past the 50-cap
 #     and silently clamps /update off, breaking Telegram parity.
+#   - repos: local working-tree status; reached via /hermes repos on Slack
+#     so the command-cap priority keeps the Matt-native /nah slot available.
+#   - platform: setup/maintenance command; reached via /hermes platform so the
+#     native list stays at Slack's 50-command cap without silently losing it.
 #   - heartbeat: session heartbeat management; reached via /hermes heartbeat
 #     on Slack. Added at the 50-cap — a native slot would clamp /insights.
 #   - refine: on-demand memory/skill review; reached via /hermes refine on
@@ -1478,7 +1488,7 @@ _SLACK_PRIORITY_ALIASES: tuple[str, ...] = ()
 #     (session export is an interactive surface; platform is a rare
 #     informational lookup) — without this entry /save tips the registry
 #     past the 50-cap and silently clamps /platform, breaking parity.
-_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update", "heartbeat", "refine", "review", "pause", "whoami", "platform", "insights"})
+_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "repos", "init", "version", "diff", "update", "heartbeat", "refine", "review", "pause", "whoami", "platform", "usage", "insights"})
 
 
 def _sanitize_slack_name(raw: str) -> str:
@@ -1537,6 +1547,14 @@ def slack_native_slashes() -> list[tuple[str, str, str]]:
         entries.append((slack_name, desc[:140], hint[:100]))
         seen.add(slack_name)
 
+    # Slack only allows 50 slash commands per app. Keep parity with the
+    # curated Telegram menu first, then reserve the few Matt-critical aliases
+    # that are faster than their canonical forms. Everything else remains
+    # reachable through /hermes <command>.
+    telegram_priority = [name for name, _desc in telegram_bot_commands()]
+    telegram_norm_priority = {name.replace("_", "-") for name in telegram_priority}
+    priority_aliases = ("reset", "bg", "btw", "q")
+
     # Priority pass: pin high-value aliases (e.g. /btw, /bg, /reset) ahead of
     # everything except /hermes, so a new canonical command can never silently
     # clamp them off the 50-slash cap. Each alias borrows its parent command's
@@ -1556,18 +1574,25 @@ def slack_native_slashes() -> list[tuple[str, str, str]]:
     for cmd in COMMAND_REGISTRY:
         if not _is_gateway_available(cmd, overrides):
             continue
-        _add(cmd.name, cmd.description, cmd.args_hint or "")
+        if _sanitize_telegram_name(cmd.name) in telegram_priority or cmd.name in telegram_norm_priority:
+            _add(cmd.name, cmd.description, cmd.args_hint or "")
 
-    # Second pass: aliases.
+    for alias in priority_aliases:
+        cmd = resolve_command(alias)
+        if not cmd or not _is_gateway_available(cmd, overrides):
+            continue
+        _add(alias, f"Alias for /{cmd.name} — {cmd.description}", cmd.args_hint or "")
+
+    # Fill any remaining slots with other aliases, canonical commands, then
+    # plugins. This normally only runs if Slack raises its cap or the curated
+    # Telegram menu shrinks.
     for cmd in COMMAND_REGISTRY:
         if not _is_gateway_available(cmd, overrides):
             continue
         for alias in cmd.aliases:
-            # Skip aliases that only differ from canonical by case/punctuation
-            # normalization (already covered by _add dedup).
             _add(alias, f"Alias for /{cmd.name} — {cmd.description}", cmd.args_hint or "")
+        _add(cmd.name, cmd.description, cmd.args_hint or "")
 
-    # Third pass: plugin commands.
     for name, description, args_hint in _iter_plugin_command_entries():
         _add(name, description, args_hint or "")
 

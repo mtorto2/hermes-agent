@@ -822,8 +822,9 @@ describe('createGatewayEventHandler', () => {
       light_colors: { banner_title: '#8B0000', banner_text: '#22201C' }
     }
 
-    // Dark terminal (clean env): the dark-authored `colors` block wins.
-    vi.stubEnv('HERMES_TUI_BACKGROUND', '')
+    // Dark terminal: make the host polarity explicit rather than relying on
+    // the machine's macOS appearance fallback.
+    vi.stubEnv('HERMES_TUI_BACKGROUND', '#1e1e1e')
     createGatewayEventHandler(buildCtx(appended))({ payload: skin, type: 'skin.changed' } as any)
     expect(getUiState().theme.color.primary).toBe('#00FF88')
 

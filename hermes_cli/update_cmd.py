@@ -6599,8 +6599,6 @@ def _service_unit_supports_graceful_sigusr1_restart(svc_name: str) -> bool:
 
 def _warn_incomplete_gateway_fleet_restart(failed_units: list) -> None:
     """Print an explicit incomplete-update warning for unrestarted units."""
-    from hermes_cli.gateway import is_macos
-
     if not failed_units:
         return
     # Preserve discovery order while de-duplicating.
@@ -6615,26 +6613,19 @@ def _warn_incomplete_gateway_fleet_restart(failed_units: list) -> None:
     print("⚠ Update incomplete — some units were not restarted:")
     for name in ordered:
         print(f"    - {name}")
-    if is_macos():
-        # A launchd label reaches this list when launchd was not supervising a
-        # live process after the restart (#88848), so the unit is not merely
-        # stale — it is very likely deregistered, and `launchctl kickstart`
-        # cannot revive a job launchd no longer knows about.
-        print("  Listed services may be deregistered from launchd, or still")
-        print("  running pre-update code (mixed sys.modules). Recover with:")
-        print("    hermes gateway status")
-        print("    launchctl list | grep <label>")
-        print("    launchctl bootstrap gui/$(id -u) "
-              "~/Library/LaunchAgents/<label>.plist")
-        return
     print("  Skipped units may still be running pre-update code (mixed")
     print("  sys.modules). Restart them manually, then verify:")
     print("    hermes gateway status")
-    if any(not name.startswith("ai.hermes.") for name in ordered):
+    has_launchd_labels = any(name.startswith("ai.hermes.") for name in ordered)
+    has_systemd_units = any(not name.startswith("ai.hermes.") for name in ordered)
+    if has_launchd_labels:
+        print("    launchctl list | grep <label>")
+        print("    launchctl kickstart -k gui/$UID/<label>   # macOS (or user/$UID)")
+        print("    launchctl bootstrap gui/$(id -u) "
+              "~/Library/LaunchAgents/<label>.plist  # if deregistered")
+    if has_systemd_units:
         print("    systemctl --user restart <unit>   # user-scope")
         print("    sudo systemctl restart <unit>     # system-scope")
-    if any(name.startswith("ai.hermes.") for name in ordered):
-        print("    launchctl kickstart -k gui/$UID/<label>   # macOS (or user/$UID)")
 
 
 def _restart_launchd_gateway_after_update(
@@ -7530,9 +7521,9 @@ def _normalize_managed_eol(git_cmd, repo_root):
     # persisting anything we might not be able to follow through on.
     probe = git_cmd + ["-c", "core.autocrlf=false"]
 
-    def _dirty(*extra):
+    def _dirty():
         out = subprocess.run(
-            probe + ["diff", "-z", "--name-only", *extra],
+            probe + ["diff", "-z", "--name-only"],
             cwd=repo_root,
             capture_output=True,
             text=True, encoding="utf-8", errors="replace",
@@ -7548,10 +7539,11 @@ def _normalize_managed_eol(git_cmd, repo_root):
         # the CR filter is applied), so it cannot be used to isolate real
         # edits. ``--numstat`` does honor the filter: a CR-only file produces
         # no numstat record, while a genuinely-edited file does. Parse the
-        # paths out of numstat instead.
+        # paths out of NUL-delimited numstat records instead, preserving tabs
+        # in a filename.
         out = subprocess.run(
             probe + ["-c", "core.quotepath=false",
-                     "diff", "--numstat", "--ignore-cr-at-eol"],
+                     "diff", "--numstat", "-z", "--ignore-cr-at-eol"],
             cwd=repo_root,
             capture_output=True,
             text=True, encoding="utf-8", errors="replace",
@@ -7559,12 +7551,12 @@ def _normalize_managed_eol(git_cmd, repo_root):
         if out.returncode != 0:
             return None
         paths = set()
-        for line in out.stdout.splitlines():
-            if not line.strip():
+        for record in out.stdout.split("\0"):
+            if not record:
                 continue
-            # Format: "<added>\t<deleted>\t<path>". Rename detection is off in
-            # plain diff, so there is exactly one path field per record.
-            parts = line.split("\t", 2)
+            # Format: "<added>\t<deleted>\t<path><NUL>". Rename detection is
+            # off in plain diff, so there is exactly one path field per record.
+            parts = record.split("\t", 2)
             if len(parts) == 3 and parts[2]:
                 paths.add(parts[2])
         return paths
@@ -7593,11 +7585,26 @@ def _normalize_managed_eol(git_cmd, repo_root):
         if eol_only:
             # Pathspec over stdin, not argv: a fully renormalized checkout is
             # thousands of paths, well past the Windows command-line limit.
-            subprocess.run(
+            restore = subprocess.run(
                 probe
                 + ["checkout", "--pathspec-from-file=-", "--pathspec-file-nul", "--"],
                 cwd=repo_root,
                 input="\0".join(sorted(eol_only)),
+                capture_output=True,
+                text=True, encoding="utf-8", errors="replace",
+                check=False,
+            )
+            if restore.returncode != 0:
+                return
+            # A normal checkout can retain the pre-pin stat-cache entry and
+            # decide the CRLF worktree bytes need no rewrite. Force a write of
+            # the already-classified index blobs instead. This is deliberately
+            # limited to ``eol_only`` paths, so genuine local edits are never
+            # overwritten.
+            subprocess.run(
+                probe + ["checkout-index", "--force", "--stdin", "-z"],
+                cwd=repo_root,
+                input="\0".join(sorted(eol_only)) + "\0",
                 capture_output=True,
                 text=True, encoding="utf-8", errors="replace",
                 check=False,

@@ -3,44 +3,81 @@ import { atom, computed } from 'nanostores'
 import { MOUSE_TRACKING } from '../config/env.js'
 import { ZERO } from '../domain/usage.js'
 import { bootTheme } from '../lib/themeBoot.js'
-import { DEFAULT_THEME } from '../theme.js'
+import { DEFAULT_THEME, fromSkin } from '../theme.js'
 
 import { DEFAULT_INDICATOR_STYLE, type UiState } from './interfaces.js'
 
-const buildUiState = (): UiState => ({
-  battery: false,
-  batteryStatus: null,
-  bgTasks: new Set(),
-  busy: false,
-  busyInputMode: 'queue',
-  compact: false,
-  compacting: false,
-  destructiveSlashConfirm: true,
-  detailsMode: 'collapsed',
-  detailsModeCommandOverride: false,
-  focusView: false,
-  indicatorStyle: DEFAULT_INDICATOR_STYLE,
-  info: null,
-  liveSessionCount: 0,
-  inlineDiffs: true,
-  mouseTracking: MOUSE_TRACKING,
-  notice: null,
-  pasteCollapseLines: 5,
-  pasteCollapseChars: 2000,
-  sections: {},
-  sessionTitle: '',
-  showReasoning: false,
-  sid: null,
-  status: 'summoning hermes…',
-  statusBar: 'top',
-  statusBarFields: null,
-  streaming: true,
-  timestamps: false,
-  // Last session's resolved theme paints frame one (flash-free boot, like
-  // the desktop's hermes-boot-* keys); DEFAULT_THEME only on first launch.
-  theme: bootTheme ?? DEFAULT_THEME,
-  usage: ZERO
-})
+// The profile launcher supplies an exact serialized skin. It must win over a
+// prior terminal boot cache so profiles cannot briefly inherit another
+// profile's brand. The cache remains the flash-free fallback for ordinary
+// launches without an explicit skin (like the desktop's hermes-boot-* keys);
+// DEFAULT_THEME only on first launch.
+const initialTheme = () => {
+  const raw = process.env.HERMES_TUI_INITIAL_SKIN
+
+  if (!raw) {
+    return bootTheme ?? DEFAULT_THEME
+  }
+
+  try {
+    const skin = JSON.parse(raw) as {
+      banner_hero?: string
+      banner_logo?: string
+      branding?: Record<string, string>
+      colors?: Record<string, string>
+      help_header?: string
+      tool_prefix?: string
+    }
+
+    return fromSkin(
+      skin.colors ?? {},
+      skin.branding ?? {},
+      skin.banner_logo ?? '',
+      skin.banner_hero ?? '',
+      skin.tool_prefix ?? '',
+      skin.help_header ?? ''
+    )
+  } catch {
+    return bootTheme ?? DEFAULT_THEME
+  }
+}
+
+const buildUiState = (): UiState => {
+  const theme = initialTheme()
+
+  return {
+    battery: false,
+    batteryStatus: null,
+    bgTasks: new Set(),
+    busy: false,
+    busyInputMode: 'queue',
+    compact: false,
+    compacting: false,
+    destructiveSlashConfirm: true,
+    detailsMode: 'collapsed',
+    detailsModeCommandOverride: false,
+    focusView: false,
+    indicatorStyle: DEFAULT_INDICATOR_STYLE,
+    info: null,
+    liveSessionCount: 0,
+    inlineDiffs: true,
+    mouseTracking: MOUSE_TRACKING,
+    notice: null,
+    pasteCollapseLines: 5,
+    pasteCollapseChars: 2000,
+    sections: {},
+    sessionTitle: '',
+    showReasoning: false,
+    sid: null,
+    status: `summoning ${theme.brand.name.toLowerCase()}…`,
+    statusBar: 'top',
+    statusBarFields: null,
+    streaming: true,
+    timestamps: false,
+    theme,
+    usage: ZERO
+  }
+}
 
 export const $uiState = atom<UiState>(buildUiState())
 

@@ -7,8 +7,8 @@
 // blocks stay attribute-free (the plaintext CSS owns them). jsdom does not
 // resolve dir="auto", so the contract is asserted at the attribute level.
 import { AssistantRuntimeProvider, type ThreadMessage, useExternalStoreRuntime } from '@assistant-ui/react'
-import { render, screen } from '@testing-library/react'
-import { describe, expect, it } from 'vitest'
+import { cleanup, render, screen } from '@testing-library/react'
+import { afterEach, describe, expect, it } from 'vitest'
 
 import { stubThreadEnvironment, stubThreadViewportSize } from '../test-utils'
 
@@ -18,6 +18,10 @@ const createdAt = new Date('2026-06-01T00:00:00.000Z')
 stubThreadEnvironment()
 
 stubThreadViewportSize()
+
+afterEach(() => {
+  cleanup()
+})
 
 function userMessage(): ThreadMessage {
   return {

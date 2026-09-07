@@ -266,9 +266,16 @@ class HostSupervisor:
             raise
         return request_id
 
-    def interrupt(self, sid: str, *, request_id: str | None = None) -> None:
+    def interrupt(self, sid: str, *, request_id: str | None = None,
+                  target_turn_id: str | None = None) -> None:
         self.start()
-        self._send_frame({"type": "interrupt", "sid": sid, "request_id": request_id or uuid.uuid4().hex})
+        self._send_frame({"type": "interrupt", "sid": sid, "request_id": request_id or uuid.uuid4().hex,
+                          **({"target_turn_id": target_turn_id} if target_turn_id is not None else {})})
+
+    def ack_notification(self, sid: str, proposal_id: str, turn_id: str) -> None:
+        """Confirm a delivery receipt without blocking the host reader thread."""
+        self._send_frame({"type": "notification.received", "sid": sid,
+                          "id": proposal_id, "turn_id": turn_id})
 
     def respond(self, sid: str, params: dict[str, Any], *, timeout: float = 15.0) -> dict:
         """Deliver an interactive prompt response to the host that owns it."""

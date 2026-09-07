@@ -66,14 +66,25 @@ def _canonical_root() -> Path:
         return Path(os.path.expanduser("~/.hermes"))
 
 
-def sentinel_path() -> Path:
-    """Path of the ESTOP sentinel this process would write on `hermes pause`."""
-    return _hermes_home() / SENTINEL_NAME
+def sentinel_path(home: Optional[Path | str] = None) -> Path:
+    """Path of the ESTOP sentinel under *home* or the active HERMES_HOME.
+
+    This is the sentinel `hermes pause` writes; reads additionally consult
+    the fleet root (see :func:`_candidate_sentinel_paths`).
+    """
+    return Path(home) / SENTINEL_NAME if home is not None else _hermes_home() / SENTINEL_NAME
 
 
-def _candidate_sentinel_paths() -> list:
-    """Profile home first, then the fleet root if it is a different directory."""
-    primary = sentinel_path()
+def _candidate_sentinel_paths(home: Optional[Path | str] = None) -> list:
+    """Profile home first, then the fleet root if it is a different directory.
+
+    *home* selects an explicit profile (a Kanban dispatcher checking the
+    assignee's pause); the fleet root is always appended so an operator's
+    ``hermes pause`` binds every profile.
+    """
+    # Call with no argument when unscoped so test doubles that replace
+    # ``sentinel_path`` with a zero-arg callable keep working.
+    primary = sentinel_path(home) if home is not None else sentinel_path()
     paths = [primary]
     try:
         root = _canonical_root() / SENTINEL_NAME
@@ -90,15 +101,15 @@ def _candidate_sentinel_paths() -> list:
     return paths
 
 
-def is_engaged() -> bool:
-    """Cheap check: is the global emergency stop engaged?
+def is_engaged(home: Optional[Path | str] = None) -> bool:
+    """Cheap check: is the emergency stop engaged for *home*?
 
-    Engaged if ANY candidate sentinel exists: the process HERMES_HOME
-    (profile-local) or the fleet canonical root (~/.hermes). Fail SAFE on
-    stat errors so an unreadable sentinel still holds the pause.
+    Engaged if ANY candidate sentinel exists: the profile home (*home*, or
+    the process HERMES_HOME) or the fleet canonical root (~/.hermes). Fail
+    SAFE on stat errors so an unreadable sentinel still holds the pause.
     """
     saw_stat_error = False
-    for path in _candidate_sentinel_paths():
+    for path in _candidate_sentinel_paths(home):
         try:
             if path.exists():
                 return True
@@ -107,9 +118,9 @@ def is_engaged() -> bool:
     return saw_stat_error
 
 
-def engage(reason: Optional[str] = None) -> Path:
-    """Create the ESTOP sentinel. Idempotent; re-engaging updates the file."""
-    path = sentinel_path()
+def engage(reason: Optional[str] = None, *, home: Optional[Path | str] = None) -> Path:
+    """Create the ESTOP sentinel for *home*; re-engaging updates the file."""
+    path = sentinel_path(home)
     payload = {
         "engaged_at": datetime.now(timezone.utc).isoformat(),
         "reason": reason or None,
@@ -126,37 +137,35 @@ def engage(reason: Optional[str] = None) -> Path:
     return path
 
 
-def disengage() -> bool:
-    """Remove ESTOP sentinels this process can see.
+def disengage(*, home: Optional[Path | str] = None) -> bool:
+    """Remove only the ESTOP sentinel selected by *home*.
 
-    Lifts both the process-local sentinel and the fleet-root sentinel so
-    ``hermes resume`` from a profile gateway still clears an operator pause
-    written at ~/.hermes/ESTOP.
+    A profile-scoped resume may lift its own pause, but it never clears the
+    fleet-root sentinel.  Calling without *home* targets the active
+    HERMES_HOME, which is the fleet root for the root operator.
     """
-    lifted = False
-    for path in _candidate_sentinel_paths():
-        try:
-            path.unlink()
-            lifted = True
-        except FileNotFoundError:
-            continue
-        except (OSError, AttributeError):
-            continue
-    return lifted
+    path = sentinel_path(home) if home is not None else sentinel_path()
+    try:
+        path.unlink()
+        return True
+    except FileNotFoundError:
+        return False
+    except OSError:
+        # If removal fails, pause remains engaged.  Caller reports failure.
+        return False
 
-
-def get_state() -> Optional[dict]:
+def get_state(home: Optional[Path | str] = None) -> Optional[dict]:
     """Return ``{"reason": ..., "engaged_at": ...}`` or None when not engaged.
 
     A sentinel with an unreadable/corrupt body still reports engaged, with
     both fields None — the pause is authoritative, the metadata is not.
     """
-    if not is_engaged():
+    if not is_engaged(home):
         return None
     reason = None
     engaged_at = None
     found = False
-    for path in _candidate_sentinel_paths():
+    for path in _candidate_sentinel_paths(home):
         try:
             exists = path.exists()
         except OSError:
@@ -179,9 +188,9 @@ def get_state() -> Optional[dict]:
     return {"reason": reason, "engaged_at": engaged_at}
 
 
-def paused_reply() -> Optional[str]:
+def paused_reply(home: Optional[Path | str] = None) -> Optional[str]:
     """Short user-facing notice for new gateway turns, or None if not paused."""
-    state = get_state()
+    state = get_state(home)
     if state is None:
         return None
     reason = state.get("reason")
@@ -196,14 +205,19 @@ def paused_reply() -> Optional[str]:
     )
 
 
-def check_paused(component: str, logger: logging.Logger) -> bool:
+def check_paused(
+    component: str,
+    logger: logging.Logger,
+    *,
+    home: Optional[Path | str] = None,
+) -> bool:
     """Return True when engaged, logging once per engagement per component.
 
     Dispatch loops call this every tick; the log fires on the disengaged→
     engaged transition for that component and re-arms after a resume, so a
     long pause doesn't spam one line per tick.
     """
-    if not is_engaged():
+    if not is_engaged(home):
         with _log_lock:
             _logged_components.discard(component)
         return False
@@ -212,7 +226,7 @@ def check_paused(component: str, logger: logging.Logger) -> bool:
         if first:
             _logged_components.add(component)
     if first:
-        state = get_state() or {}
+        state = get_state(home) or {}
         reason = state.get("reason")
         suffix = f" (reason: {reason})" if reason else ""
         logger.info(
@@ -220,7 +234,7 @@ def check_paused(component: str, logger: logging.Logger) -> bool:
             "`hermes resume` (%s)",
             component,
             suffix,
-            sentinel_path(),
+            sentinel_path(home),
         )
     return True
 

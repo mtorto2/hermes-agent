@@ -80,6 +80,11 @@ DIAGNOSTICS_DOCUMENT_WAIT = 5.0
 DIAGNOSTICS_FULL_WAIT = 10.0
 DIAGNOSTICS_REQUEST_TIMEOUT = 3.0
 PUSH_DEBOUNCE = 0.15
+# The cooperative LSP shutdown/exit handshake needs enough time for a server
+# to flush and exit under scheduler contention. SIGTERM escalation stays
+# tighter once that protocol path has failed.
+SHUTDOWN_REQUEST_TIMEOUT = 2.0
+GRACEFUL_SHUTDOWN_TIMEOUT = 2.0
 SHUTDOWN_GRACE = 1.0  # seconds between SIGTERM and SIGKILL
 
 # Retry policy for transient ContentModified errors.
@@ -291,7 +296,7 @@ class LSPClient:
             if not self._connection_is_open():
                 raise LSPProtocolError("server connection closed during initialization")
             self._state = "running"
-        except Exception:
+        except (asyncio.CancelledError, Exception):
             self._state = "error"
             await self._cleanup_process()
             raise
@@ -483,19 +488,36 @@ class LSPClient:
         try:
             if self.is_running:
                 try:
-                    await asyncio.wait_for(self._send_request("shutdown", None), timeout=2.0)
+                    await asyncio.wait_for(
+                        self._send_request("shutdown", None),
+                        timeout=SHUTDOWN_REQUEST_TIMEOUT,
+                    )
                 except (asyncio.TimeoutError, LSPRequestError, LSPProtocolError):
                     pass
                 try:
-                    await self._send_notification("exit", None)
+                    # Exit is advisory: the bounded process cleanup below is
+                    # authoritative. Do not let stream backpressure delay it.
+                    await self._send_notification("exit", None, wait_for_drain=False)
                 except Exception:
                     pass
         finally:
             self._state = "stopped"
-            await self._cleanup_process()
+            await self._cleanup_process(graceful=True)
 
-    async def _cleanup_process(self) -> None:
+    async def _cleanup_process(self, *, graceful: bool = False) -> None:
         async with self._cleanup_lock:
+            # A cooperative server exits after the shutdown/exit notifications
+            # above. When a graceful stop was requested, let its child watcher
+            # reap it before we cancel the stream tasks or send a fallback
+            # signal. This also avoids signalling an already-exited process
+            # during teardown under scheduler contention.
+            if graceful and self._proc is not None and self._proc.returncode is None:
+                try:
+                    await asyncio.wait_for(
+                        self._proc.wait(), timeout=GRACEFUL_SHUTDOWN_TIMEOUT
+                    )
+                except asyncio.TimeoutError:
+                    pass
             current_task = asyncio.current_task()
             reader_task = self._reader_task
             self._reader_task = None
@@ -575,13 +597,16 @@ class LSPClient:
                     continue
                 raise
 
-    async def _send_notification(self, method: str, params: Any) -> None:
+    async def _send_notification(
+        self, method: str, params: Any, *, wait_for_drain: bool = True
+    ) -> None:
         if not self._connection_is_open():
             raise LSPProtocolError(f"cannot send {method!r}: server connection closed")
         assert self._proc is not None and self._proc.stdin is not None
         try:
             self._proc.stdin.write(encode_message(make_notification(method, params)))
-            await self._proc.stdin.drain()
+            if wait_for_drain:
+                await self._proc.stdin.drain()
         except (BrokenPipeError, ConnectionResetError, OSError) as e:
             logger.debug("[%s] notify %s failed: %s", self.server_id, method, e)
 

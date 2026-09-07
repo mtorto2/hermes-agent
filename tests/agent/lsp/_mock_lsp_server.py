@@ -29,6 +29,9 @@ Behaviour (all behaviours selectable via env var ``MOCK_LSP_SCRIPT``):
   process and stdin alive.
 - ``"malformed_frame"`` — writes an invalid frame after ``didOpen``,
   then keeps the process and stdin alive.
+- ``"ignore_shutdown"`` — handles normal startup traffic but ignores
+  protocol ``shutdown`` and ``exit`` messages, requiring client-side
+  process termination during teardown.
 
 The script writes JSON-RPC framed messages to stdout and reads from
 stdin.  No third-party dependencies — uses only stdlib so it runs
@@ -75,6 +78,8 @@ def main():
             return 0
 
         if "id" in msg and msg.get("method") == "initialize":
+            if script == "ignore_initialize":
+                continue
             if script == "slow":
                 time.sleep(1.0)
             write_message(
@@ -196,10 +201,17 @@ def main():
             continue
 
         if msg.get("method") == "shutdown":
+            if script == "ignore_shutdown":
+                continue
             write_message({"jsonrpc": "2.0", "id": msg["id"], "result": None})
             continue
 
         if msg.get("method") == "exit":
+            if script == "ignore_shutdown":
+                continue
+            exit_delay = float(os.environ.get("MOCK_LSP_EXIT_DELAY", "0"))
+            if exit_delay > 0:
+                time.sleep(exit_delay)
             return 0
 
         # Unknown request: respond with method-not-found.

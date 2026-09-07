@@ -80,6 +80,24 @@ class TestNotepadCrud:
         assert notepad.get_note("job-2", "k") == "two"
         assert len(notepad.list_notes("job-1")) == 1
 
+    def test_profile_switch_uses_a_separate_notepad_store(self, tmp_path, monkeypatch):
+        """A long-lived process must not carry profile A's notepad into B."""
+        import cron.notepad as notepad_mod
+
+        profile_a = tmp_path / "profile-a"
+        profile_b = tmp_path / "profile-b"
+        monkeypatch.setenv("HERMES_HOME", str(profile_a))
+        notepad_mod.set_note("job-1", "cursor", "profile-a")
+
+        monkeypatch.setenv("HERMES_HOME", str(profile_b))
+        assert notepad_mod.get_note("job-1", "cursor") is None
+        notepad_mod.set_note("job-1", "cursor", "profile-b")
+
+        monkeypatch.setenv("HERMES_HOME", str(profile_a))
+        assert notepad_mod.get_note("job-1", "cursor") == "profile-a"
+        assert (profile_a / "cron" / "notepad.db").exists()
+        assert (profile_b / "cron" / "notepad.db").exists()
+
     def test_survives_new_connection(self, notepad):
         """Durability: values persist across independent calls (fresh connections)."""
         notepad.set_note("job-1", "state", "persisted")

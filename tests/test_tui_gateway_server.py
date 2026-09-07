@@ -37,6 +37,200 @@ def _dispatch_sync(req: dict, transport=None) -> dict | None:
         reset_transport(token)
 
 
+def test_tui_light_slot_retry_delegates_to_unregistered_service():
+    class DeferredSlotService:
+        def __init__(self):
+            self.calls = 0
+
+        def retry_slot_registration(self):
+            self.calls += 1
+            return True
+
+    service = DeferredSlotService()
+
+    assert server._retry_tui_light_slot_registration({"_light_cue_service": service}) is True
+    assert service.calls == 1
+
+
+def test_tui_notification_poller_retries_unregistered_agent_lights_slot(monkeypatch):
+    from tools.process_registry import process_registry
+
+    stop = threading.Event()
+    retry_calls = []
+
+    class NoEventsQueue:
+        def __init__(self):
+            self.calls = 0
+
+        def get(self, timeout):
+            self.calls += 1
+            if self.calls >= 2:
+                stop.set()
+            raise RuntimeError("no completion events")
+
+        def empty(self):
+            return True
+
+    def retry_slot(session):
+        retry_calls.append(session)
+        stop.set()
+        return True
+
+    monkeypatch.setattr(process_registry, "completion_queue", NoEventsQueue())
+    monkeypatch.setattr(server, "_retry_tui_light_slot_registration", retry_slot)
+
+    server._notification_poller_loop(stop, "slot-retry", {})
+
+    assert len(retry_calls) == 1
+
+
+class _DeferredSlotService:
+    """Light cue service stub that starts without an Agent Lights backend.
+
+    ``retry_slot_registration`` succeeds (a slot freed up) only once
+    ``free_slot`` is set, mirroring another session releasing its slot.
+    """
+
+    def __init__(self):
+        self.slot_status_backend = None
+        self.retry_calls = 0
+        self.free_slot = threading.Event()
+        self.registered = threading.Event()
+
+    def mark_slot_online(self):
+        return self.slot_status_backend is not None
+
+    def retry_slot_registration(self):
+        self.retry_calls += 1
+        if self.slot_status_backend is not None:
+            return False
+        if not self.free_slot.is_set():
+            return False
+        self.slot_status_backend = object()
+        self.registered.set()
+        return True
+
+
+def test_tui_light_slot_retry_supervisor_claims_freed_slot_without_poller(monkeypatch):
+    # The supervisor must recover the slot with NO notification poller running:
+    # this test never starts _notification_poller_loop.
+    monkeypatch.setattr(server, "_TUI_LIGHT_SLOT_RETRY_INTERVAL_S", 0.01)
+
+    service = _DeferredSlotService()
+    session = {"_light_cue_service": service}
+
+    server._start_tui_light_slot_retry(session)
+    thread = session["_light_slot_retry_thread"]
+
+    service.free_slot.set()
+    assert service.registered.wait(timeout=5.0)
+
+    # Once registered the supervisor must stand down, not keep polling.
+    thread.join(timeout=5.0)
+    assert not thread.is_alive()
+    calls_after_success = service.retry_calls
+    time.sleep(0.05)
+    assert service.retry_calls == calls_after_success
+
+
+def test_tui_light_slot_retry_supervisor_is_idempotent_per_session(monkeypatch):
+    monkeypatch.setattr(server, "_TUI_LIGHT_SLOT_RETRY_INTERVAL_S", 30.0)
+
+    service = _DeferredSlotService()
+    session = {"_light_cue_service": service}
+
+    server._start_tui_light_slot_retry(session)
+    first = session["_light_slot_retry_thread"]
+    server._start_tui_light_slot_retry(session)
+    assert session["_light_slot_retry_thread"] is first
+
+    session["_light_slot_retry_stop"].set()
+    first.join(timeout=5.0)
+    assert not first.is_alive()
+
+
+def test_tui_light_slot_retry_supervisor_stops_on_finalize_and_stays_stopped(monkeypatch):
+    monkeypatch.setattr(server, "_TUI_LIGHT_SLOT_RETRY_INTERVAL_S", 0.01)
+
+    service = _DeferredSlotService()  # slot never freed: retries keep failing
+    session = {"_light_cue_service": service}
+
+    server._start_tui_light_slot_retry(session)
+    thread = session["_light_slot_retry_thread"]
+
+    deadline = time.monotonic() + 5.0
+    while service.retry_calls == 0 and time.monotonic() < deadline:
+        time.sleep(0.005)
+    assert service.retry_calls > 0
+
+    server._finalize_session(session)
+    thread.join(timeout=5.0)
+    assert not thread.is_alive()
+
+    calls_after_stop = service.retry_calls
+    time.sleep(0.05)
+    assert service.retry_calls == calls_after_stop
+
+    # A finalized session must not resurrect the supervisor.
+    server._start_tui_light_slot_retry(session)
+    assert session["_light_slot_retry_thread"] is thread
+    assert not thread.is_alive()
+
+
+def test_tui_light_slot_retry_start_cannot_race_session_finalization(monkeypatch):
+    # Finalization marks the session finalized before waiting on this same lock.
+    # A concurrent startup caller must then observe that state and create no
+    # supervisor after finalization's stop/join pass.
+    gate = threading.Lock()
+    monkeypatch.setattr(server, "_tui_light_slot_retry_start_lock", gate)
+    session = {"_light_cue_service": _DeferredSlotService()}
+
+    gate.acquire()
+    try:
+        finalizer = threading.Thread(target=server._finalize_session, args=(session,))
+        finalizer.start()
+        deadline = time.monotonic() + 5.0
+        while not session.get("_finalized") and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert session.get("_finalized") is True
+
+        starter = threading.Thread(target=server._start_tui_light_slot_retry, args=(session,))
+        starter.start()
+    finally:
+        gate.release()
+
+    finalizer.join(timeout=5.0)
+    starter.join(timeout=5.0)
+    assert not finalizer.is_alive()
+    assert not starter.is_alive()
+    assert "_light_slot_retry_thread" not in session
+
+
+def test_startup_slot_publish_supervises_retry_only_when_unregistered(monkeypatch):
+    monkeypatch.setattr(server, "_TUI_LIGHT_SLOT_RETRY_INTERVAL_S", 30.0)
+
+    def _fake_get_service(session):
+        return session.get("_light_cue_service")
+
+    monkeypatch.setattr(server, "_get_tui_light_cue_service", _fake_get_service)
+
+    # Capacity full at startup -> supervision starts.
+    blocked = _DeferredSlotService()
+    session = {"_light_cue_service": blocked}
+    server._publish_tui_slot_online(session)
+    thread = session.get("_light_slot_retry_thread")
+    assert thread is not None and thread.is_alive()
+    session["_light_slot_retry_stop"].set()
+    thread.join(timeout=5.0)
+
+    # Slot already registered at startup -> no supervisor thread.
+    registered = _DeferredSlotService()
+    registered.slot_status_backend = object()
+    ok_session = {"_light_cue_service": registered}
+    server._publish_tui_slot_online(ok_session)
+    assert "_light_slot_retry_thread" not in ok_session
+
+
 @pytest.fixture(autouse=True)
 def _neuter_agent_prewarm_timer(request, monkeypatch):
     """Stub the deferred agent pre-warm timer for every test in this module.
@@ -316,7 +510,7 @@ def test_prompt_submit_dispatches_to_compute_host_when_turn_isolation_enabled(mo
             {
                 "type": "turn.end",
                 "sid": "iso-sid",
-                "request_id": "submit",
+                "request_id": fake_supervisor.frames[0]["request_id"],
                 "history_version": 1,
             }
         )
@@ -744,16 +938,23 @@ def test_prompt_submit_golden_transcript_matches_flag_off_and_on(monkeypatch):
 
     def run_flag_on():
         events = []
+        monkeypatch.setattr(server, "write_json", lambda message: events.append((
+            message["params"]["type"], message["params"]["session_id"], message["params"].get("payload"))) or True)
         monkeypatch.setattr(server, "_emit", lambda event, sid, payload=None: events.append((event, sid, payload)))
         monkeypatch.setattr(server, "_load_cfg", lambda: {"dashboard": {"turn_isolation": True}})
 
         class _FakeSupervisor:
             def submit_turn(self, frame, *, on_complete=None):
                 sid = frame["sid"]
-                server._emit("message.start", sid)
-                server._emit("message.delta", sid, {"text": "hi"})
-                server._emit("message.complete", sid, {"text": "hi", "usage": usage, "status": "complete"})
-                server._emit("session.info", sid, dict(fixed_info))
+                def relay(kind, payload=None):
+                    server._relay_compute_host_rpc({"method": "event", "params": {
+                        "type": kind, "session_id": sid, "payload": payload,
+                        "compute_turn_id": frame["request_id"],
+                    }})
+                relay("message.start")
+                relay("message.delta", {"text": "hi"})
+                relay("message.complete", {"text": "hi", "usage": usage, "status": "complete"})
+                relay("session.info", {**fixed_info, "running": False})
                 if on_complete is not None:
                     on_complete(
                         {
@@ -882,6 +1083,14 @@ def test_profile_scoped_agent_build_starts_mcp_discovery_in_profile_home(
     seen = []
     built = threading.Event()
 
+    class _ImmediateThread:
+        def __init__(self, target=None, daemon=None, **_kwargs):
+            self._target = target
+
+        def start(self):
+            if self._target is not None:
+                self._target()
+
     monkeypatch.setattr(
         server,
         "_make_agent",
@@ -902,6 +1111,10 @@ def test_profile_scoped_agent_build_starts_mcp_discovery_in_profile_home(
     monkeypatch.setattr(server, "_start_notification_poller", lambda *a, **k: None)
     monkeypatch.setattr(server, "_schedule_mcp_late_refresh", lambda *a, **k: None)
     monkeypatch.setattr(server, "_emit", lambda *a, **k: None)
+    # Also run the build inline when the gateway spawns it via
+    # server.threading.Thread so completion is deterministic; the bounded waits
+    # below still fail closed if a refactor routes the build off this symbol.
+    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
 
     ready = threading.Event()
     sid = f"test-sid-{uuid.uuid4().hex[:8]}"
@@ -945,6 +1158,14 @@ def test_profile_scoped_agent_build_installs_secret_scope(monkeypatch, tmp_path)
     scopes = []
     built = threading.Event()
 
+    class _ImmediateThread:
+        def __init__(self, target=None, daemon=None, **_kwargs):
+            self._target = target
+
+        def start(self):
+            if self._target is not None:
+                self._target()
+
     def _fake_make_agent(*args, **kwargs):
         scope = current_secret_scope()
         scopes.append(dict(scope) if scope else None)
@@ -964,6 +1185,9 @@ def test_profile_scoped_agent_build_installs_secret_scope(monkeypatch, tmp_path)
     monkeypatch.setattr(server, "_start_notification_poller", lambda *a, **k: None)
     monkeypatch.setattr(server, "_schedule_mcp_late_refresh", lambda *a, **k: None)
     monkeypatch.setattr(server, "_emit", lambda *a, **k: None)
+    # Run the build inline when spawned via server.threading.Thread; the bounded
+    # waits below still fail closed if the build is routed off this symbol.
+    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
 
     ready = threading.Event()
     sid = f"test-secret-sid-{uuid.uuid4().hex[:8]}"
@@ -1206,6 +1430,77 @@ def test_write_json_returns_false_on_broken_pipe(monkeypatch):
     assert server.write_json({"ok": True}) is False
 
 
+def test_block_with_light_cue_returns_to_working_after_answer(monkeypatch):
+    cues = []
+    monkeypatch.setattr(server, "_emit_tui_light_cue", lambda sid, event: cues.append(getattr(event, "value", event)))
+    monkeypatch.setattr(server, "_block", lambda event, sid, payload, timeout=300: "answer")
+
+    assert server._block_with_light_cue("clarify.request", "sid-1", {}, timeout=1) == "answer"
+    assert cues == ["human_intervention", "working"]
+
+
+def test_tui_approval_callbacks_emit_human_intervention_then_working(monkeypatch):
+    registered = {}
+    cues = []
+    emits = []
+
+    class _FakeWorker:
+        def __init__(self, key, model):
+            self.key = key
+
+    import tools.approval as _approval
+
+    monkeypatch.setattr(server, "_SlashWorker", _FakeWorker)
+    monkeypatch.setattr(server, "_wire_callbacks", lambda _sid: None)
+    monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: emits.append(args))
+    monkeypatch.setattr(server, "_notify_session_boundary", lambda *args, **kwargs: None)
+    monkeypatch.setattr(server, "_session_info", lambda _agent, *a: {"model": "x"})
+    monkeypatch.setattr(
+        server,
+        "_emit_tui_light_cue",
+        lambda sid, event: cues.append(getattr(event, "value", event)),
+    )
+    monkeypatch.setattr(
+        _approval,
+        "register_gateway_notify",
+        lambda key, cb: registered.setdefault("notify", (key, cb)),
+    )
+    monkeypatch.setattr(
+        _approval,
+        "register_gateway_resume",
+        lambda key, cb: registered.setdefault("resume", (key, cb)),
+    )
+    monkeypatch.setattr(_approval, "load_permanent_allowlist", lambda: None)
+
+    try:
+        server._init_session(
+            "sid",
+            "session-key",
+            types.SimpleNamespace(model="x"),
+            history=[],
+            cols=80,
+        )
+
+        assert registered["notify"][0] == "session-key"
+        assert registered["resume"][0] == "session-key"
+
+        registered["notify"][1]({"command": "rm -rf scratch"})
+        registered["resume"][1]()
+
+        assert cues == ["human_intervention", "working"]
+        approval_events = [event for event in emits if event[:2] == ("approval.request", "sid")]
+        assert approval_events == [
+            (
+                "approval.request",
+                "sid",
+                {
+                    "command": "rm -rf scratch",
+                    "choices": ["once", "session", "always", "deny"],
+                },
+            )
+        ]
+    finally:
+        server._sessions.pop("sid", None)
 def test_write_json_drops_detached_ws_frames(monkeypatch):
     out = _ChunkyStdout()
     monkeypatch.setattr(server, "_real_stdout", out)
@@ -1689,6 +1984,37 @@ def test_dispatch_rejects_non_object_params():
         "id": "1",
         "error": {"code": -32602, "message": "invalid params: expected an object"},
     }
+
+
+def test_tui_command_catalog_includes_nah():
+    resp = server.dispatch({"id": "catalog", "method": "commands.catalog", "params": {}})
+
+    assert resp is not None
+    assert "error" not in resp
+    commands = {name for name, _desc in resp["result"]["pairs"]}
+    assert "/nah" in commands
+
+
+@pytest.mark.parametrize("name", ["nah", "tldr", "tl-dr", "tl_dr"])
+def test_tui_nah_dispatch_sends_summary_instruction(name):
+    resp = server.dispatch(
+        {
+            "id": "nah",
+            "method": "command.dispatch",
+            "params": {"name": name, "arg": "one sentence"},
+        }
+    )
+
+    assert resp is not None
+    assert "error" not in resp
+    payload = resp["result"]
+    assert payload["type"] == "send"
+    assert "shortest useful TL;DR" in payload["message"]
+    assert "Extra style request: one sentence" in payload["message"]
+
+
+def test_tui_nah_aliases_are_declared_as_pending_input_commands():
+    assert {"nah", "tldr", "tl-dr", "tl_dr"} <= server._PENDING_INPUT_COMMANDS
 
 
 def test_system_battery_returns_reading(monkeypatch):
@@ -2618,7 +2944,7 @@ def test_load_enabled_toolsets_rejects_disabled_mcp_env(monkeypatch, capsys):
     result = server._load_enabled_toolsets()
     assert result is not None
     assert {"kanban", "memory", "project"} <= set(result)
-    assert set(result) - {"kanban", "memory", "project"} <= _RECENTLY_SHIPPED_TOOLSETS
+    assert set(result) - {"apple_calendar", "kanban", "memory", "project"} <= _RECENTLY_SHIPPED_TOOLSETS
     err = capsys.readouterr().err
     assert "ignoring disabled MCP servers" in err
     assert "mcp-off" in err
@@ -2644,7 +2970,7 @@ def test_load_enabled_toolsets_falls_back_when_tui_env_invalid(monkeypatch, caps
     result = server._load_enabled_toolsets()
     assert result is not None
     assert {"kanban", "memory", "project"} <= set(result)
-    assert set(result) - {"kanban", "memory", "project"} <= _RECENTLY_SHIPPED_TOOLSETS
+    assert set(result) - {"apple_calendar", "kanban", "memory", "project"} <= _RECENTLY_SHIPPED_TOOLSETS
     assert "using configured CLI toolsets" in capsys.readouterr().err
 
 
@@ -4672,6 +4998,31 @@ def test_session_close_commits_memory_and_fires_finalize_hook(monkeypatch):
         server._sessions.pop("sid", None)
 
 
+def test_finalize_session_defers_agent_lights_cleanup_to_process_exit(monkeypatch):
+    """A logical TUI close must not erase a still-live process's light slot.
+
+    The backend's atexit handler owns process cleanup.  Session finalization can
+    occur while the Terminal/TUI process remains alive or reconnects, so clearing
+    here incorrectly hides an open session from Agent Lights.
+    """
+
+    calls = []
+
+    class _SlotBackend:
+        def clear_if_owned(self):
+            calls.append("clear")
+            return True
+
+    class _LightService:
+        slot_status_backend = _SlotBackend()
+
+    session = _session(_light_cue_service=_LightService())
+
+    server._finalize_session(session)
+
+    assert calls == []
+
+
 def test_session_close_releases_resume_lock_before_slow_teardown(monkeypatch):
     """One slow session finalizer must not stall unrelated session.resume RPCs."""
     teardown_started = threading.Event()
@@ -5800,7 +6151,8 @@ def test_init_session_fires_reset_hook(monkeypatch):
         )
         assert ("on_session_reset", "session-key") in hooks
     finally:
-        server._sessions.pop(sid, None)
+        session = server._sessions.pop(sid, None)
+        server._teardown_session(session)
 
 
 def test_session_title_creates_row_and_sets_immediately_when_not_ready(monkeypatch):
@@ -7392,8 +7744,11 @@ def test_run_prompt_submit_requeues_all_unstarted_notifications_with_real_thread
             turns.append(prompt)
             if "proc_batch_1" in prompt:
                 nested_started.set()
-                if not release_nested.wait(timeout=5):
-                    raise TimeoutError("notification turn was not released")
+                # Keep the turn in flight beyond the queue-observation deadline;
+                # the test's finally releases this synthetic turn after it has
+                # observed the queue, so it must not self-time out under a
+                # CPU-contended full-suite run.
+                release_nested.wait()
             return {"final_response": "", "messages": []}
 
     monkeypatch.setattr(server.threading, "Thread", _recording_thread)
@@ -10711,6 +11066,365 @@ def test_prompt_submit_sets_approval_session_key(monkeypatch):
 
     assert resp["result"]["status"] == "streaming"
     assert captured["session_key"] == "session-key"
+
+
+def test_prompt_submit_emits_tui_light_cues_on_success(monkeypatch):
+    class _Agent:
+        def run_conversation(
+            self, prompt, conversation_history=None, stream_callback=None, **_kwargs
+        ):
+            return {
+                "final_response": "ok",
+                "messages": [{"role": "assistant", "content": "ok"}],
+            }
+
+    class _ImmediateThread:
+        def __init__(self, target=None, daemon=None):
+            self._target = target
+
+        def start(self):
+            assert self._target is not None
+            self._target()
+
+    cues = []
+    server._sessions["sid"] = _session(agent=_Agent())
+    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+    monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        server, "_emit_tui_light_cue", lambda sid, event: cues.append(event) or True
+    )
+    monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
+    monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
+
+    try:
+        server.handle_request(
+            {
+                "id": "1",
+                "method": "prompt.submit",
+                "params": {"session_id": "sid", "text": "ping"},
+            }
+        )
+
+        assert cues == ["working", "final_answer"]
+    finally:
+        server._sessions.pop("sid", None)
+
+
+@pytest.mark.parametrize("submit_at", ["message.complete", "session.info.build", "session.info", None])
+@pytest.mark.parametrize("queued", [False, True])
+@pytest.mark.parametrize("outcome", ["success", "error", "exception"])
+def test_prompt_submit_completion_queues_until_cleanup(monkeypatch, queued, outcome, submit_at):
+    """Only session.info(false) hands off ownership, after old-turn cleanup."""
+    second_started = threading.Event()
+    release_second = threading.Event()
+    first_started = threading.Event()
+    observed = {}
+    events = []
+    prompts = []
+
+    class _Agent:
+        model = "once"
+        _supports_active_turn_redirect = True
+        redirect = Mock(return_value=True)
+
+        def run_conversation(self, prompt, **_kwargs):
+            prompts.append(prompt)
+            if prompt == "first":
+                observed["first_thread"] = threading.current_thread()
+                first_started.set()
+                if outcome == "exception":
+                    raise RuntimeError("first turn failed")
+                if outcome == "error":
+                    return {"final_response": "", "messages": [],
+                            "failed": True, "error": "first turn failed"}
+            if prompt == "second":
+                observed["second_thread"] = threading.current_thread()
+                observed["model_at_start"] = self.model
+                self.model = "successor"
+                observed["callback"] = self.interim_assistant_callback
+                second_started.set()
+                assert release_second.wait(10)
+            return {"final_response": "ok", "messages": []}
+
+    agent = _Agent()
+    session = _session(agent=agent, one_turn_model_restore={"model": "primary"})
+    monkeypatch.setitem(server._sessions, "cleanup-race", session)
+    monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "interrupt")
+    monkeypatch.setattr(server, "_get_usage", lambda _a: {})
+    monkeypatch.setattr(server, "render_message", lambda *a: None)
+    monkeypatch.setattr(server, "_emit_tui_light_cue", lambda *a: True)
+    monkeypatch.setattr(server, "_restore_agent_model_runtime",
+                        lambda agent, state: setattr(agent, "model", state["model"]))
+    for name in ("_restart_slash_worker", "_persist_live_session_runtime",
+                 "_persist_live_session_system_prompt", "_sync_agent_model_with_config"):
+        monkeypatch.setattr(server, name, lambda *a: None)
+    clear_context = server._clear_session_context
+
+    def clear_context_and_observe(tokens):
+        clear_context(tokens)
+        observed.setdefault("cleanup_state", (
+            session["running"], session.get("_turn_settling"),
+            (session.get("queued_prompt") or {}).get("text"),
+        ))
+
+    monkeypatch.setattr(server, "_clear_session_context", clear_context_and_observe)
+    if submit_at == "message.complete":
+        # The queued user prompt must win over an automatic continuation.
+        monkeypatch.setattr(server, "_plan_goal_compression_recovery", Mock(
+            side_effect=[("automatic followup", None), (None, None), (None, None)]))
+
+    def submit(text):
+        return server.handle_request({"id": text, "method": "prompt.submit",
+            "params": {"session_id": "cleanup-race", "text": text, "queued": queued}})
+
+    def submit_during_publication():
+        # Exercise admission while the idle frame has NOT reached the transport.
+        # No lock may span payload construction or transport publication.
+        assert session["history_lock"].acquire(blocking=False)
+        session["history_lock"].release()
+        observed["response"] = submit("second")
+        observed["publication_status"] = observed["response"]["result"]["status"]
+        observed["starts_during_publication"] = sum(
+            event == "message.start" for event, _ in events
+        )
+
+    session_info = server._session_info
+
+    def build_session_info(agent, current_session):
+        payload = session_info(agent, current_session)
+        if (submit_at == "session.info.build" and payload.get("running") is False
+                and "response" not in observed):
+            submit_during_publication()
+        return payload
+
+    monkeypatch.setattr(server, "_session_info", build_session_info)
+
+    def emit(event, sid, payload=None):
+        if event == "message.complete" and "completion_state" not in observed:
+            observed["completion_state"] = (
+                session["running"], session.get("_turn_settling"), agent.model,
+                callable(agent.interim_assistant_callback),
+            )
+        if event == "session.info" and "settled_state" not in observed:
+            observed["settled_state"] = (
+                session["running"], session.get("_turn_settling", False),
+                agent.model, agent.interim_assistant_callback,
+            )
+        if (event == submit_at and "response" not in observed
+                and (event != "session.info" or payload.get("running") is False)):
+            if event == "session.info":
+                submit_during_publication()
+            else:
+                observed["response"] = submit("second")
+        # Record delivery only AFTER the write-window submission attempt.
+        events.append((event, payload))
+
+    monkeypatch.setattr(server, "_emit", emit)
+    try:
+        submit("first")
+        assert first_started.wait(10)
+        observed["first_thread"].join(10)
+        assert not observed["first_thread"].is_alive()
+        complete_index = next(i for i, (event, _) in enumerate(events)
+                              if event == "message.complete")
+        settled = [(i, payload) for i, (event, payload) in enumerate(events)
+                   if event == "session.info" and i > complete_index]
+        assert settled, "completion must publish an authoritative settled event"
+        # Only a queue change across the actual write needs a metadata correction.
+        # The terminal contract remains one completion followed by authoritative idle.
+        assert sum(event == "message.complete" for event, _ in events) == 1
+        if submit_at == "session.info":
+            assert [payload["running"] for _, payload in settled] == [False, False]
+            assert not settled[0][1].get("pending_turn", False)
+            assert settled[1][1] == {"running": False, "pending_turn": True}
+        else:
+            assert [payload["running"] for _, payload in settled] == [False]
+        if submit_at in ("session.info.build", "session.info"):
+            assert observed["publication_status"] == "queued"
+            assert observed["starts_during_publication"] == 1
+        assert observed["completion_state"] == (True, True, "once", True)
+        assert observed["settled_state"] == (False, True, "primary", None)
+        expected_queued = "second" if submit_at == "message.complete" else None
+        assert observed["cleanup_state"] == (True, True, expected_queued)
+        if submit_at is None:
+            assert session["running"] is False
+            return
+        assert second_started.wait(10)
+        assert prompts == ["first", "second"]
+        starts = [i for i, (event, _) in enumerate(events) if event == "message.start"]
+        assert complete_index < settled[0][0] < starts[1]
+        assert session["running"] is True, "old cleanup cleared successor running state"
+        assert session["inflight_turn"]["user"] == "second"
+        assert agent.interim_assistant_callback is observed["callback"]
+        assert callable(agent.interim_assistant_callback)
+        assert agent.model == "successor"
+        assert observed["model_at_start"] == "primary"
+        assert observed["response"]["result"]["status"] == "queued"
+        assert not session.get("_turn_settling")
+        agent.redirect.assert_not_called()
+    finally:
+        release_second.set()
+        for key in ("first_thread", "second_thread"):
+            if key in observed:
+                observed[key].join(10)
+                assert not observed[key].is_alive(), f"leaked {key}"
+
+
+
+def test_delayed_predecessor_drain_waits_for_successor_idle_publication(monkeypatch):
+    """A's late drain cannot start C inside B's session.info(false) write."""
+    a_at_drain = threading.Event()
+    release_a = threading.Event()
+    b_publishing = threading.Event()
+    release_b = threading.Event()
+    c_started = threading.Event()
+    threads = {}
+    events = []
+    observed = {}
+
+    class _Agent:
+        def run_conversation(self, prompt, **_kwargs):
+            threads[prompt] = threading.current_thread()
+            if prompt == "C":
+                c_started.set()
+            return {"final_response": prompt, "messages": []}
+
+    session = _session(agent=_Agent())
+    monkeypatch.setitem(server._sessions, "delayed-drain", session)
+    monkeypatch.setattr(server, "_get_usage", lambda _a: {})
+    monkeypatch.setattr(server, "render_message", lambda *a: None)
+    monkeypatch.setattr(server, "_emit_tui_light_cue", lambda *a: True)
+    for name in ("_restart_slash_worker", "_persist_live_session_runtime",
+                 "_persist_live_session_system_prompt", "_sync_agent_model_with_config"):
+        monkeypatch.setattr(server, name, lambda *a: None)
+
+    def submit(text):
+        return server.handle_request({"id": text, "method": "prompt.submit",
+            "params": {"session_id": "delayed-drain", "text": text, "queued": True}})
+
+    drain = server._drain_queued_prompt
+
+    def delayed_drain(rid, sid, current_session):
+        if rid == "A":
+            a_at_drain.set()
+            assert release_a.wait(10)
+        result = drain(rid, sid, current_session)
+        if threading.current_thread() is threads.get(rid):
+            observed[rid] = result
+        return result
+
+    monkeypatch.setattr(server, "_drain_queued_prompt", delayed_drain)
+
+    def emit(event, sid, payload=None):
+        if (event == "session.info" and payload.get("running") is False
+                and threading.current_thread() is threads.get("B")):
+            observed["state_at_b_idle"] = (session["running"], session.get("_turn_settling"))
+            observed["c_response"] = submit("C")
+            b_publishing.set()
+            assert release_b.wait(10)
+        events.append((event, threading.current_thread()))
+
+    monkeypatch.setattr(server, "_emit", emit)
+    try:
+        submit("A")
+        assert a_at_drain.wait(10)
+        assert not session["running"]
+        assert not session.get("_turn_settling")
+        submit("B")
+        assert b_publishing.wait(10)
+        assert observed["state_at_b_idle"] == (False, True)
+        assert observed["c_response"]["result"]["status"] == "queued"
+        release_a.set()
+        threads["A"].join(10)
+        assert not threads["A"].is_alive()
+        assert observed["A"] is False
+        assert "C" not in threads
+        assert session["queued_prompt"]["text"] == "C"
+
+        release_b.set()
+        threads["B"].join(10)
+        assert not threads["B"].is_alive()
+        assert observed["B"] is True
+        assert c_started.wait(10)
+        threads["C"].join(10)
+        assert not threads["C"].is_alive()
+        starts = [i for i, (event, _) in enumerate(events) if event == "message.start"]
+        assert len(starts) == 3
+        assert events.index(("session.info", threads["B"])) < starts[2]
+    finally:
+        release_a.set()
+        release_b.set()
+        for prompt in ("A", "B", "C"):
+            if prompt == "C" and any(observed.get(turn) is True for turn in ("A", "B")):
+                assert c_started.wait(10)
+            if prompt in threads:
+                threads[prompt].join(10)
+                assert not threads[prompt].is_alive(), f"leaked turn {prompt}"
+
+
+def test_prompt_submit_emits_tui_light_cues_on_error(monkeypatch):
+    class _Agent:
+        def run_conversation(
+            self, prompt, conversation_history=None, stream_callback=None, **_kwargs
+        ):
+            return {
+                "final_response": "",
+                "messages": [],
+                "failed": True,
+                "error": "boom",
+            }
+
+    class _ImmediateThread:
+        def __init__(self, target=None, daemon=None):
+            self._target = target
+
+        def start(self):
+            assert self._target is not None
+            self._target()
+
+    cues = []
+    server._sessions["sid"] = _session(agent=_Agent())
+    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+    monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        server, "_emit_tui_light_cue", lambda sid, event: cues.append(event) or True
+    )
+    monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
+    monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
+
+    try:
+        server.handle_request(
+            {
+                "id": "1",
+                "method": "prompt.submit",
+                "params": {"session_id": "sid", "text": "ping"},
+            }
+        )
+
+        assert cues == ["working", "error"]
+    finally:
+        server._sessions.pop("sid", None)
+
+
+def test_block_with_light_cue_marks_human_intervention(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        server, "_emit_tui_light_cue", lambda sid, event: calls.append((sid, event)) or True
+    )
+    monkeypatch.setattr(
+        server,
+        "_block",
+        lambda event, sid, payload, timeout=300: f"{event}:{sid}:{timeout}",
+    )
+
+    answer = server._block_with_light_cue("clarify.request", "sid", {}, timeout=12)
+
+    assert answer == "clarify.request:sid:12"
+    assert len(calls) == 2
+    assert calls[0][0] == "sid"
+    assert getattr(calls[0][1], "value", calls[0][1]) == "human_intervention"
+    assert calls[1][0] == "sid"
+    assert getattr(calls[1][1], "value", calls[1][1]) == "working"
 
 
 def test_prompt_submit_expands_context_refs(monkeypatch):
@@ -14340,8 +15054,13 @@ def test_session_create_no_race_keeps_worker_alive(monkeypatch):
     # session.create tests in the same shard process mutate the shared
     # ``server._sessions`` dict under ``_sessions_lock`` and can replace/pop
     # entries mid-run, which would flip this build thread's ``replaced`` check
-    # to True and trigger a spurious unregister. Snapshot, clear, and restore
-    # so this test sees only its own session regardless of shard composition.
+    # to True and trigger a spurious unregister. First wait for any existing
+    # build threads to settle, then snapshot, clear, and restore so this test
+    # sees only its own session regardless of shard composition.
+    for _session in list(server._sessions.values()):
+        _ready = _session.get("agent_ready") if isinstance(_session, dict) else None
+        if _ready is not None:
+            _ready.wait(timeout=2.0)
     _saved_sessions = dict(server._sessions)
     server._sessions.clear()
 
@@ -14354,6 +15073,10 @@ def test_session_create_no_race_keeps_worker_alive(monkeypatch):
             }
         )
         sid = resp["result"]["session_id"]
+        # Drop unregister callbacks emitted by sibling build threads before
+        # this session's id exists; below we assert this session did not
+        # unregister its own callback.
+        unregistered_keys.clear()
 
         # Wait for the build to finish (ready event inside session dict).
         session = server._sessions[sid]
@@ -15697,6 +16420,12 @@ def test_model_options_preserves_canonical_custom_row_after_agent_init(monkeypat
         "hermes_cli.auth.is_provider_explicitly_configured",
         lambda _slug: False,
     )
+    # Keep this explicit-only test independent of the developer machine's
+    # real Claude Code OAuth session; that credential path is covered elsewhere.
+    monkeypatch.setattr(
+        "hermes_cli.inventory._anthropic_oauth_credentials_present",
+        lambda: False,
+    )
     monkeypatch.setattr("hermes_cli.inventory._apply_pricing", lambda *_args, **_kwargs: None)
     monkeypatch.setattr("hermes_cli.inventory._apply_capabilities", lambda *_args, **_kwargs: None)
 
@@ -16580,6 +17309,10 @@ def test_browser_manage_connect_default_local_reports_launch_hint(monkeypatch):
                 "hermes_cli.browser_connect.get_chrome_debug_candidates",
                 return_value=[],
             ),
+            patch(
+                "hermes_cli.browser_connect.manual_chrome_debug_command",
+                return_value=None,
+            ),
         ):
             resp = server.handle_request(
                 {
@@ -16728,13 +17461,15 @@ def test_browser_manage_connect_default_local_retries_after_launch(monkeypatch):
             patch(
                 "hermes_cli.browser_connect.launch_chrome_debug",
                 return_value=launched,
-            ),
+            ) as launch,
             patch("hermes_cli.browser_connect.local_port_in_use", return_value=False),
         ):
             resp = server.handle_request(
                 {"id": "1", "method": "browser.manage", "params": {"action": "connect"}}
             )
 
+    launch.assert_called_once()
+    assert launch.call_args.args[0] == 9222
     assert resp["result"]["connected"] is True
     assert resp["result"]["url"] == "http://127.0.0.1:9222"
     assert resp["result"]["messages"] == [

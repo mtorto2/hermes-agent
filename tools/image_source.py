@@ -353,9 +353,29 @@ async def _resolve_container_fallback(
     qp = shlex.quote(str(p))
     cmd = f"head -c {_MAX_INGEST_BYTES + 1} < {qp} | base64 | tr -d '\\n'"
 
+    # A sandbox can be shared by ACP/desktop sessions. Pass the calling
+    # session's cwd so a relative image path resolves against this session's
+    # last terminal directory rather than another session's. Best-effort: if
+    # the helpers are unavailable we fall back to an unscoped exec.
+    execute_kwargs: dict = {}
+    try:
+        from tools.terminal_tool import (
+            _get_env_config,
+            _sanitize_environment_cwd,
+            get_session_cwd,
+        )
+
+        session_cwd = get_session_cwd(ctx.task_id)
+        if session_cwd:
+            execute_kwargs["cwd"] = _sanitize_environment_cwd(
+                session_cwd, _get_env_config()
+            )
+    except Exception:
+        execute_kwargs = {}
+
     last_res: dict = {"returncode": 1, "output": ""}
     for attempt in range(2):
-        last_res = await asyncio.to_thread(env.execute, cmd)
+        last_res = await asyncio.to_thread(env.execute, cmd, **execute_kwargs)
         if last_res.get("returncode", 1) == 0:
             break
         if attempt == 0:
