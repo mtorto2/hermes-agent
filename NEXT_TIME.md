@@ -4,26 +4,21 @@ Updated: 2026-09-07
 Project: Hermes Agent — Matt local fork / live runtime
 Prepared by: Hermes
 
-## Active handoff — Frozen Green integration checkpoint (September 7, 2026)
+## Active handoff — Blue promotion completed (September 7, 2026)
 
-- **Read this section first.** The August material below is retained as historical background; it does not describe the current Green candidate.
-- Isolated candidate: `/Users/matt/.hermes/runtime/releases/hermes-agent-v0.21.0-20260831-integration-20260906-084314`
-  - Branch: `candidate/green-integration-20260906-084314`
-  - Checkpoint: `d456ba514` — `feat: checkpoint frozen Green Hermes integration`
-  - This checkpoint is local only. It has not been pushed, merged, promoted, or used to restart any live process.
-- **Blue/live remains authoritative and untouched** at `~/.hermes/hermes-agent`. The active default, business, and personal gateways/TUIs all resolve from Blue, not this Green checkout.
-- Green evidence at checkpoint:
-  - focused TUI lifecycle Python suite: `773 passed`;
-  - Desktop route/gateway suite: `140 passed`; Desktop TypeScript typecheck passed;
-  - Python compile and staged diff hygiene passed;
-  - exact WeCom stream + performance failure cluster passed five candidate-pinned, retries-disabled reruns: `29 passed, 2 expected xfails` each run;
-  - the canonical all-extras runner was nonzero only for three non-reproducible runner-load failures in that unchanged cluster. Do not call it a clean all-extras pass; do not reopen unrelated production code without a deterministic reproduction.
-- Isolated no-live-impact canary passed:
-  - candidate CLI, gateway, and TUI lifecycle imports all resolved from Green;
-  - CLI `--help` passed with disposable `HOME` and `HERMES_HOME`;
-  - no candidate gateway, Desktop, listener, or persistent process was launched.
-  - **Launch invariant:** any Green Python process must explicitly set `HERMES_PYTHON_SRC_ROOT` to this Green root. An inherited Blue value correctly redirects the bootstrap to Blue and creates a mixed-source import failure.
-- **Next and only promotion gate:** obtain a fresh explicit approval for a Blue/live promotion plan. That plan must separately prove Green/Blue commit topology, stage one runtime-path change at a time, preserve all profile gateways, and require a human inbound Telegram proof before any live cutover. Do not push, restart, replace, or switch Blue based on this document alone.
+- **Read this section first.** The August material below is retained as historical background; it does not describe the current live runtime.
+- **Live Blue:** `/Users/matt/.hermes/hermes-agent` on local `main` at `d4f4dafee` (`chore: drop case-colliding contributor email file (#88168)`). No remote was pushed.
+- **Green evidence checkout:** `/Users/matt/.hermes/runtime/releases/hermes-agent-v0.21.0-20260831-integration-20260906-084314`, branch `candidate/green-integration-20260906-084314`, at the same `d4f4dafee` commit.
+- The original frozen Green checkpoint was `d456ba514`; its preserved Blue handoff merge is `1ed8e1863`. The final necessary exception was the deletion-only upstream fix `fcdae2cf0b`, cherry-picked into Green as `d4f4dafee`.
+  - It removes `contributors/emails/agent@Agents-Mac-mini.local`, a local-machine artifact that collided with the lowercase sibling on macOS/Windows case-insensitive filesystems.
+  - Green then passed a case-fold uniqueness guard, a fresh non-shared macOS checkout with `core.ignorecase=true` and zero dirty paths, and the standard runtime import closure.
+- Prior Green evidence remains applicable: focused TUI lifecycle Python suite (`773 passed`), Desktop route/gateway suite (`140 passed`) plus typecheck, Python compile/diff hygiene, and five retries-disabled reruns of the unchanged WeCom/performance cluster (`29 passed, 2 expected xfails`). The old all-extras runner result remains a runner-load caveat, not a clean-pass claim.
+- **Approved live rollout completed in order:** Tate/business → Hermes/default → Aurelius/personal.
+  - Each Blue runtime was synchronized with `uv sync --locked --extra dev --extra messaging --extra acp`, passed dependency/import closure, and had a clean case-fold source tree before restart.
+  - LaunchAgent readiness and human Telegram canaries passed for all profiles: `BUSINESS CANARY OK`, `DEFAULT CANARY OK`, and `PERSONAL CANARY OK`.
+  - Temporary one-shot restart scripts/jobs were removed after each verification. No credentials, global profile configuration, plist definitions, or remotes were changed.
+- A local source rollback ref remains: `backup/blue-pre-green-20260907-111014` at pre-promotion Blue commit `17f0a34fb0`. It is retained; do not delete it without a separate review.
+- **Next safe work:** observe normal traffic. No restart, remote push, upstream intake, or additional source change is implied by this handoff; each requires separate approval.
 
 ## Current status — Agent Lights six-slot reconciliation (August 14, 2026)
 
