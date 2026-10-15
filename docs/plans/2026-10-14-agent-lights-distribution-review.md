@@ -266,3 +266,22 @@ plain install refused, `--remove-legacy` set all six aside and kept the six
 new/unrelated pieces, a plain re-run succeeded, the plugin carried the
 install marker, and `uninstall.sh` removed exactly this app and the marked
 plugin.
+
+## Round 8: response to round 7 (changes requested → fixed, not yet reviewed)
+
+Re-review range: `2266c590e0..HEAD` (fix `6f37adecbe` plus this note); only
+`uninstall.sh` and its tests changed. Zip rebuilt from `6f37adecbe`:
+`~/Desktop/agent-lights-src-20261015-6f37adecbe.zip` (+ `.sha256`); the
+prompt only changed its zip name.
+
+| # | Finding | Fix | Proof |
+| --- | --- | --- | --- |
+| 1 | Foreign app at the app path named the cleanup | `bundle_id` comes only from this package's `Resources/Info.plist` (uninstall stops, removing nothing, if it can't be read). The login item is booted out and removed only if `~/Library/LaunchAgents/<id>.plist` is a regular file whose `Label` is that id. `defaults delete` / `tccutil reset` use that id only | `test_a_foreign_app_at_the_app_path_never_names_what_uninstall_cleans_up` (`--purge`; asserts no `launchctl`/`defaults`/`tccutil` call mentions the foreign id, the foreign plist and app survive, and this package's login item and grants are cleaned) |
+| 2 | Symlinked marker trusted | `marked_install()` in `uninstall.sh` mirrors `is_marked_install()`: regular, non-link file with the exact first line | `test_a_symlinked_install_marker_does_not_prove_ownership` (helper says unmarked; plugin kept; no `plugins disable` call) |
+
+Both regressions fail on the round-7 `uninstall.sh` and pass now. 858
+Python tests across the five suites. From the unzipped Desktop zip in a
+throwaway HOME: plain install refused; `--remove-legacy` set all six old
+pieces aside and kept the six others; a re-run with `--login-item`
+succeeded; `uninstall.sh --purge` removed this app, the marked plugin and
+this package's login item.
