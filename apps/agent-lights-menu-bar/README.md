@@ -79,23 +79,29 @@ none of which the current app reads. Before building, `install.sh` runs
   folder or the Trash (never touched).
 - **A Hermes core patch (blocking):** this tool never edits Hermes source.
   Use `scripts/hermes_core_patch.py` in the Hermes checkout (`hermes
-  --version` prints its "Install directory"):
+  --version` prints its "Install directory"). Its classification only
+  decides what is *eligible* for automatic removal; every removal also needs
+  your approval of the exact changes being discarded.
   1. `python3 scripts/hermes_core_patch.py inventory --hermes-dir <dir>`
      finds the stock baseline (merge-base with the branch's upstream, else
-     `origin/main`; override with `--baseline`) and lists committed, staged,
-     unstaged and untracked changes, classifying each changed path as
-     `agent-lights-file`, `agent-lights-only`, `mixed` or `unrelated` (and
-     printing the hunks of mixed files).
-  2. `... backup --hermes-dir <dir>` saves all of it (patches for staged,
-     unstaged and committed changes, a tar of untracked files, and git refs
-     to HEAD and the working tree) into a new
+     `origin/main`; override with `--baseline`), lists committed, staged,
+     unstaged and untracked changes, and classifies each path, judging the
+     staged and unstaged layers separately: `agent-lights-file` (a new file
+     at a known Agent Lights path), `agent-lights-only` (every added line in
+     both layers is Agent Lights code or bare syntax), `mixed`, `review` (a
+     new file elsewhere that mentions Agent Lights) or `unrelated`.
+  2. `... backup --hermes-dir <dir>` saves everything (staged, unstaged and
+     committed patches, untracked files, git refs, a fingerprint) into a new
      `~/.hermes/agent-lights-core-backup-<time>-<id>/`.
-  3. `... restore --hermes-dir <dir> --backup <that folder> --yes <paths>`
-     takes `agent-lights-file` and `agent-lights-only` paths back to the
-     baseline in both the index and the working tree (untracked ones are
-     moved into the backup). It refuses `mixed` and `unrelated` paths, and
-     refuses if the checkout changed since the backup. Edit mixed files by
-     hand, removing only the Agent Lights hunks.
+  3. `... review --hermes-dir <dir> <paths>` prints exactly what restoring
+     those paths would discard and an `APPROVAL DIGEST`.
+  4. `... restore --hermes-dir <dir> --backup <folder> --approved <digest>
+     --yes <paths>` takes them back to the baseline in both the index and the
+     working tree. It refuses `mixed`, `review` and `unrelated` paths, a
+     digest that no longer matches, and a backup that isn't of the current
+     state. Edit mixed files by hand, removing only the Agent Lights hunks.
+  5. To undo: `... recover --backup <folder> --yes` puts the checkout back
+     exactly as it was at backup time and verifies it.
   Then check `hermes` still starts, restart running Hermes sessions, and run
   `install.sh` again.
 
