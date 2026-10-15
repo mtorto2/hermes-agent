@@ -878,9 +878,9 @@ final class SlotStatusTests: XCTestCase {
     }
 
     func testAgentLightsSharedDirectoryIgnoresProfileScopedHermesHome() {
-        let directory = AgentLightsPath.sharedDirectory(userHomeDirectory: "/Users/matt")
+        let directory = AgentLightsPath.sharedDirectory(userHomeDirectory: "/Users/someone")
 
-        XCTAssertEqual(directory.path, "/Users/matt/.hermes/agent-lights/v2")
+        XCTAssertEqual(directory.path, "/Users/someone/.hermes/agent-lights/v2")
     }
 
     private func acquiredFD(_ outcome: AppInstanceLock.Outcome) throws -> Int32 {
