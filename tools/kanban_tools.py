@@ -31,6 +31,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 from typing import Any, Optional
 
 from agent.light_cues import LightCueEvent, build_light_cue_service_from_config
@@ -228,10 +229,26 @@ def _agent_run_usage(agent: Any) -> dict[str, Any]:
     return usage
 
 
+_kanban_light_cue_service = None
+_kanban_light_cue_service_lock = threading.Lock()
+
+
 def _emit_human_intervention_light_cue() -> None:
-    """Best-effort yellow Agent Lights cue when a Kanban worker blocks."""
+    """Best-effort yellow Agent Lights cue when a Kanban worker blocks.
+
+    The cue lights this process's own slot: the worker's in a dispatched
+    worker, or the orchestrator's normal slot when an orchestrator blocks a
+    card by explicit task id.
+    """
+    global _kanban_light_cue_service
     try:
-        build_light_cue_service_from_config({}, auto_assign_slot=True).emit(LightCueEvent.HUMAN_INTERVENTION)
+        # One service per process: rebuilding it per event re-ran slot
+        # claiming and stacked another atexit cleanup on every block.
+        with _kanban_light_cue_service_lock:
+            if _kanban_light_cue_service is None:
+                _kanban_light_cue_service = build_light_cue_service_from_config({}, auto_assign_slot=True)
+            service = _kanban_light_cue_service
+        service.emit(LightCueEvent.HUMAN_INTERVENTION)
     except Exception:
         logger.debug("Kanban block light cue failed", exc_info=True)
 

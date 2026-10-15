@@ -349,12 +349,58 @@ def test_block_emits_human_intervention_light_cue(worker_env, monkeypatch):
             emitted.append(getattr(event, "value", event))
             return True
 
-    monkeypatch.setattr(kt, "build_light_cue_service_from_config", lambda *a, **k: FakeLightCueService(), raising=False)
+    builds = []
+
+    def build(*a, **k):
+        builds.append(1)
+        return FakeLightCueService()
+
+    monkeypatch.setattr(kt, "build_light_cue_service_from_config", build, raising=False)
+    monkeypatch.setattr(kt, "_kanban_light_cue_service", None, raising=False)
 
     out = kt._handle_block({"reason": "need clarification"})
+    kt._emit_human_intervention_light_cue()
 
     assert json.loads(out)["ok"] is True
-    assert emitted == ["human_intervention"]
+    assert emitted == ["human_intervention", "human_intervention"]
+    # The worker reuses one service (and one slot claim) across block events.
+    assert builds == [1]
+
+
+def test_kanban_light_cue_service_is_built_once_under_concurrent_first_use(monkeypatch):
+    import threading as _threading
+
+    from tools import kanban_tools as kt
+
+    builds: list[int] = []
+    emitted: list[str] = []
+    gate = _threading.Barrier(16)
+
+    class FakeService:
+        def emit(self, event):
+            emitted.append(event.value)
+            return True
+
+    def slow_build(*args, **kwargs):
+        builds.append(1)
+        _threading.Event().wait(0.05)
+        return FakeService()
+
+    monkeypatch.setattr(kt, "build_light_cue_service_from_config", slow_build)
+    monkeypatch.setattr(kt, "_kanban_light_cue_service", None)
+
+    def call():
+        gate.wait()
+        kt._emit_human_intervention_light_cue()
+
+    threads = [_threading.Thread(target=call) for _ in range(16)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert builds == [1]
+    assert emitted == ["human_intervention"] * 16
 
 
 def test_block_rejects_empty_reason(worker_env):

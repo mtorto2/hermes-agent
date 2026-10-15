@@ -12,7 +12,9 @@ NSString * _Nullable AgentLightsTerminalTabSnapshot(pid_t processIdentifier) {
         if (terminal == nil) {
             return nil;
         }
-        terminal.timeout = 1;
+        // SBApplication.timeout is in ticks (1/60 s): 1 meant ~17 ms, which
+        // dropped tab titles whenever Terminal was briefly busy.
+        terminal.timeout = 60;
 
         NSMutableArray<NSString *> *records = [NSMutableArray array];
         SBElementArray *windows = [terminal elementArrayWithCode:'cwin'];
