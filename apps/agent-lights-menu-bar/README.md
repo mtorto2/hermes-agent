@@ -73,7 +73,12 @@ none of which the current app reads. Before building, `install.sh` runs
   is gone, every old login item is unloaded and no old copy still runs.
   Nothing is deleted.
 - **Backed up automatically:** a previous install of this plugin, when you
-  re-run `install.sh` after changes.
+  re-run `install.sh` after changes. `install.sh` marks the plugin it
+  installs with a `.agent-lights-install` file; only that marker (or an exact
+  match with the new plugin) identifies a previous install. Right before
+  replacing the app or a plugin, `install.sh` checks again that the path is
+  absent or a previous install, and refuses otherwise. `uninstall.sh`
+  likewise removes only this app (same bundle id) and marked plugins.
 - **Reported only:** a plugin that merely mentions Agent Lights (a README, a
   comment), an app you can't write to, and anything already inside a backup
   folder or the Trash (never touched).

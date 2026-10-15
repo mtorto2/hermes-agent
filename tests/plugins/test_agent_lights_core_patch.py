@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import importlib.util
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -217,3 +218,77 @@ def test_the_readme_commands_also_recover_exactly(repo, tmp_path):
         subprocess.run(["/bin/bash", "-c", command], check=True, cwd=tmp_path)
     assert core.state_fingerprint(repo) == before
     assert re.search(r"recover --backup \S+ --yes", readme)
+
+
+def _outside(tmp_path):
+    outside = tmp_path / "outside.txt"
+    outside.write_text("must not change\n")
+    return outside
+
+
+def test_recover_replaces_a_symlink_instead_of_writing_through_it(repo, tmp_path):
+    """Round 6 #1: on Python 3.9 tar extraction followed the link and wrote
+    outside the checkout, and the fingerprint read through the link."""
+    (repo / "notes.txt").write_text("my note\n")
+    label, base = _base(repo)
+    before = core.state_fingerprint(repo)
+    backup = core.backup(repo, label, base, parent=tmp_path / "backups")
+    outside = _outside(tmp_path)
+    (repo / "notes.txt").unlink()
+    (repo / "notes.txt").symlink_to(outside)
+    assert core.state_fingerprint(repo) != before  # a link is not the same state
+
+    assert core.main(["recover", "--backup", str(backup), "--yes"]) == 0
+    assert outside.read_text() == "must not change\n"
+    assert not (repo / "notes.txt").is_symlink()
+    assert (repo / "notes.txt").read_text() == "my note\n"
+    assert core.state_fingerprint(repo) == before
+
+
+def test_recover_refuses_before_changing_anything_when_a_parent_is_a_link(repo, tmp_path):
+    (repo / "docs").mkdir()
+    (repo / "docs" / "note.txt").write_text("my note\n")
+    label, base = _base(repo)
+    backup = core.backup(repo, label, base, parent=tmp_path / "backups")
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    shutil.rmtree(repo / "docs")
+    (repo / "docs").symlink_to(elsewhere)
+    (repo / "cli.py").write_text("changed after backup\n")
+    state = core.state_fingerprint(repo)
+
+    assert core.main(["recover", "--backup", str(backup), "--yes"]) == 2
+    assert core.state_fingerprint(repo) == state  # nothing was reset or written
+    assert list(elsewhere.iterdir()) == []
+
+
+@pytest.mark.macos_only
+@pytest.mark.skipif(not Path("/usr/bin/python3").exists(), reason="needs the system python3")
+def test_recover_symlink_case_on_the_system_python(repo, tmp_path):
+    """The same regression on the Command Line Tools' python3 (3.9 here)."""
+    (repo / "notes.txt").write_text("my note\n")
+    backup = subprocess.run(["/usr/bin/python3", "-I", str(_TOOL), "backup", "--hermes-dir", str(repo)],
+                            capture_output=True, text=True, check=True, env={"HOME": str(tmp_path)}).stdout.strip()
+    outside = _outside(tmp_path)
+    (repo / "notes.txt").unlink()
+    (repo / "notes.txt").symlink_to(outside)
+
+    done = subprocess.run(["/usr/bin/python3", "-I", str(_TOOL), "recover", "--backup", backup, "--yes"],
+                          capture_output=True, text=True, env={"HOME": str(tmp_path)})
+    assert done.returncode == 0, done.stderr
+    assert outside.read_text() == "must not change\n"
+    assert (repo / "notes.txt").read_text() == "my note\n" and not (repo / "notes.txt").is_symlink()
+
+
+def test_the_readme_tar_command_replaces_links_too(repo, tmp_path):
+    (repo / "notes.txt").write_text("my note\n")
+    label, base = _base(repo)
+    backup = core.backup(repo, label, base, parent=tmp_path / "backups")
+    outside = _outside(tmp_path)
+    (repo / "notes.txt").unlink()
+    (repo / "notes.txt").symlink_to(outside)
+
+    tar_line = next(line for line in (backup / "README.txt").read_text().splitlines() if "tar -x" in line)
+    subprocess.run(["/bin/bash", "-c", tar_line.split("#")[0]], check=True)
+    assert outside.read_text() == "must not change\n"
+    assert (repo / "notes.txt").read_text() == "my note\n"

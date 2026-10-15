@@ -284,7 +284,14 @@ def _fake_install(home: Path) -> Path:
     shutil.copy(_APP_DIR / "Resources" / "Info.plist", app / "Contents" / "Info.plist")
     for plugins in (home / ".hermes" / "plugins", home / ".hermes" / "profiles" / "work" / "plugins"):
         shutil.copytree(_APP_DIR / "plugin" / "agent-lights", plugins / "agent-lights")
+        _mark(plugins / "agent-lights")
+    (app / "Contents" / "MacOS" / "AgentLightsMenuBar").chmod(0o755)
     return app
+
+
+def _mark(plugin: Path) -> None:
+    """What install.sh writes into the plugin it installs."""
+    (plugin / ".agent-lights-install").write_text("agent-lights plugin installed by install.sh\n2026-10-15\n")
 
 
 def _run(script: str, box: dict, *args: str) -> subprocess.CompletedProcess:
@@ -672,6 +679,7 @@ def test_an_existing_agent_lights_plugin_is_backed_up_unless_identical(tmp_path,
     # A previous install of this plugin is backed up automatically...
     shutil.copytree(_PLUGIN_SRC, plugin, ignore=shutil.ignore_patterns("__pycache__"))
     (plugin / "protocol.py").write_text((plugin / "protocol.py").read_text() + "\n# local tweak\n")
+    _mark(plugin)
     [previous] = legacy.scan(ctx)
     assert previous.auto
     assert legacy.report([previous]) == legacy.EXIT_NONE
@@ -745,6 +753,7 @@ def test_automatic_plugin_backup_only_in_profiles_this_install_writes(tmp_path, 
         plugin = profile_home / "plugins" / "agent-lights"
         shutil.copytree(_PLUGIN_SRC, plugin, ignore=shutil.ignore_patterns("__pycache__"))
         (plugin / "protocol.py").write_text((plugin / "protocol.py").read_text() + "\n# tweak\n")
+        _mark(plugin)
 
     def profiles_hit(targets):
         return {f.profile for f in legacy.scan(_ctx(tmp_path, home, None, install_profiles=targets))}
@@ -802,6 +811,78 @@ def test_a_symlinked_old_plugin_is_found_and_only_the_link_moves(tmp_path, fake_
     assert not os.path.lexists(link) and (code / "__init__.py").exists()
 
 
+def test_comment_naming_the_producer_class_neither_identifies_nor_exempts(tmp_path, fake_system):
+    """Round 6 #3: a raw `class AgentLightsProducer` match made an unrelated
+    plugin 'previous install' (auto-removed) and exempted an old producer."""
+    home = tmp_path / "home"
+    unrelated = home / ".hermes" / "plugins" / "agent-lights"
+    unrelated.mkdir(parents=True)
+    (unrelated / "__init__.py").write_text("# like class AgentLightsProducer, but not\ndef register(ctx): pass\n")
+    old = home / ".hermes" / "profiles" / "work" / "plugins" / "lights"
+    old.mkdir(parents=True)
+    (old / "__init__.py").write_text("# class AgentLightsProducer\nfrom agent.light_cues import LightCueService\n")
+
+    findings = {f.path: f for f in legacy.scan(_ctx(tmp_path, home, None))}
+    assert findings[unrelated].removable and not findings[unrelated].auto  # needs --remove-legacy
+    assert findings[old].removable  # still inspected and found
+
+
+def test_a_string_mentioning_the_app_is_report_only(tmp_path, fake_system):
+    """Round 6 #4."""
+    home = tmp_path / "home"
+    plugin = home / ".hermes" / "plugins" / "status"
+    plugin.mkdir(parents=True)
+    (plugin / "__init__.py").write_text('def report_status():\n    return "AgentLightsMenuBar is not installed"\n')
+
+    [finding] = legacy.scan(_ctx(tmp_path, home, None))
+    assert finding.removable is False
+    assert legacy.remove(_ctx(tmp_path, home, None), [finding], tmp_path / "backup", None) == legacy.EXIT_NONE
+    assert plugin.exists()
+
+
+def test_a_canonical_name_link_outside_install_targets_is_inspected(tmp_path, fake_system):
+    """Round 6 #5."""
+    home = tmp_path / "home"
+    code = tmp_path / "src" / "old"
+    code.mkdir(parents=True)
+    (code / "__init__.py").write_text("import agent.light_cues\n")
+    link = home / ".hermes" / "profiles" / "work" / "plugins" / "agent-lights"
+    link.parent.mkdir(parents=True)
+    link.symlink_to(code)
+    (home / ".hermes" / "plugins").mkdir(parents=True)
+
+    for targets in ({"default"}, None):  # install run, and a standalone scan
+        [finding] = legacy.scan(_ctx(tmp_path, home, None, install_profiles=targets))
+        assert finding.path == link and finding.removable
+
+    # A marked current install linked there is left alone.
+    _mark(code)
+    assert legacy.scan(_ctx(tmp_path, home, None)) == []
+
+
+def test_replace_guard_allows_only_absent_paths_and_previous_installs(tmp_path):
+    app = tmp_path / "AgentLightsMenuBar-v2.app"
+    check_app = lambda: legacy.replaceable(app, kind="app", new_bundle_id=_NEW_ID, new_plugin_dir=_PLUGIN_SRC)
+    assert check_app() is None
+    app.mkdir()
+    (app / "notes.txt").write_text("x")
+    assert check_app() is not None
+    shutil.rmtree(app)
+    _old_bundle(app, _NEW_ID)
+    assert check_app() is None
+
+    plugin = tmp_path / "agent-lights"
+    check_plugin = lambda: legacy.replaceable(plugin, kind="plugin", new_bundle_id=None, new_plugin_dir=_PLUGIN_SRC)
+    plugin.write_text("a file")
+    assert check_plugin() is not None
+    plugin.unlink()
+    plugin.mkdir()
+    (plugin / "__init__.py").write_text("# class AgentLightsProducer\n")
+    assert check_plugin() is not None
+    _mark(plugin)
+    assert check_plugin() is None
+
+
 def test_a_hermes_core_patch_blocks_and_is_never_touched(tmp_path, fake_system):
     home, hermes_dir = tmp_path / "home", tmp_path / "hermes-agent"
     (hermes_dir / "agent").mkdir(parents=True)
@@ -854,6 +935,7 @@ def test_reinstalling_after_a_local_plugin_edit_backs_it_up_without_extra_flags(
     plugin = box["home"] / ".hermes" / "plugins" / "agent-lights"
     shutil.copytree(_PLUGIN_SRC, plugin, ignore=shutil.ignore_patterns("__pycache__"))
     (plugin / "protocol.py").write_text((plugin / "protocol.py").read_text() + "\n# local tweak\n")
+    _mark(plugin)
 
     done = _run("install.sh", box, "--no-test", "--yes")
     assert done.returncode == 0, done.stderr
@@ -874,6 +956,7 @@ def test_no_plugin_install_and_other_profiles_leave_plugins_alone(tmp_path):
     for plugin in (mine, theirs):
         shutil.copytree(_PLUGIN_SRC, plugin, ignore=shutil.ignore_patterns("__pycache__"))
         (plugin / "protocol.py").write_text((plugin / "protocol.py").read_text() + "\n# local tweak\n")
+        _mark(plugin)
 
     done = _run("install.sh", box, "--no-test", "--yes", "--no-plugin")
     assert done.returncode == 0, done.stderr
@@ -904,6 +987,42 @@ def test_unrecognized_contents_at_the_new_app_path_survive_install(tmp_path):
     assert done.returncode == 0, done.stderr
     [backup] = (box["home"] / ".hermes").glob("agent-lights-legacy-backup-*")
     assert (next(backup.glob("*-app-AgentLightsMenuBar-v2.app")) / "my-notes.txt").read_text() == "keep me\n"
+
+
+@pytest.mark.macos_only
+@pytest.mark.skipif(shutil.which("swift") is None, reason="needs the Swift toolchain")
+def test_allow_core_producer_never_lets_an_occupied_destination_be_deleted(tmp_path):
+    """Round 6 #2."""
+    box = _sandbox(tmp_path)
+    box["env"]["PATH"] = os.pathsep.join([box["env"]["PATH"], os.path.dirname(shutil.which("swift"))])
+    hermes_dir = tmp_path / "hermes-agent"
+    (hermes_dir / "agent").mkdir(parents=True)
+    (hermes_dir / "agent" / "light_cues.py").write_text("_AGENT_LIGHTS_POOL = 'v2'\n")
+    box["env"]["FAKE_HERMES_DIR"] = str(hermes_dir)
+    dest = box["home"] / "Applications" / "AgentLightsMenuBar-v2.app"
+    dest.mkdir(parents=True)
+    (dest / "my-notes.txt").write_text("keep me\n")
+
+    done = _run("install.sh", box, "--no-test", "--yes", "--no-plugin", "--allow-core-producer")
+
+    assert done.returncode != 0
+    assert (dest / "my-notes.txt").read_text() == "keep me\n"
+
+
+@pytest.mark.macos_only
+def test_uninstall_removes_only_what_install_put_there(tmp_path):
+    box = _sandbox(tmp_path)
+    app = _fake_install(box["home"])
+    (app / "Contents" / "Info.plist").write_bytes(
+        (app / "Contents" / "Info.plist").read_bytes().replace(_NEW_ID.encode(), b"com.someone.else"))
+    foreign = box["home"] / ".hermes" / "profiles" / "work" / "plugins" / "agent-lights"
+    (foreign / ".agent-lights-install").unlink()
+
+    done = _run("uninstall.sh", box, "--profile", "work", "--yes")
+
+    assert done.returncode == 0, done.stderr
+    assert app.exists() and foreign.exists()  # not ours: left in place
+    assert not (box["home"] / ".hermes" / "plugins" / "agent-lights").exists()  # ours: removed
 
 
 @pytest.mark.macos_only

@@ -166,7 +166,7 @@ case "$legacy_status" in
   11)
     if [ "$allow_core_producer" -eq 1 ]; then
       echo "Continuing with the Hermes core patch in place (--allow-core-producer)."
-      [ "$remove_legacy" -eq 1 ] || echo "Other pieces listed above stay in place unless you also pass --remove-legacy."
+      [ "$remove_legacy" -eq 1 ] || echo "If other pieces listed above need setting aside, install stops; add --remove-legacy."
     else
       die "Hermes itself contains an older Agent Lights patch (above). Restore those files to stock Hermes first; see README, \"Replacing an older install\"."
     fi
@@ -225,13 +225,18 @@ remove_status=$?
 set -e
 case "$remove_status" in
   0) ;;
-  10) [ "$allow_core_producer" -eq 1 ] || die "Older pieces are still in place; re-run with --remove-legacy." ;;
+  # --allow-core-producer excuses only the core patch, never pieces this
+  # install would otherwise replace or leave running beside it.
+  10) die "Older pieces are still in place (above); re-run with --remove-legacy." ;;
   11) [ "$allow_core_producer" -eq 1 ] || die "The Hermes core patch is still present." ;;
   *) die "Could not set aside every older piece (above); nothing new was installed." ;;
 esac
 
 say "Installing $DEST"
 # Replace the whole bundle: never write through an existing one.
+# Last guard: only an absent path or a previous install of this app is replaced.
+"$python_bin" -I "$legacy_tool" replaceable-app "$DEST" "${legacy_args[@]}" \
+  || die "Nothing new was installed."
 rm -rf "$DEST"
 ditto "$stage/$APP_NAME" "$DEST"
 
@@ -241,9 +246,15 @@ install_plugin_into() {
   local profile="$1" home
   home="$(profile_home "$profile")"
   mkdir -p "$home/plugins"
+  # Last guard: only an absent path, this plugin, or one this script
+  # installed (it carries the install marker) is replaced.
+  "$python_bin" -I "$legacy_tool" replaceable-plugin "$home/plugins/$PLUGIN_NAME" "${legacy_args[@]}" \
+    || die "The plugin was not installed in profile $profile."
   rm -rf "$home/plugins/$PLUGIN_NAME"
   cp -R "$HERE/plugin/$PLUGIN_NAME" "$home/plugins/$PLUGIN_NAME"
   find "$home/plugins/$PLUGIN_NAME" -name __pycache__ -type d -prune -exec rm -rf {} +
+  printf '%s\n%s\n' "agent-lights plugin installed by install.sh" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    > "$home/plugins/$PLUGIN_NAME/.agent-lights-install"
   env -u HERMES_HOME "$hermes_bin" -p "$profile" plugins enable "$PLUGIN_NAME"
 }
 

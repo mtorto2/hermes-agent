@@ -111,18 +111,32 @@ if [ -n "$bundle_id" ]; then
   fi
 fi
 
+# Remove only what install.sh put there: this app (same bundle id as this
+# package). Anything else at that path is left alone.
+expected_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$HERE/Resources/Info.plist" 2>/dev/null || true)"
 if [ -L "$DEST" ]; then
-  say "Removing symlink $DEST (not its target)"
-  rm -f "$DEST"
+  echo "warning: $DEST is a symlink, not something install.sh created; left in place." >&2
+elif [ -d "$DEST" ]; then
+  dest_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$DEST/Contents/Info.plist" 2>/dev/null || true)"
+  if [ -x "$DEST/Contents/MacOS/$EXECUTABLE" ] && [ -n "$expected_id" ] && [ "$dest_id" = "$expected_id" ]; then
+    say "Removing $DEST"
+    rm -rf "$DEST"
+  else
+    echo "warning: $DEST is not this Agent Lights app (bundle id '${dest_id:-none}'); left in place." >&2
+  fi
 elif [ -e "$DEST" ]; then
-  say "Removing $DEST"
-  rm -rf "$DEST"
+  echo "warning: $DEST is not an app; left in place." >&2
 fi
 
 remove_plugin_from() {
   local profile="$1" home
   home="$(profile_home "$profile")"
   [ -d "$home/plugins/$PLUGIN_NAME" ] || return 0
+  if [ -L "$home/plugins/$PLUGIN_NAME" ] \
+     || [ "$(head -n 1 "$home/plugins/$PLUGIN_NAME/.agent-lights-install" 2>/dev/null)" != "agent-lights plugin installed by install.sh" ]; then
+    echo "warning: $home/plugins/$PLUGIN_NAME was not installed by install.sh; left in place." >&2
+    return 0
+  fi
   say "Removing the Hermes plugin from profile $profile ($home)"
   if command -v hermes >/dev/null 2>&1; then
     env -u HERMES_HOME hermes -p "$profile" plugins disable "$PLUGIN_NAME" >/dev/null \

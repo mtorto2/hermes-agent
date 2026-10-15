@@ -229,10 +229,17 @@ def state_fingerprint(repo: Path) -> str:
     for raw in sorted(filter(None, git(repo, "ls-files", "--others", "--exclude-standard", "-z",
                                        text=False).stdout.split(b"\0"))):
         digest.update(raw + b"\0")
+        path = repo / raw.decode("utf-8", "surrogateescape")
+        # Type and link target count, not just contents read through a link.
         try:
-            digest.update((repo / raw.decode("utf-8", "surrogateescape")).read_bytes())
+            if path.is_symlink():
+                digest.update(b"L" + os.fsencode(os.readlink(path)))
+            elif path.is_file():
+                digest.update(b"F%o" % (path.stat().st_mode & 0o777) + path.read_bytes())
+            else:
+                digest.update(b"O")
         except OSError:
-            pass
+            digest.update(b"E")
         digest.update(b"\0")
     return digest.hexdigest()
 
@@ -308,7 +315,8 @@ def backup(repo: Path, label: str, baseline_sha: str, parent: Path = DEFAULT_BAC
         f"  git -C {q(str(repo.resolve()))} reset --hard {head}\n"
         f"  git -C {q(str(repo.resolve()))} apply --index --binary {q(str(target / 'staged.patch'))}\n"
         f"  git -C {q(str(repo.resolve()))} apply --binary {q(str(target / 'unstaged.patch'))}\n"
-        f"  tar -xf {q(str(target / 'untracked.tar'))} -C {q(str(repo.resolve()))}\n\n"
+        f"  tar -xUf {q(str(target / 'untracked.tar'))} -C {q(str(repo.resolve()))}"
+        "   # -U replaces links instead of writing through them\n\n"
         f"Git refs kept in the checkout: refs/agent-lights-backup/{backup_id}/head and /worktree.\n")
     return target
 
@@ -358,19 +366,88 @@ def restore(repo: Path, baseline_sha: str, backup_dir: Path, paths: list[str], a
     return 0
 
 
+class RecoverError(Exception):
+    pass
+
+
+def _check_member(repo: Path, member: tarfile.TarInfo) -> Path:
+    """Where `member` goes, refusing anything that could land outside `repo`.
+
+    Never relies on tarfile's extraction (on Python 3.9 it follows an existing
+    symlink at the destination): every parent must be a real directory inside
+    the checkout, and the destination itself may only be absent, a file or a
+    symlink (both are replaced, never written through).
+    """
+    rel = Path(member.name)
+    if rel.is_absolute() or ".." in rel.parts or not rel.parts:
+        raise RecoverError(f"unsafe path in backup: {member.name}")
+    if not (member.isfile() or member.issym() or member.isdir()):
+        raise RecoverError(f"unsupported entry in backup: {member.name}")
+    current = repo
+    for part in rel.parts[:-1]:
+        current = current / part
+        if current.is_symlink():
+            raise RecoverError(f"{current} is a symlink; refusing to write through it")
+        if os.path.lexists(current) and not current.is_dir():
+            raise RecoverError(f"{current} is in the way (not a directory)")
+    target = repo / rel
+    if not member.isdir() and target.is_dir() and not target.is_symlink():
+        raise RecoverError(f"{target} is a directory; refusing to replace it")
+    if member.isdir() and target.is_symlink():
+        raise RecoverError(f"{target} is a symlink; refusing to write through it")
+    return target
+
+
+def _restore_untracked(repo: Path, archive: tarfile.TarFile, members: list[tarfile.TarInfo]) -> None:
+    for member in members:
+        target = _check_member(repo, member)  # again: the reset may have changed things
+        for parent in reversed(target.parents):
+            if parent == repo or repo not in parent.parents:
+                continue
+            if not os.path.lexists(parent):
+                os.mkdir(parent)
+        if member.isdir():
+            if not os.path.lexists(target):
+                os.mkdir(target)
+            continue
+        if os.path.lexists(target):
+            os.unlink(target)  # a file or a symlink: replace it, never follow it
+        if member.issym():
+            os.symlink(member.linkname, target)
+            continue
+        data = archive.extractfile(member).read()
+        fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                     member.mode & 0o777)
+        os.fchmod(fd, member.mode & 0o777)  # creation mode is trimmed by the umask
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+
+
 def recover(backup_dir: Path) -> int:
     head_lines = (backup_dir / "HEAD.txt").read_text().splitlines()
     head, repo = head_lines[0], Path(head_lines[2])
-    git(repo, "reset", "--quiet", "--hard", head)
-    for name, extra in (("staged.patch", ["--index"]), ("unstaged.patch", [])):
-        patch = backup_dir / name
-        if patch.stat().st_size:
-            git(repo, "apply", *extra, "--binary", str(patch))
-    with tarfile.open(backup_dir / "untracked.tar") as archive:
-        if hasattr(tarfile, "data_filter"):
-            archive.extractall(repo, filter="tar")
-        else:
-            archive.extractall(repo)
+    archive = tarfile.open(backup_dir / "untracked.tar")
+    try:
+        members = archive.getmembers()
+        # Preflight: refuse before anything destructive happens.
+        try:
+            for member in members:
+                _check_member(repo, member)
+        except RecoverError as exc:
+            print(f"error: {exc}. Nothing was changed.", file=sys.stderr)
+            return 2
+        git(repo, "reset", "--quiet", "--hard", head)
+        for name, extra in (("staged.patch", ["--index"]), ("unstaged.patch", [])):
+            patch = backup_dir / name
+            if patch.stat().st_size:
+                git(repo, "apply", *extra, "--binary", str(patch))
+        try:
+            _restore_untracked(repo, archive, members)
+        except RecoverError as exc:
+            print(f"error: {exc}; tracked files were recovered, untracked files only partly.", file=sys.stderr)
+            return 1
+    finally:
+        archive.close()
     if state_fingerprint(repo) != (backup_dir / "fingerprint.txt").read_text():
         print("error: the checkout does not match the backup after recovery.", file=sys.stderr)
         return 1

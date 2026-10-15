@@ -67,11 +67,15 @@ OLD_BUNDLE_IDS = ("com.savant.hermes-agent-lights",)
 BACKUP_PREFIXES = ("agent-lights-legacy-backup-", "agent-lights-core-backup-")
 # Text that mentions Agent Lights somewhere (report-only for plugins).
 MENTIONS = re.compile(r"AgentLightsMenuBar|agent-lights|agent_lights|light_cues|LightCue")
-# Evidence, in executable code (not comments or docstrings), that a plugin
-# *is* an Agent Lights producer or launcher.
-PRODUCER_NAMES = {"SlotStatusFileBackend", "LightCueService", "AgentLightsMenuBarLauncher",
-                  "build_light_cue_service_from_config", "AgentLightsProducer", "InstalledAppLauncher"}
-POOL_STRING = re.compile(r"agent-lights[/\\](slots|agents|v2)")
+# Classes that implement an Agent Lights producer or launcher. Defining one,
+# or importing agent.light_cues, is the only evidence that makes a plugin
+# removable; mentions anywhere else (comments, docstrings, strings) are
+# report-only.
+PRODUCER_CLASSES = {"SlotStatusFileBackend", "AgentLightsMenuBarLauncher", "LightCueService"}
+# install.sh writes this into the plugin it installs; it is the only thing
+# that identifies a directory as an install of the current plugin.
+INSTALL_MARKER = ".agent-lights-install"
+MARKER_LINE = "agent-lights plugin installed by install.sh"
 
 
 @dataclass
@@ -145,20 +149,18 @@ def _text_files(directory: Path, limit: int = 300) -> list[Path]:
 
 
 def _producer_evidence(directory: Path) -> str | None:
-    """Why the plugin's *code* is an Agent Lights producer, or None.
+    """Why the plugin's code is an Agent Lights producer, or None.
 
-    Parses each .py file and looks only at executable code: imports of
-    agent.light_cues, Agent Lights class/function names, and string literals
-    naming the app or its status pool. Comments and docstrings don't count.
+    Only two things count, both from the parsed code: importing
+    agent.light_cues (the old core producer), or defining one of the
+    producer/launcher classes. Comments, docstrings and string literals never
+    count: a plugin that merely talks about Agent Lights is report-only.
     """
     for path in _code_files(directory):
         try:
             tree = ast.parse(path.read_text(encoding="utf-8", errors="ignore"))
         except (SyntaxError, ValueError, OSError):
             continue
-        bare_strings = {id(node.value) for node in ast.walk(tree)
-                        if isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant)
-                        and isinstance(node.value.value, str)}
         for node in ast.walk(tree):
             if isinstance(node, ast.Import) and any(a.name.startswith("agent.light_cues") for a in node.names):
                 return f"{path.name} imports agent.light_cues"
@@ -166,15 +168,20 @@ def _producer_evidence(directory: Path) -> str | None:
                     (node.module or "").startswith("agent.light_cues")
                     or (node.module == "agent" and any(a.name == "light_cues" for a in node.names))):
                 return f"{path.name} imports agent.light_cues"
-            name = node.id if isinstance(node, ast.Name) else node.attr if isinstance(node, ast.Attribute) else None
-            if name in PRODUCER_NAMES:
-                return f"{path.name} uses {name}"
-            if isinstance(node, ast.ClassDef) and node.name in PRODUCER_NAMES:
+            if isinstance(node, ast.ClassDef) and node.name in PRODUCER_CLASSES:
                 return f"{path.name} defines {node.name}"
-            if isinstance(node, ast.Constant) and isinstance(node.value, str) and id(node) not in bare_strings:
-                if "AgentLightsMenuBar" in node.value or POOL_STRING.search(node.value) or node.value == "agent-lights":
-                    return f"{path.name} names the Agent Lights app or status files in code"
     return None
+
+
+def is_marked_install(directory: Path) -> bool:
+    """A plugin directory install.sh wrote (it carries the install marker)."""
+    marker = directory / INSTALL_MARKER
+    if marker.is_symlink() or not marker.is_file():
+        return False
+    try:
+        return marker.read_text(encoding="utf-8", errors="ignore").splitlines()[:1] == [MARKER_LINE]
+    except OSError:
+        return False
 
 
 def _any_match(files: list[Path], pattern: re.Pattern) -> bool:
@@ -189,7 +196,7 @@ def _any_match(files: list[Path], pattern: re.Pattern) -> bool:
 
 def _same_tree(a: Path, b: Path) -> bool:
     """Same files with the same contents, ignoring __pycache__."""
-    cmp = filecmp.dircmp(a, b, ignore=["__pycache__", ".DS_Store"])
+    cmp = filecmp.dircmp(a, b, ignore=["__pycache__", ".DS_Store", INSTALL_MARKER])
 
     def same(c: filecmp.dircmp) -> bool:
         if c.left_only or c.right_only or c.funny_files:
@@ -310,46 +317,43 @@ def scan(ctx: Context) -> list[Finding]:
     for name, home in ctx.all_profile_homes():
         plugins = home / "plugins"
         target = ctx.install_profiles is not None and name in ctx.install_profiles
-        dest_plugin = plugins / NEW_PLUGIN_DIR
-        if target and os.path.lexists(dest_plugin) and (dest_plugin.is_symlink() or not dest_plugin.is_dir()):
-            add(Finding("plugin", dest_plugin, f"a file or link occupies the plugin path in profile {name}; "
-                        "backed up before replacing", profile=name))
         if plugins.is_dir():
             for plugin in sorted(plugins.iterdir()):
-                if plugin.name == NEW_PLUGIN_DIR and (plugin.is_symlink() or not plugin.is_dir()):
-                    continue  # handled above (install targets) or not ours to judge
-                if not plugin.is_dir():
+                is_link = plugin.is_symlink()
+                code_dir = Path(os.path.realpath(plugin)) if is_link else plugin
+                at_install_path = target and plugin.name == NEW_PLUGIN_DIR
+                if not code_dir.is_dir():
+                    # A plain file, or a link to a file or nowhere: harmless
+                    # unless this install is about to replace it.
+                    if at_install_path:
+                        add(Finding("plugin", plugin, f"a file or link occupies the plugin path in profile "
+                                    f"{name}; backed up before replacing", profile=name))
                     continue
                 plugin_name = plugin.name
-                manifest = plugin / "plugin.yaml"
+                manifest = code_dir / "plugin.yaml"
                 if manifest.is_file():
                     match = re.search(r"^name:\s*['\"]?([^'\"\n]+)", manifest.read_text(errors="ignore"), re.M)
                     plugin_name = match.group(1).strip() if match else plugin_name
-                is_link = plugin.is_symlink()
-                code_dir = Path(os.path.realpath(plugin)) if is_link else plugin
                 where = f" (a link to {code_dir}; only the link is moved)" if is_link else ""
-                is_current = _any_match([code_dir / "__init__.py"], re.compile(r"class AgentLightsProducer\b"))
-                if plugin.name == NEW_PLUGIN_DIR and not is_link:
-                    if not target:
-                        # Not replaced by this install: a current plugin there is
-                        # simply another profile's install; judge anything else
-                        # like any other plugin below.
-                        if is_current:
-                            continue
+                if at_install_path:
+                    # install.sh replaces this path: back up anything there
+                    # unless it is exactly the new plugin.
+                    if is_link:
+                        add(Finding("plugin", plugin, f"a link occupies the plugin path in profile {name}{where}; "
+                                    "backed up before replacing", profile=name, plugin_name=plugin_name))
                     elif ctx.new_plugin_dir and _same_tree(plugin, ctx.new_plugin_dir):
-                        continue
-                    elif is_current:
+                        pass
+                    elif is_marked_install(plugin):
                         add(Finding("plugin", plugin, f"previous install of this plugin in profile {name}; "
                                     "backed up before being replaced", profile=name, plugin_name=plugin_name,
                                     auto=True))
-                        continue
                     else:
                         add(Finding("plugin", plugin, f"another '{plugin.name}' plugin in profile {name} "
-                                    "(not this one); backed up before being replaced",
+                                    "(not installed by this install.sh); backed up before being replaced",
                                     profile=name, plugin_name=plugin_name))
-                        continue
-                if is_current:
-                    continue  # the current plugin under another name (or linked): leave it
+                    continue
+                if is_marked_install(code_dir):
+                    continue  # the current plugin, installed in a profile this run doesn't touch
                 evidence = _producer_evidence(code_dir)
                 if evidence:
                     add(Finding("plugin", plugin, f"old Agent Lights plugin '{plugin_name}' in profile {name}: "
@@ -512,6 +516,25 @@ def remove(ctx: Context, findings: list[Finding], backup: Path | None, hermes_bi
     return EXIT_NONE
 
 
+def replaceable(path: Path, *, kind: str, new_bundle_id: str | None, new_plugin_dir: Path | None) -> str | None:
+    """Why install.sh must not delete `path` to replace it, or None if it may.
+
+    The last guard before each `rm -rf` in install.sh: only an absent path or
+    a previous install of the same thing may be replaced.
+    """
+    if not os.path.lexists(path):
+        return None
+    if path.is_symlink() or not path.is_dir():
+        return f"{path} is not a directory this install created"
+    if kind == "app":
+        if (path / "Contents" / "MacOS" / EXECUTABLE).is_file() and new_bundle_id and _bundle_id(path) == new_bundle_id:
+            return None
+        return f"{path} is not a previous install of this app"
+    if (new_plugin_dir and _same_tree(path, new_plugin_dir)) or is_marked_install(path):
+        return None
+    return f"{path} is not a previous install of this plugin"
+
+
 def _default_new_bundle_id() -> str | None:
     try:
         with open(HERE.parent / "Resources" / "Info.plist", "rb") as handle:
@@ -522,7 +545,8 @@ def _default_new_bundle_id() -> str | None:
 
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("command", choices=["scan", "remove"])
+    parser.add_argument("command", choices=["scan", "remove", "replaceable-app", "replaceable-plugin"])
+    parser.add_argument("target", nargs="?", help="replaceable-*: the path install.sh is about to replace")
     parser.add_argument("--hermes-dir")
     parser.add_argument("--hermes-bin")
     parser.add_argument("--profile", action="append", default=[])
@@ -547,6 +571,13 @@ def main(argv: list[str]) -> int:
         confine=Path(confine) if confine else None,
         install_profiles=set(args.install_profile) if args.install_profile else None,
     )
+    if args.command.startswith("replaceable-"):
+        problem = replaceable(Path(args.target), kind=args.command.split("-", 1)[1],
+                              new_bundle_id=args.new_bundle_id, new_plugin_dir=ctx.new_plugin_dir)
+        if problem:
+            print(f"error: refusing to replace: {problem}; back it up first (--remove-legacy).", file=sys.stderr)
+            return EXIT_FAILED
+        return EXIT_NONE
     findings = scan(ctx)
     if args.command == "scan":
         return report(findings)
