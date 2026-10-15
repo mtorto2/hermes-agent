@@ -121,3 +121,23 @@ All four tests touching changed behavior fail on the round-2 helper (4 of 4)
 and pass now. Rerun: 812 Python tests across the same four files, `git diff
 --check` clean. Swift and E2E unchanged since round 2 (no Swift or plugin
 changes).
+
+## Review outcome (2026-10-15)
+
+Hermes, round 3: **PASS** for `fff204b808..efc8eef0df`; the independent
+reviewer also passed it. Rounds 1 and 2 findings are all resolved. Hermes
+reran 811 Python tests (excluding the Swift-building install test) plus
+temporary-pool lock probes.
+
+This is a code-review pass, not release verification. Still open before the
+tarball goes to a friend or the branch goes live:
+
+- a fresh macOS account (or the friend's Mac): first Accessibility and
+  Terminal-automation prompts, and that a locally built app opens without a
+  Gatekeeper prompt;
+- a real launch of the installed `~/Applications/AgentLightsMenuBar-v2.app`;
+- the visible dot-order smoke test with real Terminal tabs.
+
+Merging to live `main` additionally costs one Accessibility + Terminal
+automation re-grant on Matt's Mac (bundle id change) and needs Matt's
+approval.
