@@ -73,3 +73,30 @@ and its defaults on 2026-10-14.
 
 No merge to `main`, no push to `fork`, no app rebuild/relaunch on the live
 machine. Each needs Matt's separate approval after review.
+
+## Round 2: response to review (changes requested → fixed)
+
+Re-review range: `a881951994..HEAD` (fixes `b11e11269c`, `775839a345`,
+`94ab2dec6f`, plus this note). Paths relative to `apps/agent-lights-menu-bar/`.
+
+| Finding | Fix | Proof |
+| --- | --- | --- |
+| P1 purge under live sessions | New `scripts/agent_lights_pool.py`: `check` before anything is removed; `purge` takes every `.claim.lock` (root, `slots/`, `agents/`; never creates or replaces them), refuses if any `.json`/`.lock`/`app.json` owner PID is alive (PID-only, errs toward refusing), else clears everything but the `.claim.lock` files | `test_purge_refuses_while_a_session_owns_a_slot_and_keeps_its_files` (real owner process; a second claimant still gets slot 2), `..._keeps_the_claim_locks` (lock inode unchanged), `..._waits_out_a_claim_in_progress_then_gives_up`, `test_uninstall_purge_refuses_up_front_while_a_session_owns_a_slot` |
+| P2 wrong profile | Both scripts: `env -u HERMES_HOME hermes -p <profile> plugins enable/disable`; targets are profile names (`default` always) mapped to `~/.hermes[/profiles/NAME]` | Stubbed argv tests for install and uninstall; real upstream `hermes` with sticky `active_profile=work` and `HERMES_HOME=<root>` exported: install/uninstall touched only default. The old command line in the same setup went to `work` ("only be enabled or disabled…") |
+| P2 blocked worker loses yellow | Worker task outcome kept past the turn: failed → error > blocked → human_intervention > completed → final_answer > interrupted → idle | `test_blocked_kanban_worker_stays_yellow_through_its_turn_end` (reply / no reply / interrupted), `..._completed_kanban_task_stays_red_and_a_failed_turn_still_shows_error`, `..._keeps_its_state_when_the_process_exits` (real files + `clear_if_owned`) |
+| P2 subagent approvals | Human-input/approval/clarify events count only while the root turn is open and only from its session id (known children and other ids ignored; events without an id still need the open turn) | `test_background_subagent_approvals_never_touch_a_finished_parent` (both hook paths, with and without `session_id`), `test_subagent_human_input_during_the_parent_turn_is_ignored`; E2E still passes, so the root clarify carries the root session id on both releases |
+| P2 uninstall continues if app won't quit | Aborts, removing nothing | `test_uninstall_aborts_before_removing_anything_when_the_app_will_not_quit` (persistent `pgrep` stub) |
+| P2 dangling legacy alias | `install.sh` resolves both `AgentLightsMenuBar.app` and its executable path with non-strict `realpath` (follows dangling links) before building | `test_install_refuses_a_dangling_legacy_alias_before_building` |
+| P2 relative package path | Output dir made absolute before `git -C` | `test_package_source_honors_a_relative_output_directory` |
+| Minor `/Users/matt` fixtures | Swift fixture uses `/Users/someone` | `swift test` 62 passed |
+
+Every new script test fails when run against the reviewed scripts (6 of 6)
+and passes on the fixes. Rerun: 808 Python tests across
+`tests/agent/test_light_cues.py`, `tests/plugins/test_agent_lights_plugin.py`,
+`tests/plugins/test_agent_lights_scripts.py`, `tests/test_tui_gateway_server.py`;
+`swift test` 62; `scripts/plugin_e2e.py` PASS on upstream main `7bda2a3368`
+and `v2026.8.31`; `git diff --check` clean.
+
+New dependency for `install.sh` / `uninstall.sh --purge`: `python3` (from the
+Command Line Tools, which Swift already requires). Release gates in "Not
+verified" above are unchanged.
