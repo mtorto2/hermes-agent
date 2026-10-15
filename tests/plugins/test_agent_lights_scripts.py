@@ -560,6 +560,27 @@ def test_a_plugin_that_only_mentions_agent_lights_is_reported_not_moved(tmp_path
     assert planted["keep"]["mention_only"].exists()
 
 
+def test_report_only_items_and_running_copies_do_not_block(tmp_path, fake_system):
+    home = tmp_path / "home"
+    mention = home / ".hermes" / "plugins" / "diagnostics"
+    mention.mkdir(parents=True)
+    (mention / "README.md").write_text("Compatible with agent-lights.\n")
+
+    findings = legacy.scan(_ctx(tmp_path, home, None))
+    assert [f.removable for f in findings] == [False]
+    assert legacy.report(findings) == legacy.EXIT_NONE
+
+
+def test_a_running_old_copy_leads_to_its_bundle_wherever_it_is(tmp_path, fake_system):
+    home = tmp_path / "home"
+    (home / ".hermes").mkdir(parents=True)
+    odd = _old_bundle(tmp_path / "Downloads" / "Lights.app")
+    fake_system.processes = [("4242", str(odd / "Contents" / "MacOS" / "AgentLightsMenuBar"))]
+
+    apps = [f for f in legacy.scan(_ctx(tmp_path, home, None)) if f.kind == "app"]
+    assert [f.path for f in apps] == [odd] and apps[0].removable
+
+
 def test_legacy_remove_moves_everything_into_a_new_backup_and_verifies(tmp_path, fake_system):
     home, hermes_dir = tmp_path / "home", tmp_path / "hermes-agent"
     planted = _plant_old_install(home, hermes_dir)
@@ -751,8 +772,12 @@ def test_install_stops_on_an_old_install_then_sets_it_aside_with_remove_legacy(t
     for path in planted["old"].values():
         assert not path.exists(), path
     assert planted["keep"]["mention_only"].exists()
+    # Re-running (the update path) works without flags: only report-only
+    # items remain, and the previous install is simply replaced.
+    again = _run("install.sh", box, "--no-test", "--yes")
+    assert again.returncode == 0, again.stderr
     backups = list((box["home"] / ".hermes").glob("agent-lights-legacy-backup-*"))
-    assert len(backups) == 1 and (backups[0] / "MANIFEST.txt").exists()
+    assert len(backups) == 1 and (backups[0] / "MANIFEST.txt").exists()  # the re-run set nothing aside
     assert (box["home"] / "Applications" / "AgentLightsMenuBar-v2.app" / "Contents" / "Info.plist").exists()
 
 

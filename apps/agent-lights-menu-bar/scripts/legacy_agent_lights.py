@@ -218,6 +218,11 @@ def scan(ctx: Context) -> list[Finding]:
             candidates += [p for p in build.iterdir() if p.suffix == ".app"]
     if ctx.spotlight:
         candidates += _spotlight_apps()
+    # A running old copy tells us where its bundle is, wherever that is.
+    for _, command in _old_processes(ctx):
+        parts = Path(command).parts
+        if len(parts) >= 4 and parts[-2:] == ("MacOS", EXECUTABLE) and parts[-3] == "Contents":
+            candidates.append(Path(*parts[:-3]))
     queue = list(candidates)
     while queue:
         app = queue.pop(0)
@@ -326,7 +331,8 @@ def report(findings: list[Finding]) -> int:
     if not findings:
         print("No older Agent Lights install found.")
         return EXIT_NONE
-    print("Older Agent Lights pieces found:")
+    actionable = [f for f in findings if f.removable or f.kind == "core"]
+    print("Older Agent Lights pieces found:" if actionable else "Notes (nothing to set aside):")
     for f in findings:
         if f.removable:
             tag = "set aside by --remove-legacy"
@@ -341,7 +347,8 @@ def report(findings: list[Finding]) -> int:
         print("\nThe Hermes core patch must be removed before installing (see README, \"Replacing an\n"
               "older install\"). This tool never edits Hermes source.")
         return EXIT_BLOCKING
-    return EXIT_FOUND
+    # Report-only items and running copies (install quits them) don't block.
+    return EXIT_FOUND if actionable else EXIT_NONE
 
 
 def _new_backup_dir(home: Path) -> Path:
