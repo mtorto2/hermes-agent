@@ -176,3 +176,37 @@ Delivered to Matt's Desktop: `agent-lights-src-20261015-5ee4d3df4c.zip`
 (+ `.sha256`) and `agent-lights-prompt-for-hermes.md`, a step-by-step prompt
 for the friend's Hermes agent (inventory, git-restore of a core patch with
 his OK and a backup, `install.sh --remove-legacy`, verification).
+
+## Round 5: response to round 4 (changes requested → fixed, not yet reviewed)
+
+Re-review range: `6857d34177..HEAD` (fixes `2ef7220ac7`, `dd0765e75e`, plus
+this note) and the rewritten `~/Desktop/agent-lights-prompt-for-hermes.md`.
+Zip rebuilt from `dd0765e75e`: `~/Desktop/agent-lights-src-20261015-dd0765e75e.zip`
+(+ `.sha256`); the earlier zips were moved off the Desktop.
+
+| # | Finding | Fix | Proof |
+| --- | --- | --- | --- |
+| 1 | Prompt's `git diff` + `git checkout --` | New `scripts/hermes_core_patch.py` (`inventory` / `backup` / `restore`); the prompt now uses only it. Baseline = merge-base with upstream (else `origin/main`, or `--baseline`); classification per `-U0` hunk; backup = new unique folder with staged/unstaged/committed patches, untracked tar, refs to HEAD and an index+worktree snapshot; restore takes index **and** worktree to the baseline only for `agent-lights-file` / `agent-lights-only` paths, only against a backup fingerprinting the exact current state; `mixed` refused | `tests/plugins/test_agent_lights_core_patch.py`: the reviewer's fixture (staged AL hunk + unrelated unstaged edit) is `mixed`, refused, both preserved in the backup; committed + staged + untracked patch removed with index and worktree equal to stock and unrelated work untouched; stale backup refused; `--yes` required |
+| 2 | Backup reuse overwrote data | Backup folder created exclusively (`mkdir`, time + random id), never reused; existing destination refused; manifest appended + fsync per move | `test_backups_are_never_reused_or_overwritten` |
+| 3 | Tests could reach real `/Applications` | `AGENT_LIGHTS_SYSTEM_APPLICATIONS` replaces `/Applications`; `AGENT_LIGHTS_LEGACY_CONFINE` refuses moves outside a root; every legacy/install test sets both and stubs `ps`/`launchctl`/`mdfind`/`hermes` | `test_moves_outside_the_allowed_root_are_refused`; sandbox env |
+| 4 | Text mention removed a plugin | Only producer code (imports `agent.light_cues`, `SlotStatusFileBackend`, pool paths, `AgentLightsMenuBar`) makes a plugin removable; mentions are report-only and don't block | `test_a_plugin_that_only_mentions_agent_lights_is_reported_not_moved`, `test_report_only_items_and_running_copies_do_not_block` |
+| 5 | Spotlight re-found backups | Paths inside `agent-lights-legacy-backup-*`, `agent-lights-core-backup-*` or `.Trash` are ignored | `test_backed_up_apps_found_by_spotlight_are_not_active_installs` |
+| 6 | Standalone scan flagged the new login item | Default `--new-bundle-id` read from `Resources/Info.plist` | `test_standalone_scan_knows_the_current_login_item` |
+| 7 | Old `agent-lights` plugin deleted unsaved | Existing `plugins/agent-lights` is backed up unless identical to the new one (a previous install of this plugin automatically, via `remove --auto-only`; anything else needs `--remove-legacy`). Same for anything at the new app path whose bundle id isn't the new one | `test_an_existing_agent_lights_plugin_is_backed_up_unless_identical`, `test_another_app_at_the_new_apps_path_is_backed_up`, `test_reinstalling_after_a_local_plugin_edit_backs_it_up_without_extra_flags` |
+| 8 | Alias moved, real app left | Alias and target are separate findings (dedup on the unresolved path); post-move check that every item is gone | `test_an_alias_and_the_app_it_points_to_are_both_set_aside` |
+| 9 | Core status masked failures | Any failure returns 12 before the core status is considered | `test_failures_win_over_an_allowed_core_patch` |
+| 10 | Unload / process failures ignored | `launchctl print` before and after `bootout` (not loaded = fine; still loaded = failure, plist not moved); old processes rechecked after removal; plugin-disable failure is noted but the directory is still moved (that is what stops it loading) | `test_a_login_item_that_will_not_unload_or_an_old_copy_still_running_fails` |
+
+Also found while fixing: a report-only plugin made every later install (the
+update path) demand `--remove-legacy`; now report-only items don't block. A
+running old copy's executable path now leads the scan to its bundle.
+
+Evidence: 835 Python tests across `tests/agent/test_light_cues.py`,
+`tests/plugins/test_agent_lights_plugin.py`, `test_agent_lights_scripts.py`,
+`test_agent_lights_core_patch.py`, `tests/test_tui_gateway_server.py`.
+The Desktop zip, unpacked with `ditto -x -k` into a throwaway HOME with every
+old-install shape planted: plain install refused; `--remove-legacy` set all
+six aside and installed, keeping the mention-only plugin and new pieces; a
+plain re-run then succeeded. Read-only `scan` and `inventory` on Matt's Mac
+ran cleanly (baseline = merge-base with `fork/main`). Swift code unchanged
+since round 2.
