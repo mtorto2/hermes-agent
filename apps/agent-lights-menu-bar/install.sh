@@ -21,6 +21,8 @@ login_item=0
 install_plugin=1
 assume_yes=0
 sign_identity="-"
+remove_legacy=0
+allow_core_producer=0
 profiles=()
 
 usage() {
@@ -34,6 +36,13 @@ Usage: ./install.sh [options]
   --no-test            Skip `swift test`.
   --login-item         Open the app at login (a LaunchAgent).
   --sign-identity ID   Sign with this certificate instead of ad-hoc ("-").
+  --remove-legacy      Set aside pieces of an older Agent Lights install
+                       (old apps, login items, plugins, status files) into
+                       ~/.hermes/agent-lights-legacy-backup-<time>/. Without
+                       it, install stops and lists them.
+  --allow-core-producer
+                       Install even though Hermes itself contains an Agent
+                       Lights patch (only for the Hermes fork it came from).
   --yes                Don't ask before quitting a running Agent Lights app.
   -h, --help           Show this help.
 EOF
@@ -46,6 +55,8 @@ while [ $# -gt 0 ]; do
     --no-test) run_tests=0; shift ;;
     --login-item) login_item=1; shift ;;
     --sign-identity) [ $# -ge 2 ] || { echo "--sign-identity needs a value" >&2; exit 2; }; sign_identity="$2"; shift 2 ;;
+    --remove-legacy) remove_legacy=1; shift ;;
+    --allow-core-producer) allow_core_producer=1; shift ;;
     --yes|-y) assume_yes=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
@@ -125,6 +136,39 @@ PYCODE
 )"
 [ -z "$legacy_problem" ] || die "$legacy_problem; remove the old AgentLightsMenuBar.app alias and re-run."
 
+# -- an older Agent Lights install ---------------------------------------------
+
+hermes_dir=""
+if [ -n "$hermes_bin" ]; then
+  hermes_dir="$("$hermes_bin" --version 2>/dev/null | sed -n 's/^Install directory: //p' | head -1)"
+fi
+legacy_args=(--new-bundle-id "$bundle_id")
+[ -n "$hermes_dir" ] && legacy_args+=(--hermes-dir "$hermes_dir")
+[ -n "$hermes_bin" ] && legacy_args+=(--hermes-bin "$hermes_bin")
+for profile in ${profiles[@]+"${profiles[@]}"}; do legacy_args+=(--profile "$profile"); done
+legacy_tool="$HERE/scripts/legacy_agent_lights.py"
+
+say "Checking for an older Agent Lights install"
+set +e
+"$python_bin" -I "$legacy_tool" scan "${legacy_args[@]}"
+legacy_status=$?
+set -e
+case "$legacy_status" in
+  0) ;;
+  10)
+    [ "$remove_legacy" -eq 1 ] || die "Older Agent Lights pieces are installed (above). Re-run with --remove-legacy to move them into a backup folder (nothing is deleted)."
+    ;;
+  11)
+    if [ "$allow_core_producer" -eq 1 ]; then
+      echo "Continuing with the Hermes core patch in place (--allow-core-producer)."
+      [ "$remove_legacy" -eq 1 ] || echo "Other pieces listed above stay in place unless you also pass --remove-legacy."
+    else
+      die "Hermes itself contains an older Agent Lights patch (above). Restore those files to stock Hermes first; see README, \"Replacing an older install\"."
+    fi
+    ;;
+  *) die "The older-install check failed (exit $legacy_status)." ;;
+esac
+
 # -- build -------------------------------------------------------------------
 
 say "Building the app (swift build -c release)"
@@ -161,6 +205,19 @@ if pgrep -x "$EXECUTABLE" >/dev/null 2>&1; then
   else
     die "Quit Agent Lights (menu > Quit Hermes Agent Lights) and re-run."
   fi
+fi
+
+if [ "$legacy_status" -ne 0 ] && [ "$remove_legacy" -eq 1 ]; then
+  say "Setting aside the older Agent Lights install"
+  set +e
+  "$python_bin" -I "$legacy_tool" remove "${legacy_args[@]}"
+  remove_status=$?
+  set -e
+  case "$remove_status" in
+    0) ;;
+    11) [ "$allow_core_producer" -eq 1 ] || die "The Hermes core patch is still present." ;;
+    *) die "Could not set aside every older piece (above); nothing new was installed." ;;
+  esac
 fi
 
 say "Installing $DEST"

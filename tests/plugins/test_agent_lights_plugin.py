@@ -313,6 +313,21 @@ def test_register_stands_down_where_core_already_produces(monkeypatch):
     assert "pre_llm_call" in ctx.hooks
 
 
+def test_plugin_runs_beside_an_old_pre_v2_core_patch(monkeypatch):
+    """An older core patch writes a pool the current app ignores, so the plugin
+    must not stand down for it."""
+    import importlib.machinery
+    import types
+
+    old_core = types.ModuleType("agent.light_cues")
+    old_core.__spec__ = importlib.machinery.ModuleSpec("agent.light_cues", None)
+    monkeypatch.setitem(sys.modules, "agent.light_cues", old_core)
+    assert plugin.fork_producer_present() is False
+
+    old_core._AGENT_LIGHTS_POOL = "v2"
+    assert plugin.fork_producer_present() is True
+
+
 def test_register_is_inert_off_macos(monkeypatch):
     ctx = SimpleNamespace(hooks=[], register_hook=lambda name, cb: ctx.hooks.append(name))
     monkeypatch.setattr(plugin.sys, "platform", "linux")

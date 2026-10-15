@@ -11,9 +11,9 @@ You need macOS 14 or later, Swift 6 (Xcode, or the Command Line Tools:
 Developer account is involved: the app is built and signed on your Mac.
 
 ```bash
-tar -xzf agent-lights-src-*.tar.gz
+unzip agent-lights-src-*.zip
 cd agent-lights
-./install.sh
+bash install.sh
 ```
 
 `install.sh` builds the app (`swift build -c release`), runs `swift test`,
@@ -27,6 +27,8 @@ app. Options:
 | `--login-item` | Open the app at login (a LaunchAgent). Not needed for normal use: Hermes opens the app when a session starts. |
 | `--no-plugin` | Install only the app. |
 | `--no-test` | Skip `swift test`. |
+| `--remove-legacy` | Move the pieces of an older Agent Lights install into `~/.hermes/agent-lights-legacy-backup-<time>/` (see "Replacing an older install"). |
+| `--allow-core-producer` | Install even though Hermes itself carries an Agent Lights patch. Only for the Hermes fork Agent Lights came from. |
 | `--sign-identity ID` | Sign with a certificate you have instead of ad-hoc. |
 | `--yes` | Don't ask before quitting a running copy. |
 
@@ -50,9 +52,37 @@ status files, the app's preferences and its privacy grants; it is refused
 because clearing the pool under a running session lets two sessions share a
 slot. Exit those sessions first.
 
+### Replacing an older install
+
+Earlier Agent Lights builds were installed by patching Hermes itself
+(`agent/light_cues.py` plus edits to `cli.py`, `tui_gateway/server.py` and
+`tools/kanban_tools.py`). That patch builds and opens its own
+`apps/agent-lights-menu-bar/.build/AgentLightsMenuBar.app` inside the Hermes
+checkout and writes status files under each profile's `agent-lights/` folder,
+none of which the current app reads. `install.sh` checks for every such piece
+before building (`python3 scripts/legacy_agent_lights.py scan` runs the same
+check on its own):
+
+- **Old apps, login items, plugins and status files:** install stops and
+  lists them. Re-run with `--remove-legacy` to quit any old copy and move
+  them all into `~/.hermes/agent-lights-legacy-backup-<time>/`, with a
+  `MANIFEST.txt` of where each came from. Nothing is deleted; an app in
+  `/Applications` that you can't write to is listed for you to remove.
+- **A Hermes core patch:** install stops; the script never edits Hermes
+  source. Restore those files to stock Hermes, for example in the Hermes
+  checkout (`hermes --version` prints its "Install directory"):
+  `git status` and `git diff` to see the local changes, save them with
+  `git diff > ~/agent-lights-core-patch.diff` (and copy any untracked
+  `agent/light_cues.py`, `agent/wiz_light.py`), then `git checkout --` the
+  changed files and remove the untracked ones. If the patch was committed,
+  compare with `git log origin/main..HEAD` instead. Check that `hermes`
+  still starts, restart running Hermes sessions, and run `install.sh` again.
+
 ### How the plugin reports state
 
-The plugin maps Hermes hooks to dot states: a turn starting is **working**; a
+The plugin maps Hermes hooks to dot states (on Hermes without an Agent Lights
+core patch; beside an older pre-v2 patch it still runs, since that patch
+writes files the current app ignores): a turn starting is **working**; a
 clarify question, command approval or sudo prompt is **waiting for you**
 until answered; a finished turn is **answer ready**, a failed one **error**,
 and an interrupted one **idle**. Kanban workers report blocked and completed
@@ -339,7 +369,7 @@ Two producers write the slot files, following the same protocol:
   real agent turn on any Hermes checkout against a local fake model and
   checks the slot file goes working → waiting → working → answer ready.
 
-`scripts/package-source.sh` writes the tarball to hand out: committed files
+`scripts/package-source.sh` writes the zip to hand out: committed files
 under this folder only.
 
 Hermes will best-effort launch the companion app when a CLI/TUI instance claims

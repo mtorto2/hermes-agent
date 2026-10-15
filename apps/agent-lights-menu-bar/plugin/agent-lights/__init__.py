@@ -27,6 +27,7 @@ Delegated subagents run in-process and are ignored. On macOS only.
 
 from __future__ import annotations
 
+import importlib
 import importlib.util
 import logging
 import os
@@ -309,11 +310,19 @@ def hook_table(producer: AgentLightsProducer, valid_hooks: set[str] | frozenset[
 
 
 def fork_producer_present() -> bool:
-    """True on the Hermes fork that writes Agent Lights from core already."""
+    """True when Hermes core already writes the current (v2) Agent Lights pool.
+
+    That is the Hermes fork Agent Lights started in. An older core patch
+    (pre-v2) writes a pool the current app ignores, so the plugin still runs
+    beside it rather than leave the session without a dot.
+    """
     try:
-        return importlib.util.find_spec("agent.light_cues") is not None
-    except (ImportError, ValueError):
+        if importlib.util.find_spec("agent.light_cues") is None:
+            return False
+        module = importlib.import_module("agent.light_cues")
+    except Exception:
         return False
+    return getattr(module, "_AGENT_LIGHTS_POOL", None) == "v2"
 
 
 def register(ctx) -> None:
@@ -322,7 +331,7 @@ def register(ctx) -> None:
         return
     if fork_producer_present():
         # Two producers in one process would claim two slots for one session.
-        logger.info("agent-lights: this Hermes writes Agent Lights from core; plugin inactive.")
+        logger.info("agent-lights: this Hermes writes Agent Lights (v2) from core; plugin inactive.")
         return
     from hermes_cli.plugins import VALID_HOOKS
 
