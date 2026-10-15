@@ -167,10 +167,82 @@ def test_kanban_worker_reports_its_own_task_only(producer, monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_1")
     producer.on_pre_llm_call(session_id="w", platform="kanban", user_message="work")
     producer.on_kanban_task_blocked(task_id="t_2")
-    producer.on_kanban_task_blocked(task_id="t_1")
-    producer.on_kanban_task_completed(task_id="t_1")
+    producer.on_kanban_task_completed(task_id="t_2")
 
-    assert producer.backend.events == ["working", "human_intervention", "final_answer"]
+    assert producer.backend.events == ["working"]
+
+
+@pytest.mark.parametrize(
+    ("response", "end"),
+    [("I'm blocked on credentials.", {}), ("", {}), ("", {"interrupted": True})],
+)
+def test_blocked_kanban_worker_stays_yellow_through_its_turn_end(producer, monkeypatch, response, end):
+    """The worker explains the block and its turn ends; the dot must stay yellow."""
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_1")
+    producer.on_pre_llm_call(session_id="w", platform="kanban", user_message="work")
+    producer.on_kanban_task_blocked(task_id="t_1")
+    producer.on_post_llm_call(session_id="w", platform="kanban", assistant_response=response)
+    producer.on_session_end(session_id="w", platform="kanban", **{"completed": True, **end})
+
+    assert producer.backend.events[-1] == "human_intervention"
+
+
+def test_completed_kanban_task_stays_red_and_a_failed_turn_still_shows_error(producer, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_1")
+    producer.on_pre_llm_call(session_id="w", platform="kanban", user_message="work")
+    producer.on_kanban_task_completed(task_id="t_1")
+    producer.on_session_end(session_id="w", platform="kanban", completed=True)
+    assert producer.backend.events[-1] == "final_answer"
+
+    producer.on_pre_llm_call(session_id="w", platform="kanban", user_message="again")
+    producer.on_kanban_task_blocked(task_id="t_1")
+    producer.on_session_end(session_id="w", platform="kanban", failed=True)
+    assert producer.backend.events[-1] == "error"
+
+
+def test_blocked_worker_keeps_its_state_when_the_process_exits(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_AGENT_LIGHTS_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_1")
+    monkeypatch.delenv("HERMES_SLOT", raising=False)
+    worker = plugin.AgentLightsProducer(launcher=RecordingLauncher())
+    worker.on_pre_llm_call(session_id="w", platform="kanban", user_message="work")
+    worker.on_kanban_task_blocked(task_id="t_1")
+    worker.on_session_end(session_id="w", platform="kanban", completed=True)
+
+    worker._backend.clear_if_owned()  # what atexit runs
+
+    payload = json.loads((tmp_path / "agent-lights" / "v2" / "agents" / "1.json").read_text())
+    assert payload["state"] == "human_intervention"
+
+
+@pytest.mark.parametrize("fallback", [False, True])
+def test_background_subagent_approvals_never_touch_a_finished_parent(producer, fallback):
+    producer.on_pre_llm_call(session_id="parent", platform="cli", user_message="go")
+    producer.on_subagent_start(parent_session_id="parent", child_session_id="child")
+    producer.on_post_llm_call(session_id="parent", platform="cli", assistant_response="started it")
+    producer.on_session_end(session_id="parent", platform="cli", completed=True)
+    # The background child asks for approval after the parent's turn ended.
+    if fallback:
+        producer.on_pre_approval_request(surface="cli", session_id="child")
+        producer.on_post_approval_response(surface="cli", session_id="child", choice="deny")
+        # Older builds may omit session_id entirely.
+        producer.on_pre_approval_request(surface="cli")
+        producer.on_post_approval_response(surface="cli", choice="deny")
+    else:
+        producer.on_human_input_request(request_id="r", kind="approval", session_id="child")
+        producer.on_human_input_resolved(request_id="r", kind="approval", session_id="child")
+
+    assert producer.backend.events == ["working", "final_answer"]
+
+
+def test_subagent_human_input_during_the_parent_turn_is_ignored(producer):
+    producer.on_pre_llm_call(session_id="parent", platform="cli", user_message="go")
+    producer.on_subagent_start(parent_session_id="parent", child_session_id="child")
+    producer.on_human_input_request(request_id="c", kind="approval", session_id="child")
+    producer.on_pre_approval_request(surface="cli", session_id="other-session")
+    producer.on_human_input_request(request_id="p", kind="clarify", session_id="parent")
+
+    assert producer.backend.events == ["working", "human_intervention"]
 
 
 def test_claim_retries_on_later_events_and_launches_once(monkeypatch):

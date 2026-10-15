@@ -7,11 +7,13 @@ the menu-bar app draws one dot per slot. Hook mapping:
 - ``pre_llm_call``                         -> working
 - ``on_human_input_request`` (clarify,
   approval, sudo prompts)                  -> human_intervention, back to working
-                                              when every open request resolves
+                                              when every open request resolves;
+                                              only for the open root turn
 - ``on_session_end`` (fires once per turn) -> error if failed, idle if
   interrupted, final_answer if ``post_llm_call`` saw a response, else idle
 - ``kanban_task_blocked`` / ``_completed`` -> human_intervention / final_answer
-  in the worker running that task
+  in the worker running that task, kept through the turn's end (only a
+  failed turn overrides it, with error)
 
 Hermes builds without the ``on_human_input_*`` hooks fall back to
 ``pre_tool_call``/``post_tool_call`` for the clarify tool and
@@ -59,6 +61,12 @@ class AgentLightsProducer:
         # worker). Hooks that carry no platform act only once it is set.
         self._active = False
         self._model: str | None = None
+        # The root session's open turn: human-input events count only while
+        # it is open and only from that session (never a subagent's).
+        self._turn_open = False
+        self._root_session: str | None = None
+        # This Kanban worker's own task outcome ("blocked" / "completed").
+        self._task_outcome: str | None = None
         self._child_sessions: set[str] = set()
         self._open_human_requests: set[str] = set()
         self._responded: set[str] = set()
@@ -146,6 +154,9 @@ class AgentLightsProducer:
             return None
         with self._lock:
             self._active = True
+            self._turn_open = True
+            self._root_session = str(session_id) if session_id else None
+            self._task_outcome = None
             if model:
                 self._model = str(model)
             self._responded.discard(session_id)
@@ -173,8 +184,17 @@ class AgentLightsProducer:
             responded = session_id in self._responded
             self._responded.discard(session_id)
             self._open_human_requests.clear()
+            self._turn_open = False
+            task_outcome = self._task_outcome
+        # A Kanban worker's task outcome outlives its turn: a blocked task
+        # stays yellow and a completed one red even if the turn then ends
+        # without a reply or is interrupted. Only a failed turn overrides it.
         if failed:
             self._emit(LightCueEvent.ERROR)
+        elif task_outcome == "blocked":
+            self._emit(LightCueEvent.HUMAN_INTERVENTION)
+        elif task_outcome == "completed":
+            self._emit(LightCueEvent.FINAL_ANSWER)
         elif interrupted:
             self._emit(LightCueEvent.IDLE)
         elif responded:
@@ -189,17 +209,31 @@ class AgentLightsProducer:
 
     # -- waiting on a human --------------------------------------------------
 
-    def human_input_requested(self, request_id: str) -> None:
-        if not self._active:
-            return
+    def _human_input_applies(self, session_id: Any) -> bool:
+        """Whether a human-input event belongs to the root session's open turn.
+
+        Subagents (including background ones that outlive the parent's turn)
+        fire the same hooks; they must not change the parent's dot.
+        """
+        if not self._active or not self._turn_open:
+            return False
+        if session_id and session_id in self._child_sessions:
+            return False
+        if session_id and self._root_session and str(session_id) != self._root_session:
+            return False
+        return True
+
+    def human_input_requested(self, request_id: str, session_id: Any = None) -> None:
         with self._lock:
+            if not self._human_input_applies(session_id):
+                return
             self._open_human_requests.add(request_id)
         self._emit(LightCueEvent.HUMAN_INTERVENTION)
 
-    def human_input_resolved(self, request_id: str) -> None:
-        if not self._active:
-            return
+    def human_input_resolved(self, request_id: str, session_id: Any = None) -> None:
         with self._lock:
+            if not self._human_input_applies(session_id):
+                return
             if request_id not in self._open_human_requests:
                 return
             self._open_human_requests.discard(request_id)
@@ -207,30 +241,32 @@ class AgentLightsProducer:
         if not still_waiting:
             self._emit(LightCueEvent.WORKING)
 
-    def on_human_input_request(self, request_id: Any = None, **_: Any) -> None:
-        self.human_input_requested(str(request_id or "human-input"))
+    def on_human_input_request(self, request_id: Any = None, session_id: Any = None, **_: Any) -> None:
+        self.human_input_requested(str(request_id or "human-input"), session_id)
 
-    def on_human_input_resolved(self, request_id: Any = None, **_: Any) -> None:
-        self.human_input_resolved(str(request_id or "human-input"))
+    def on_human_input_resolved(self, request_id: Any = None, session_id: Any = None, **_: Any) -> None:
+        self.human_input_resolved(str(request_id or "human-input"), session_id)
 
     # Fallbacks for Hermes builds without on_human_input_*.
 
-    def on_pre_tool_call(self, tool_name: Any = None, tool_call_id: Any = None, **_: Any) -> None:
+    def on_pre_tool_call(self, tool_name: Any = None, tool_call_id: Any = None,
+                         session_id: Any = None, **_: Any) -> None:
         if tool_name == "clarify":
-            self.human_input_requested(f"clarify:{tool_call_id or ''}")
+            self.human_input_requested(f"clarify:{tool_call_id or ''}", session_id)
 
-    def on_post_tool_call(self, tool_name: Any = None, tool_call_id: Any = None, **_: Any) -> None:
+    def on_post_tool_call(self, tool_name: Any = None, tool_call_id: Any = None,
+                          session_id: Any = None, **_: Any) -> None:
         if tool_name == "clarify":
-            self.human_input_resolved(f"clarify:{tool_call_id or ''}")
+            self.human_input_resolved(f"clarify:{tool_call_id or ''}", session_id)
 
-    def on_pre_approval_request(self, surface: Any = None, **_: Any) -> None:
+    def on_pre_approval_request(self, surface: Any = None, session_id: Any = None, **_: Any) -> None:
         # "smart" approvals are decided by an auxiliary model, not a person.
         if surface != "smart":
-            self.human_input_requested("approval")
+            self.human_input_requested("approval", session_id)
 
-    def on_post_approval_response(self, surface: Any = None, **_: Any) -> None:
+    def on_post_approval_response(self, surface: Any = None, session_id: Any = None, **_: Any) -> None:
         if surface != "smart":
-            self.human_input_resolved("approval")
+            self.human_input_resolved("approval", session_id)
 
     # -- Kanban workers ------------------------------------------------------
 
@@ -240,10 +276,14 @@ class AgentLightsProducer:
 
     def on_kanban_task_blocked(self, task_id: Any = None, **_: Any) -> None:
         if self._is_own_task(task_id):
+            with self._lock:
+                self._task_outcome = "blocked"
             self._emit(LightCueEvent.HUMAN_INTERVENTION)
 
     def on_kanban_task_completed(self, task_id: Any = None, **_: Any) -> None:
         if self._is_own_task(task_id):
+            with self._lock:
+                self._task_outcome = "completed"
             self._emit(LightCueEvent.FINAL_ANSWER)
 
 
