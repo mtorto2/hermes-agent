@@ -57,14 +57,19 @@ for profile in ${profiles[@]+"${profiles[@]}"}; do
   [ "$profile" = "default" ] || targets+=("$profile")
 done
 
-# Prefer the installed app's id; fall back to the one in this folder.
-bundle_id=""
-for plist in "$DEST/Contents/Info.plist" "$HERE/Resources/Info.plist"; do
-  if [ -f "$plist" ]; then
-    bundle_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$plist" 2>/dev/null || true)"
-    [ -n "$bundle_id" ] && break
-  fi
-done
+# This package's own identity. Never taken from whatever sits at the app
+# path: a foreign app there must not decide which login item, preferences
+# or privacy grants get removed.
+bundle_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$HERE/Resources/Info.plist" 2>/dev/null || true)"
+[ -n "$bundle_id" ] || die "Cannot read this package's bundle id from $HERE/Resources/Info.plist; nothing was removed."
+
+# install.sh's marker, checked like the Python helper does: a regular file
+# (never a link) whose first line is exactly this.
+marked_install() {
+  local marker="$1/.agent-lights-install"
+  [ -f "$marker" ] && [ ! -L "$marker" ] \
+    && [ "$(head -n 1 "$marker" 2>/dev/null)" = "agent-lights plugin installed by install.sh" ]
+}
 
 # -- checks before removing anything ------------------------------------------
 
@@ -102,8 +107,9 @@ fi
 
 # -- removal -----------------------------------------------------------------
 
-if [ -n "$bundle_id" ]; then
-  agent_plist="$HOME/Library/LaunchAgents/$bundle_id.plist"
+agent_plist="$HOME/Library/LaunchAgents/$bundle_id.plist"
+agent_label="$(/usr/libexec/PlistBuddy -c 'Print :Label' "$agent_plist" 2>/dev/null || true)"
+if [ -f "$agent_plist" ] && [ ! -L "$agent_plist" ] && [ "$agent_label" = "$bundle_id" ]; then
   launchctl bootout "gui/$(id -u)/$bundle_id" >/dev/null 2>&1 || true
   if [ -f "$agent_plist" ]; then
     say "Removing login item $agent_plist"
@@ -113,12 +119,11 @@ fi
 
 # Remove only what install.sh put there: this app (same bundle id as this
 # package). Anything else at that path is left alone.
-expected_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$HERE/Resources/Info.plist" 2>/dev/null || true)"
 if [ -L "$DEST" ]; then
   echo "warning: $DEST is a symlink, not something install.sh created; left in place." >&2
 elif [ -d "$DEST" ]; then
   dest_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$DEST/Contents/Info.plist" 2>/dev/null || true)"
-  if [ -x "$DEST/Contents/MacOS/$EXECUTABLE" ] && [ -n "$expected_id" ] && [ "$dest_id" = "$expected_id" ]; then
+  if [ -x "$DEST/Contents/MacOS/$EXECUTABLE" ] && [ "$dest_id" = "$bundle_id" ]; then
     say "Removing $DEST"
     rm -rf "$DEST"
   else
@@ -132,8 +137,7 @@ remove_plugin_from() {
   local profile="$1" home
   home="$(profile_home "$profile")"
   [ -d "$home/plugins/$PLUGIN_NAME" ] || return 0
-  if [ -L "$home/plugins/$PLUGIN_NAME" ] \
-     || [ "$(head -n 1 "$home/plugins/$PLUGIN_NAME/.agent-lights-install" 2>/dev/null)" != "agent-lights plugin installed by install.sh" ]; then
+  if [ -L "$home/plugins/$PLUGIN_NAME" ] || ! marked_install "$home/plugins/$PLUGIN_NAME"; then
     echo "warning: $home/plugins/$PLUGIN_NAME was not installed by install.sh; left in place." >&2
     return 0
   fi
@@ -155,12 +159,11 @@ if [ "$purge" -eq 1 ]; then
   if ! "$python_bin" -I "$POOL_TOOL" purge "$POOL"; then
     die "The app and plugin were removed, but $POOL was not cleared (see above). Re-run with --purge once those sessions exit."
   fi
-  if [ -n "$bundle_id" ]; then
-    say "Removing preferences and privacy grants for $bundle_id"
-    defaults delete "$bundle_id" >/dev/null 2>&1 || true
-    tccutil reset Accessibility "$bundle_id" >/dev/null 2>&1 || true
-    tccutil reset AppleEvents "$bundle_id" >/dev/null 2>&1 || true
-  fi
+  # This package's own id (never the app path's), so only its data goes.
+  say "Removing preferences and privacy grants for $bundle_id"
+  defaults delete "$bundle_id" >/dev/null 2>&1 || true
+  tccutil reset Accessibility "$bundle_id" >/dev/null 2>&1 || true
+  tccutil reset AppleEvents "$bundle_id" >/dev/null 2>&1 || true
 fi
 
 say "Agent Lights removed. Restart Hermes sessions to unload the plugin."

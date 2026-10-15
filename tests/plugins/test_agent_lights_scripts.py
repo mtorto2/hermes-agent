@@ -1026,6 +1026,48 @@ def test_uninstall_removes_only_what_install_put_there(tmp_path):
 
 
 @pytest.mark.macos_only
+def test_a_foreign_app_at_the_app_path_never_names_what_uninstall_cleans_up(tmp_path):
+    """Round 7 #1: the foreign app's bundle id drove bootout, plist removal,
+    defaults and TCC resets."""
+    box = _sandbox(tmp_path)
+    app = _fake_install(box["home"])
+    (app / "Contents" / "Info.plist").write_bytes(
+        (app / "Contents" / "Info.plist").read_bytes().replace(_NEW_ID.encode(), b"com.someone.else"))
+    agents = box["home"] / "Library" / "LaunchAgents"
+    foreign_agent = _write_plist(agents / "com.someone.else.plist", {"Label": "com.someone.else"})
+    own_agent = _write_plist(agents / f"{_NEW_ID}.plist", {"Label": _NEW_ID})
+
+    done = _run("uninstall.sh", box, "--purge", "--yes")
+
+    assert done.returncode == 0, done.stderr
+    assert app.exists() and foreign_agent.exists()
+    assert not own_agent.exists()
+    effects = _calls(box, "launchctl") + _calls(box, "defaults") + _calls(box, "tccutil")
+    assert not [call for call in effects if "com.someone.else" in call]
+    assert any(f"bootout gui/{os.getuid()}/{_NEW_ID}" in call for call in effects)
+    assert any(f"tccutil reset Accessibility {_NEW_ID}" in call for call in effects)
+
+
+@pytest.mark.macos_only
+def test_a_symlinked_install_marker_does_not_prove_ownership(tmp_path):
+    """Round 7 #2: uninstall read the marker through a link."""
+    box = _sandbox(tmp_path)
+    _fake_install(box["home"])
+    plugin = box["home"] / ".hermes" / "plugins" / "agent-lights"
+    real_marker = tmp_path / "marker"
+    real_marker.write_text("agent-lights plugin installed by install.sh\n")
+    (plugin / ".agent-lights-install").unlink()
+    (plugin / ".agent-lights-install").symlink_to(real_marker)
+    assert legacy.is_marked_install(plugin) is False  # the helper's view
+
+    done = _run("uninstall.sh", box, "--yes")
+
+    assert done.returncode == 0, done.stderr
+    assert plugin.exists()
+    assert not [call for call in _calls(box, "hermes") if " plugins disable " in call and "-p default" in call]
+
+
+@pytest.mark.macos_only
 @pytest.mark.skipif(shutil.which("swift") is None, reason="needs the Swift toolchain")
 def test_install_refuses_while_hermes_core_carries_an_old_patch(tmp_path):
     box = _sandbox(tmp_path)
