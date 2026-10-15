@@ -1,8 +1,10 @@
 # Agent Lights distribution plan (2026-10-14)
 
 Goal: a friend running stock Hermes can install Agent Lights (the macOS
-menu-bar dots for Hermes session activity) without running Matt's fork, and
-Matt's own builds stop losing the Accessibility grant on every rebuild.
+menu-bar dots for Hermes session activity) without running Matt's fork.
+Matt hands over source; the friend builds, installs, and tweaks it locally.
+No Apple Developer account, Developer ID, notarization, or prebuilt binary
+(decided 2026-10-14).
 
 Status: **plan only, awaiting approval.** No runtime code has changed. Hermes
 reviews every code change before it goes live; nothing is pushed (the fork on
@@ -91,81 +93,66 @@ so profile sessions still share one surface.
 plugin logs once and registers nothing, so the two producers never claim
 twice for one process.
 
-## 2. App distribution
+## 2. App distribution: source handoff, local build
 
-### Signing identity
+Matt sends the source; the friend builds it on their Mac. There is no
+release binary, so no signing identity, notarization, or Gatekeeper override
+is involved: a locally built, ad-hoc-signed app is never quarantined.
 
-Today the launcher ad-hoc signs (`codesign --sign -`), so the designated
-requirement is the cdhash and every rebuild drops the Accessibility and
-Automation (Terminal) grants.
+### What gets sent
 
-This Mac has two **Apple Development** identities and **no Developer ID
-Application** certificate.
+`scripts/package-source.sh` writes `agent-lights-src-<date>.tar.gz` (via
+`git archive`, so only tracked files) containing:
 
-Recommendation, in order:
+- `apps/agent-lights-menu-bar/` (Swift package, tests, README)
+- the plugin directory `plugin/agent-lights/`
+- `install.sh`, `uninstall.sh`
 
-1. **Developer ID Application + notarization** (needs a paid Apple Developer
-   Program membership on one of those teams). The designated requirement is
-   then the team-anchored certificate, so grants survive every rebuild on both
-   Macs, and the friend's Gatekeeper accepts the download with no override.
-2. **If there is no paid membership:** sign with one of the existing Apple
-   Development identities. The requirement is still certificate-anchored, so
-   grants survive rebuilds, but Gatekeeper will not pass a quarantined copy;
-   the friend must use System Settings > Privacy & Security > Open Anyway once
-   (or install with the script, see below).
+It contains nothing else from the fork. Before the first handoff, check the
+tree for anything personal (paths, the "Matt's active Hermes lanes" README
+wording, the `com.savant` bundle id). Matt delivers the tarball however he
+likes (Dropbox, AirDrop, message).
 
-Either way the signing identity becomes a build-script parameter
-(`AGENT_LIGHTS_SIGN_IDENTITY`), never hard-coded, and ad-hoc stays the
-fallback for contributors with no certificate.
+### Signing and the Accessibility grant
 
-Hardened runtime (`--options runtime`) is required for notarization; the app
-needs no extra entitlements (Accessibility and Apple Events are TCC, not
-entitlements; `NSAppleEventsUsageDescription` is already in the plist).
+The build stays ad-hoc signed (`codesign --sign -`). Consequence, accepted:
+macOS ties the Accessibility and Terminal-automation grants to the build's
+code hash, so after each rebuild the friend re-grants Accessibility (the app
+already prompts once per build) and Terminal automation. Accessibility is
+optional: without it the dots fall back to tab-open order (see README).
+`install.sh` accepts `--sign-identity <name>` for anyone who does have a
+certificate, but nothing requires one.
 
-### Neutral bundle id
+### Bundle id
 
-Current id is `com.savant.hermes-agent-lights`. Proposed:
-`io.github.mtorto2.agent-lights` (see open questions). Changing it moves the
-UserDefaults domain (monitor opacity, prompt marker) and the TCC entries, so
-Matt grants Accessibility and Terminal automation once more after the switch.
-The bundle **name** stays `AgentLightsMenuBar-v2.app`, so the bundle guard is
-untouched; display name stays "Hermes Agent Lights".
-
-### Release build
-
-`scripts/build-release.sh` in `apps/agent-lights-menu-bar/`:
-
-1. `swift test`
-2. `swift build -c release --arch arm64 --arch x86_64` (universal, macOS 14+)
-3. assemble `AgentLightsMenuBar-v2.app` from a checked-in
-   `Resources/Info.plist` (moved out of the Python string in
-   `light_cues.py`), with `CFBundleShortVersionString`/`CFBundleVersion` taken
-   from a `VERSION` file
-4. `codesign --force --options runtime --timestamp --sign "$IDENTITY"`;
-   `codesign --verify --strict`; `lipo -archs` check
-5. if Developer ID: `xcrun notarytool submit --wait` and `xcrun stapler staple`
-6. produce `agent-lights-<version>.zip` containing the app, the plugin
-   directory, `install.sh`, `uninstall.sh`, and a short README, plus a
-   `SHA256SUMS`
+Switch the default from `com.savant.hermes-agent-lights` to the neutral
+`io.github.mtorto2.agent-lights`, set in one checked-in `Resources/Info.plist`
+so the friend can change it. On Matt's Mac this costs nothing extra: ad-hoc
+builds already need a re-grant every rebuild. The bundle **name** stays
+`AgentLightsMenuBar-v2.app`, so the bundle guard is untouched.
 
 ### Install script (`install.sh`)
 
-- Checks macOS 14+, finds the Hermes home (`HERMES_HOME` or `~/.hermes`).
-- Gets the app: from the zip it ships in (default), or `--build` to build from
-  source with `swift build` and local signing (needs Swift 6 toolchain).
+- Checks macOS 14+ and a Swift 6 toolchain (`swift --version`; Xcode or the
+  Command Line Tools). If missing, prints `xcode-select --install` and stops.
+- Runs `swift build -c release` for the host architecture and `swift test`
+  (skipped with `--no-test`).
+- Assembles `AgentLightsMenuBar-v2.app` from `Resources/Info.plist`,
+  ad-hoc signs it, and verifies with `codesign --verify --strict`.
 - Quits a running Agent Lights app gracefully (asks first; never `kill -9`),
-  then installs to `~/Applications/AgentLightsMenuBar-v2.app` with
-  `ditto`, replacing the whole bundle (never writing through an existing
-  bundle, matching the launcher's alias-safety rule). Refuses if that path is a
-  symlink or if a sibling `AgentLightsMenuBar.app` resolves into it.
+  then installs to `~/Applications/AgentLightsMenuBar-v2.app` with `ditto`,
+  replacing the whole bundle (never writing through an existing bundle, the
+  launcher's alias-safety rule). Refuses if that path is a symlink or if a
+  sibling `AgentLightsMenuBar.app` resolves into it.
 - Installs the plugin with `hermes plugins install <path>` and
   `hermes plugins enable agent-lights` (per profile with `--profile`, since
   plugin dirs are per `HERMES_HOME`).
-- `--login-item`: writes `~/Library/LaunchAgents/<bundle-id>.plist`
+- `--login-item` (opt-in): writes `~/Library/LaunchAgents/<bundle-id>.plist`
   (`/usr/bin/open -g <app>`, `RunAtLoad`) and `launchctl bootstrap`s it. The
   app's single-instance lock makes a duplicate start harmless.
-- Prints the two manual steps: Terminal > Settings > Profiles > Tab > TTY,
-  and the Accessibility grant (the app prompts once).
+- Prints the manual steps: Terminal > Settings > Profiles > Tab > TTY, and
+  the Accessibility grant (the app prompts once per build).
+- Re-running it after editing the source is the update path.
 
 ### Uninstall script (`uninstall.sh`)
 
@@ -201,58 +188,44 @@ and only when no installed app exists. The plugin never builds or signs.
    tests (trusted → never; same build → once; new build → again), and add a
    scripted manual smoke check to the README:
    `tccutil reset Accessibility <bundle-id>`, launch (one prompt), relaunch
-   (none), rebuild + launch (one; with stable signing, none after the grant).
+   (none), rebuild + launch (one prompt again: ad-hoc builds lose the grant).
 
 ## 4. Work list (after approval)
 
 Each step is its own commit, reviewed by Hermes before it goes live.
 
 1. Swift follow-ups from §3, with tests (`swift test`).
-2. `Resources/Info.plist` + `VERSION`; bundle id switch; launcher reads the
-   plist instead of the inline string.
-3. `scripts/build-release.sh` (universal, signing identity parameter,
-   optional notarization) and verify on this Mac: `lipo`, `codesign
-   --verify`, `spctl -a -vv` (Developer ID only).
-4. Plugin `apps/agent-lights-menu-bar/plugin/agent-lights/`
+2. `Resources/Info.plist` with the neutral bundle id; the fork's launcher
+   reads it instead of the inline plist string.
+3. Plugin `apps/agent-lights-menu-bar/plugin/agent-lights/`
    (`plugin.yaml`, `__init__.py`, `protocol.py`): hook mapping from §1,
-   fork-detection no-op, surface filter, subagent filter.
-5. Plugin tests: unit tests for the event mapping and protocol; the
+   fork-detection no-op, surface filter, subagent filter, `idle` on
+   interrupt.
+4. Plugin tests: unit tests for the event mapping and protocol; the
    cross-producer conformance test; an E2E run against a temp `HERMES_HOME` on
    a clean upstream checkout (`git worktree` of `origin/main`) driving a real
    CLI turn with clarify and asserting the slot file transitions.
-6. Fork launcher prefers the installed app (§2).
-7. `install.sh` / `uninstall.sh`, tested on a second macOS user account (fresh
-   TCC, fresh defaults) as a stand-in for the friend's Mac.
-8. README: install/uninstall, signing, troubleshooting (Ice hiding the item,
-   TTY titles, re-granting).
+5. Fork launcher prefers the installed app (§2).
+6. `install.sh` / `uninstall.sh` / `scripts/package-source.sh`, tested by
+   unpacking the tarball and installing on a second macOS user account
+   (fresh TCC, fresh defaults) as a stand-in for the friend's Mac.
+7. README: install/uninstall, rebuild-and-re-grant, troubleshooting (Ice
+   hiding the item, TTY titles), and neutral wording for a non-Matt user.
 
 Development stays in this fork under `apps/agent-lights-menu-bar/`; the
 plugin directory is outside `plugins/`, so the fork does not auto-discover it.
-It can move to a standalone repo when publishing is no longer deferred.
 
-## 5. Open questions for Matt
+## 5. Decisions (2026-10-14)
 
-1. **Apple Developer Program:** is either Apple Development team a paid
-   membership, so we can get a Developer ID certificate and notarize? If not,
-   OK to sign with "Apple Development: Matthew Tortorich" and have the friend
-   use Open Anyway once?
-2. **Bundle id:** `io.github.mtorto2.agent-lights`, or something else? (Costs
-   one re-grant on your Mac.)
-3. **Friend's Hermes version:** do they track upstream `main`, or install
-   tagged releases? `on_human_input_request` is only on `main` since
-   2026-10-04; on `v2026.8.31` the plugin uses the clarify/approval fallback
-   and sudo prompts will not show yellow.
-4. **Delivery channel** while GitHub publishing is deferred: a zip via
-   Dropbox/AirDrop, or a private repo they get access to?
-5. **Should your fork switch to the plugin later?** That would delete the
-   core producer edits (`cli.py`, `tui_gateway/server.py`,
-   `tools/kanban_tools.py`) and shrink your divergence from upstream, at the
-   cost of the gaps in §1 (no dot until the first turn, no yellow for secret
-   prompts). Proposed as a separate follow-up, not part of this work.
-6. **Interrupt state:** the plugin will show `idle` after an interrupted turn.
-   The fork emits nothing on interrupt (neither `cli.py` nor
-   `tui_gateway/server.py` ever emits `IDLE` after a turn), so its dot stays
-   green until the next turn. Is `idle` right? If so, the fork could be fixed
-   to match.
-7. **Login item** on by default in the installer, or opt-in (`--login-item`)?
-   Proposed opt-in, since any Hermes session launches the app anyway.
+| Question | Decision |
+| --- | --- |
+| Apple Developer / signing | None. Source handoff, local ad-hoc build, re-grant after each rebuild. |
+| Bundle id | `io.github.mtorto2.agent-lights`, in one editable plist. |
+| Friend's Hermes version | Unknown. The plugin uses `on_human_input_*` when registered and falls back to clarify/approval hooks on `v2026.8.31`. |
+| Delivery | Source tarball from `package-source.sh`, sent by Matt directly. |
+| Fork switches to the plugin | Not now; possible later follow-up to shrink fork divergence. |
+| Interrupt state | Plugin shows `idle` after an interrupted turn. The fork leaves the dot green; fixing that is a separate small change. |
+| Login item | Opt-in `--login-item`; any Hermes session launches the app anyway. |
+
+The last three were defaults chosen without discussion; say if any should
+change.
