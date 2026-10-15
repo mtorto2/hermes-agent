@@ -285,3 +285,31 @@ throwaway HOME: plain install refused; `--remove-legacy` set all six old
 pieces aside and kept the six others; a re-run with `--login-item`
 succeeded; `uninstall.sh --purge` removed this app, the marked plugin and
 this package's login item.
+
+## Round 8 outcome and round 9 (small follow-up, not yet reviewed)
+
+Hermes, round 8: **PASS** for `2266c590e0..f2c19d3f89` (independent reviewer
+agrees). Non-blocking suggestion: permanent tests for a missing package
+identity and for mismatched/symlinked login plists.
+
+Adding those tests found a real gap the round-8 pass had accepted on source
+reading: with the package `Info.plist` missing, `PlistBuddy` prints "File
+Doesn't Exist, Will Create: …" on **stdout**, and `uninstall.sh` took that
+text as the bundle id, so the "unreadable identity stops uninstall" check
+never fired (harmless in effect, since nothing matched that id, but not the
+promised stop).
+
+Round 9 range: `f2c19d3f89..HEAD` (fix `4efba59bc7` plus this note).
+`install.sh` and `uninstall.sh` now read plist values through
+`plist_value()` (regular, non-link file; value only when PlistBuddy
+succeeds) and require a well-formed reverse-DNS bundle id via
+`valid_bundle_id()`. Tests added:
+`test_uninstall_stops_before_removing_anything_without_its_package_identity`
+(fails on `f2c19d3f89`), `test_install_stops_without_a_valid_package_identity`,
+and `test_uninstall_leaves_a_login_plist_it_did_not_write`
+[wrong-label, symlink].
+
+Zip rebuilt from `4efba59bc7`: `~/Desktop/agent-lights-src-20261015-4efba59bc7.zip`
+(+ `.sha256`); prompt only changed its zip name. 862 Python tests pass;
+the unzipped-zip run (old install planted → refused → `--remove-legacy` →
+re-run with `--login-item` → `uninstall.sh --purge`) passed as in round 8.
