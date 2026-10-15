@@ -1,6 +1,79 @@
 # Agent Lights Menu Bar
 
-Minimal native macOS status item for Matt's active Hermes lanes.
+A small native macOS menu-bar item that shows one dot per running Hermes
+session (CLI or TUI) and a grid for Kanban workers, colored by what each one
+is doing: working, waiting for you, answer ready, error, or idle.
+
+## Install
+
+You need macOS 14 or later, Swift 6 (Xcode, or the Command Line Tools:
+`xcode-select --install`), and Hermes with `hermes` on your `PATH`. No Apple
+Developer account is involved: the app is built and signed on your Mac.
+
+```bash
+tar -xzf agent-lights-src-*.tar.gz
+cd agent-lights
+./install.sh
+```
+
+`install.sh` builds the app (`swift build -c release`), runs `swift test`,
+installs it as `~/Applications/AgentLightsMenuBar-v2.app`, copies the Hermes
+plugin into `~/.hermes/plugins/agent-lights` and enables it, then opens the
+app. Options:
+
+| Option | Effect |
+| --- | --- |
+| `--profile NAME` | Also install the plugin into Hermes profile `NAME` (repeatable; plugins are per profile). |
+| `--login-item` | Open the app at login (a LaunchAgent). Not needed for normal use: Hermes opens the app when a session starts. |
+| `--no-plugin` | Install only the app. |
+| `--no-test` | Skip `swift test`. |
+| `--sign-identity ID` | Sign with a certificate you have instead of ad-hoc. |
+| `--yes` | Don't ask before quitting a running copy. |
+
+Then, once:
+
+1. Terminal → Settings → Profiles → (each profile you use) → Tab: turn on
+   **TTY**, so dots follow your tab order (see "Dot order").
+2. Allow **Hermes Agent Lights** in System Settings → Privacy & Security →
+   Accessibility when macOS asks. Optional: without it, dots are ordered by
+   when each tab was opened. Because the app is signed locally, macOS treats
+   every rebuild as a new app: allow it again after each `install.sh`. The
+   same goes for the Terminal automation prompt (used when you click a row).
+3. Start a new Hermes session; sessions already running don't load the
+   plugin. The dot appears with your first message.
+
+To change the app or plugin, edit the source and re-run `./install.sh`. The
+bundle id lives in `Resources/Info.plist`. To remove everything,
+`./uninstall.sh` (`--purge` also deletes the status files, the app's
+preferences and its privacy grants; `--profile NAME` for profiles).
+
+### How the plugin reports state
+
+The plugin maps Hermes hooks to dot states: a turn starting is **working**; a
+clarify question, command approval or sudo prompt is **waiting for you**
+until answered; a finished turn is **answer ready**, a failed one **error**,
+and an interrupted one **idle**. Kanban workers report blocked and completed
+tasks. Hermes builds from before the `on_human_input_*` hooks (2026-10) fall
+back to the clarify tool and approval hooks, so sudo prompts don't turn the
+dot yellow there.
+
+Known limits: a session's dot appears on its first message, not when the tab
+opens (no hook runs earlier); secret-entry prompts don't turn the dot yellow;
+messaging gateways and the desktop app's backend are not shown (one process
+serves many chats). Delegated subagents never change their parent's dot.
+
+### Troubleshooting
+
+- **No dot:** `hermes plugins list` should show `agent-lights` enabled, and
+  the app should be running (`pgrep -x AgentLightsMenuBar`). Start a *new*
+  session and send a message.
+- **Dot hidden:** menu-bar managers like Ice may file the item under hidden
+  items; reveal it once and pin "Hermes Agent Lights" visible.
+- **Dot order says "needs TTY in tab titles" or "needs Accessibility":** see
+  setup steps 1 and 2.
+- **App quits right after opening:** it only runs from a bundle named
+  `AgentLightsMenuBar-v2.app` that is not an alias (see "Upgrading from pre-v2
+  builds"); reinstall with `install.sh`.
 
 ## Contract
 
@@ -246,10 +319,27 @@ directories, not symlinks into `v2`.
 
 ## Development
 
+Two producers write the slot files, following the same protocol:
+
+- **This Hermes fork's core** (`agent/light_cues.py`, called from `cli.py`,
+  `tui_gateway/server.py` and `tools/kanban_tools.py`). On this fork the
+  plugin stays inactive so a session never claims two slots.
+- **The plugin** in `plugin/agent-lights/` for stock Hermes. Its tests are
+  `tests/plugins/test_agent_lights_plugin.py` in the fork (including a mixed
+  core + plugin claim race over one pool). `scripts/plugin_e2e.py` runs one
+  real agent turn on any Hermes checkout against a local fake model and
+  checks the slot file goes working → waiting → working → answer ready.
+
+`scripts/package-source.sh` writes the tarball to hand out: committed files
+under this folder only.
+
 Hermes will best-effort launch the companion app when a CLI/TUI instance claims
-an Agent Lights slot. The launcher uses the built Swift debug binary if present
-and packages it into `.build/AgentLightsMenuBar-v2.app`, ad-hoc signs that local
-bundle, then opens it in the background. If the Swift binary has not been built
+an Agent Lights slot. Both producers open an app installed by `install.sh`
+(`~/Applications/AgentLightsMenuBar-v2.app`) as-is. Without one, the fork's
+launcher uses the built Swift debug binary if present and packages it into
+`.build/AgentLightsMenuBar-v2.app`, ad-hoc signs that local bundle (with
+`Resources/Info.plist`), then opens it in the background; re-run `install.sh`
+instead if you have an installed copy, or the installed one keeps winning. If the Swift binary has not been built
 yet, run:
 
 ```bash

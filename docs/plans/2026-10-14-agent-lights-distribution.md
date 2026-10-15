@@ -6,9 +6,21 @@ Matt hands over source; the friend builds, installs, and tweaks it locally.
 No Apple Developer account, Developer ID, notarization, or prebuilt binary
 (decided 2026-10-14).
 
-Status: **plan only, awaiting approval.** No runtime code has changed. Hermes
-reviews every code change before it goes live; nothing is pushed (the fork on
-GitHub is public and deliberately behind live main).
+Status: **implemented on branch `claude/intelligent-euclid-c3fce5`, awaiting
+Hermes review** (approved 2026-10-14). Nothing is pushed or live; the fork on
+GitHub is public and deliberately behind live main.
+
+Verification: `swift test` (62), `tests/agent/test_light_cues.py` +
+`tests/plugins/test_agent_lights_plugin.py` (120), `scripts/plugin_e2e.py`
+passing on upstream main `348f145164` and on `v2026.8.31`, and the packaged
+tarball's `install.sh` / `uninstall.sh --purge` run in a throwaway `HOME`
+with process and launchd commands stubbed (the live app was left running).
+Not done: a run on a separate macOS account or the friend's Mac, so the
+first real Accessibility/Automation prompts are unobserved.
+
+Deviation from §2: `hermes plugins install` only accepts git sources, so
+`install.sh` copies the plugin into `<hermes home>/plugins/agent-lights` and
+runs `hermes plugins enable agent-lights`.
 
 Baseline read for this plan: live main `c37d17fdbd`, upstream
 `origin/main` `379cf1220f`, latest upstream tag `v2026.8.31`.
