@@ -65,6 +65,17 @@ done
 
 say() { printf '\n==> %s\n' "$*"; }
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
+# A plist value, only when the file is a regular file and the key reads
+# cleanly. (PlistBuddy prints errors such as "File Doesn't Exist, Will
+# Create" on stdout, which must never be taken for a value.)
+plist_value() {
+  local value
+  { [ -f "$1" ] && [ ! -L "$1" ]; } || return 1
+  value="$(/usr/libexec/PlistBuddy -c "Print :$2" "$1" 2>/dev/null)" || return 1
+  printf '%s' "$value"
+}
+valid_bundle_id() { [[ "$1" =~ ^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$ ]]; }
+
 
 confirm() {
   [ "$assume_yes" -eq 1 ] && return 0
@@ -86,7 +97,8 @@ swift_major="$(swift --version 2>&1 | sed -nE 's/.*Swift version ([0-9]+).*/\1/p
 [ -n "$swift_major" ] && [ "$swift_major" -ge 6 ] || die "Swift 6 or later is required (found: $(swift --version 2>&1 | head -1)). Update Xcode or the Command Line Tools."
 
 [ -f "$INFO_PLIST" ] || die "Missing $INFO_PLIST."
-bundle_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$INFO_PLIST")"
+bundle_id="$(plist_value "$INFO_PLIST" CFBundleIdentifier || true)"
+valid_bundle_id "$bundle_id" || die "Cannot read a valid CFBundleIdentifier from $INFO_PLIST."
 
 hermes_bin="$(command -v hermes || true)"
 if [ "$install_plugin" -eq 1 ] && [ -z "$hermes_bin" ]; then

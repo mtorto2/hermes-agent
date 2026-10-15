@@ -42,6 +42,17 @@ done
 
 say() { printf '==> %s\n' "$*"; }
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
+# A plist value, only when the file is a regular file and the key reads
+# cleanly. (PlistBuddy prints errors such as "File Doesn't Exist, Will
+# Create" on stdout, which must never be taken for a value.)
+plist_value() {
+  local value
+  { [ -f "$1" ] && [ ! -L "$1" ]; } || return 1
+  value="$(/usr/libexec/PlistBuddy -c "Print :$2" "$1" 2>/dev/null)" || return 1
+  printf '%s' "$value"
+}
+valid_bundle_id() { [[ "$1" =~ ^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$ ]]; }
+
 confirm() {
   [ "$assume_yes" -eq 1 ] && return 0
   local reply
@@ -60,8 +71,8 @@ done
 # This package's own identity. Never taken from whatever sits at the app
 # path: a foreign app there must not decide which login item, preferences
 # or privacy grants get removed.
-bundle_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$HERE/Resources/Info.plist" 2>/dev/null || true)"
-[ -n "$bundle_id" ] || die "Cannot read this package's bundle id from $HERE/Resources/Info.plist; nothing was removed."
+bundle_id="$(plist_value "$HERE/Resources/Info.plist" CFBundleIdentifier || true)"
+valid_bundle_id "$bundle_id" || die "Cannot read this package's bundle id from $HERE/Resources/Info.plist; nothing was removed."
 
 # install.sh's marker, checked like the Python helper does: a regular file
 # (never a link) whose first line is exactly this.
@@ -108,7 +119,7 @@ fi
 # -- removal -----------------------------------------------------------------
 
 agent_plist="$HOME/Library/LaunchAgents/$bundle_id.plist"
-agent_label="$(/usr/libexec/PlistBuddy -c 'Print :Label' "$agent_plist" 2>/dev/null || true)"
+agent_label="$(plist_value "$agent_plist" Label || true)"
 if [ -f "$agent_plist" ] && [ ! -L "$agent_plist" ] && [ "$agent_label" = "$bundle_id" ]; then
   launchctl bootout "gui/$(id -u)/$bundle_id" >/dev/null 2>&1 || true
   if [ -f "$agent_plist" ]; then
@@ -122,7 +133,7 @@ fi
 if [ -L "$DEST" ]; then
   echo "warning: $DEST is a symlink, not something install.sh created; left in place." >&2
 elif [ -d "$DEST" ]; then
-  dest_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$DEST/Contents/Info.plist" 2>/dev/null || true)"
+  dest_id="$(plist_value "$DEST/Contents/Info.plist" CFBundleIdentifier || true)"
   if [ -x "$DEST/Contents/MacOS/$EXECUTABLE" ] && [ "$dest_id" = "$bundle_id" ]; then
     say "Removing $DEST"
     rm -rf "$DEST"

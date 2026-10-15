@@ -1068,6 +1068,65 @@ def test_a_symlinked_install_marker_does_not_prove_ownership(tmp_path):
 
 
 @pytest.mark.macos_only
+def test_uninstall_stops_before_removing_anything_without_its_package_identity(tmp_path):
+    """Round 8 suggestion: an unreadable package identity stops uninstall."""
+    box = _sandbox(tmp_path)
+    app = _fake_install(box["home"])
+    package = tmp_path / "package"
+    shutil.copytree(_APP_DIR, package, ignore=shutil.ignore_patterns(".build", "__pycache__"))
+    (package / "Resources" / "Info.plist").unlink()
+
+    done = subprocess.run(["/bin/bash", str(package / "uninstall.sh"), "--yes"], env=box["env"],
+                          capture_output=True, text=True, timeout=120)
+
+    assert done.returncode != 0 and "nothing was removed" in done.stderr
+    assert app.exists() and (box["home"] / ".hermes" / "plugins" / "agent-lights").exists()
+    assert _calls(box, "launchctl") == [] and _calls(box, "hermes") == []
+
+
+@pytest.mark.macos_only
+@pytest.mark.parametrize("shape", ["wrong-label", "symlink"])
+def test_uninstall_leaves_a_login_plist_it_did_not_write(tmp_path, shape):
+    """Round 8 suggestion: only a regular plist labeled with this package's id goes."""
+    box = _sandbox(tmp_path)
+    _fake_install(box["home"])
+    agent = box["home"] / "Library" / "LaunchAgents" / f"{_NEW_ID}.plist"
+    if shape == "wrong-label":
+        _write_plist(agent, {"Label": "com.someone.else"})
+    else:
+        target = _write_plist(tmp_path / "elsewhere.plist", {"Label": _NEW_ID})
+        agent.parent.mkdir(parents=True)
+        agent.symlink_to(target)
+
+    done = _run("uninstall.sh", box, "--yes")
+
+    assert done.returncode == 0, done.stderr
+    assert os.path.lexists(agent)
+    assert not [call for call in _calls(box, "launchctl") if "bootout" in call]
+
+
+@pytest.mark.macos_only
+@pytest.mark.skipif(shutil.which("swift") is None, reason="needs the Swift toolchain")
+def test_install_stops_without_a_valid_package_identity(tmp_path):
+    box = _sandbox(tmp_path)
+    box["env"]["PATH"] = os.pathsep.join([box["env"]["PATH"], os.path.dirname(shutil.which("swift"))])
+    package = tmp_path / "package"
+    shutil.copytree(_APP_DIR, package, ignore=shutil.ignore_patterns(".build", "__pycache__"))
+    import plistlib
+
+    info = package / "Resources" / "Info.plist"
+    data = plistlib.loads(info.read_bytes())
+    del data["CFBundleIdentifier"]
+    info.write_bytes(plistlib.dumps(data))
+
+    done = subprocess.run(["/bin/bash", str(package / "install.sh"), "--no-test", "--yes", "--no-plugin"],
+                          env=box["env"], capture_output=True, text=True, timeout=300)
+
+    assert done.returncode != 0 and "CFBundleIdentifier" in done.stderr
+    assert "Building" not in done.stdout
+
+
+@pytest.mark.macos_only
 @pytest.mark.skipif(shutil.which("swift") is None, reason="needs the Swift toolchain")
 def test_install_refuses_while_hermes_core_carries_an_old_patch(tmp_path):
     box = _sandbox(tmp_path)
