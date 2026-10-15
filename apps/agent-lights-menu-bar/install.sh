@@ -38,7 +38,7 @@ Usage: ./install.sh [options]
   --sign-identity ID   Sign with this certificate instead of ad-hoc ("-").
   --remove-legacy      Set aside pieces of an older Agent Lights install
                        (old apps, login items, plugins, status files) into
-                       ~/.hermes/agent-lights-legacy-backup-<time>/. Without
+                       ~/.hermes/agent-lights-legacy-backup-<time>-<id>/. Without
                        it, install stops and lists them.
   --allow-core-producer
                        Install even though Hermes itself contains an Agent
@@ -142,7 +142,7 @@ hermes_dir=""
 if [ -n "$hermes_bin" ]; then
   hermes_dir="$("$hermes_bin" --version 2>/dev/null | sed -n 's/^Install directory: //p' | head -1)"
 fi
-legacy_args=(--new-bundle-id "$bundle_id")
+legacy_args=(--new-bundle-id "$bundle_id" --new-plugin-dir "$HERE/plugin/$PLUGIN_NAME")
 [ -n "$hermes_dir" ] && legacy_args+=(--hermes-dir "$hermes_dir")
 [ -n "$hermes_bin" ] && legacy_args+=(--hermes-bin "$hermes_bin")
 for profile in ${profiles[@]+"${profiles[@]}"}; do legacy_args+=(--profile "$profile"); done
@@ -207,18 +207,23 @@ if pgrep -x "$EXECUTABLE" >/dev/null 2>&1; then
   fi
 fi
 
-if [ "$legacy_status" -ne 0 ] && [ "$remove_legacy" -eq 1 ]; then
-  say "Setting aside the older Agent Lights install"
-  set +e
-  "$python_bin" -I "$legacy_tool" remove "${legacy_args[@]}"
-  remove_status=$?
-  set -e
-  case "$remove_status" in
-    0) ;;
-    11) [ "$allow_core_producer" -eq 1 ] || die "The Hermes core patch is still present." ;;
-    *) die "Could not set aside every older piece (above); nothing new was installed." ;;
-  esac
-fi
+# Set aside what the check found (with --remove-legacy) and back up anything
+# this install is about to replace. Runs after old copies were quit; it
+# verifies everything moved, old login items are unloaded, and no old copy is
+# still running. Failures win over an allowed core patch.
+say "Backing up what this install replaces"
+set +e
+remove_args=("${legacy_args[@]}")
+[ "$remove_legacy" -eq 1 ] || remove_args+=(--auto-only)
+"$python_bin" -I "$legacy_tool" remove "${remove_args[@]}"
+remove_status=$?
+set -e
+case "$remove_status" in
+  0) ;;
+  10) [ "$allow_core_producer" -eq 1 ] || die "Older pieces are still in place; re-run with --remove-legacy." ;;
+  11) [ "$allow_core_producer" -eq 1 ] || die "The Hermes core patch is still present." ;;
+  *) die "Could not set aside every older piece (above); nothing new was installed." ;;
+esac
 
 say "Installing $DEST"
 # Replace the whole bundle: never write through an existing one.

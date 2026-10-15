@@ -247,7 +247,7 @@ def _sandbox(tmp_path: Path, *, app_running: bool = False) -> dict:
         "pgrep": "exit 0" if app_running else "exit 1",
         "pkill": "exit 0",
         "open": "exit 0",
-        "launchctl": "exit 0",
+        "launchctl": '[ "${1-}" = "print" ] && exit 113; exit 0',
         "tccutil": "exit 0",
         "defaults": "exit 0",
         "hermes": 'if [ "${1-}" = "--version" ] && [ -n "${FAKE_HERMES_DIR-}" ]; then echo "Install directory: $FAKE_HERMES_DIR"; fi\nexit 0',
@@ -261,8 +261,13 @@ def _sandbox(tmp_path: Path, *, app_running: bool = False) -> dict:
         stub.chmod(0o755)
     path = os.pathsep.join([str(shims), os.path.dirname(shutil.which("python3") or "/usr/bin/python3"),
                             "/usr/bin", "/bin", "/usr/sbin", "/sbin"])
+    (tmp_path / "SystemApplications").mkdir()
     env = {"HOME": str(home), "PATH": path, "HERMES_HOME": str(home / ".hermes"),
-           "TMPDIR": os.environ.get("TMPDIR", "/tmp")}
+           "TMPDIR": os.environ.get("TMPDIR", "/tmp"),
+           # Keep the legacy scan off this machine's real /Applications and
+           # refuse any move outside this test's own folder.
+           "AGENT_LIGHTS_SYSTEM_APPLICATIONS": str(tmp_path / "SystemApplications"),
+           "AGENT_LIGHTS_LEGACY_CONFINE": str(tmp_path)}
     return {"home": home, "env": env, "log": log}
 
 
@@ -422,124 +427,301 @@ def test_package_source_honors_a_relative_output_directory(tmp_path):
 
 # -- an older install ---------------------------------------------------------
 
+_PLUGIN_SRC = _APP_DIR / "plugin" / "agent-lights"
+_NEW_ID = "io.github.mtorto2.agent-lights"
+
 
 def _old_bundle(path: Path, bundle_id: str = "com.savant.hermes-agent-lights") -> Path:
-    (path / "Contents" / "MacOS").mkdir(parents=True)
-    (path / "Contents" / "MacOS" / "AgentLightsMenuBar").write_bytes(b"old")
     import plistlib
 
+    (path / "Contents" / "MacOS").mkdir(parents=True)
+    (path / "Contents" / "MacOS" / "AgentLightsMenuBar").write_bytes(b"old")
     with open(path / "Contents" / "Info.plist", "wb") as handle:
         plistlib.dump({"CFBundleIdentifier": bundle_id, "CFBundleExecutable": "AgentLightsMenuBar"}, handle)
     return path
 
 
-def _plant_old_install(home: Path, hermes_dir: Path) -> dict:
-    """Every shape an older Agent Lights install has taken."""
+def _write_plist(path: Path, data: dict) -> Path:
     import plistlib
 
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "wb") as handle:
+        plistlib.dump(data, handle)
+    return path
+
+
+def _plant_old_install(home: Path, hermes_dir: Path) -> dict:
+    """Every shape an older Agent Lights install has taken, plus new pieces to keep."""
     hermes = home / ".hermes"
     (hermes / "profiles" / "work").mkdir(parents=True, exist_ok=True)
     old = {
         "user_app": _old_bundle(home / "Applications" / "AgentLightsMenuBar.app"),
         "repo_app": _old_bundle(hermes_dir / "apps" / "agent-lights-menu-bar" / ".build" / "AgentLightsMenuBar.app"),
-        "launch_agent": home / "Library" / "LaunchAgents" / "com.friend.agentlights.plist",
+        "launch_agent": _write_plist(home / "Library" / "LaunchAgents" / "com.friend.agentlights.plist", {
+            "Label": "com.friend.agentlights",
+            "ProgramArguments": ["/usr/bin/open", str(home / "Applications" / "AgentLightsMenuBar.app")]}),
         "plugin": hermes / "profiles" / "work" / "plugins" / "lights",
         "root_pool": hermes / "agent-lights" / "slots",
-        "profile_pool": hermes / "profiles" / "work" / "agent-lights",
+        "profile_pool": hermes / "profiles" / "work" / "agent-lights" / "slots",
     }
-    old["launch_agent"].parent.mkdir(parents=True)
-    with open(old["launch_agent"], "wb") as handle:
-        plistlib.dump({"Label": "com.friend.agentlights", "ProgramArguments": [
-            "/usr/bin/open", str(old["user_app"])]}, handle)
     old["plugin"].mkdir(parents=True)
     (old["plugin"] / "plugin.yaml").write_text("name: lights\n")
     (old["plugin"] / "__init__.py").write_text("from agent.light_cues import LightCueService\n")
     old["root_pool"].mkdir(parents=True)
     (old["root_pool"] / "1.json").write_text("{}")
-    (old["profile_pool"] / "slots").mkdir(parents=True)
-    # Pieces of the NEW system that must never be flagged.
+    old["profile_pool"].mkdir(parents=True)
     keep = {
-        "new_app": _old_bundle(home / "Applications" / "AgentLightsMenuBar-v2.app", "io.github.mtorto2.agent-lights"),
+        "new_app": _old_bundle(home / "Applications" / "AgentLightsMenuBar-v2.app", _NEW_ID),
         "new_pool": hermes / "agent-lights" / "v2",
         "new_plugin": hermes / "plugins" / "agent-lights",
-        "new_agent": home / "Library" / "LaunchAgents" / "io.github.mtorto2.agent-lights.plist",
+        "new_agent": _write_plist(home / "Library" / "LaunchAgents" / f"{_NEW_ID}.plist", {
+            "Label": _NEW_ID, "ProgramArguments": ["/usr/bin/open", "-g", str(home / "Applications")]}),
         "other_plugin": hermes / "plugins" / "unrelated",
+        "mention_only": hermes / "plugins" / "diagnostics",
     }
     keep["new_pool"].mkdir(parents=True)
-    keep["new_plugin"].mkdir(parents=True)
-    (keep["new_plugin"] / "__init__.py").write_text("# agent-lights\n")
-    with open(keep["new_agent"], "wb") as handle:
-        plistlib.dump({"Label": "io.github.mtorto2.agent-lights",
-                       "ProgramArguments": ["/usr/bin/open", "-g", str(keep["new_app"])]}, handle)
+    shutil.copytree(_PLUGIN_SRC, keep["new_plugin"], ignore=shutil.ignore_patterns("__pycache__"))
     keep["other_plugin"].mkdir(parents=True)
     (keep["other_plugin"] / "__init__.py").write_text("print('hello')\n")
+    keep["mention_only"].mkdir(parents=True)
+    (keep["mention_only"] / "__init__.py").write_text("def check(): return True\n")
+    (keep["mention_only"] / "README.md").write_text("Compatible with agent-lights.\n")
     return {"old": old, "keep": keep}
 
 
-def _ctx(home: Path, hermes_dir: Path | None):
-    return legacy.Context(home=home, hermes_dir=hermes_dir, profiles=[], spotlight=False,
-                          new_bundle_id="io.github.mtorto2.agent-lights")
+class FakeSystem:
+    """Stands in for ps, launchctl, mdfind and hermes inside the legacy tool."""
+
+    def __init__(self, monkeypatch):
+        self.processes: list[tuple[str, str]] = []
+        self.loaded: set[str] = set()
+        self.stuck: set[str] = set()
+        self.spotlight: list[str] = []
+        self.calls: list[list[str]] = []
+        real_run = legacy.subprocess.run
+
+        def run(argv, *a, **k):
+            argv = list(argv)
+            self.calls.append(argv)
+            done = lambda code=0, out="": subprocess.CompletedProcess(argv, code, out, "")
+            if argv[0] == "ps":
+                return done(0, "".join(f"{pid} {cmd}\n" for pid, cmd in self.processes))
+            if argv[0] == "mdfind":
+                return done(0, "".join(f"{p}\n" for p in self.spotlight))
+            if argv[0] == "launchctl":
+                label = argv[2].rsplit("/", 1)[-1]
+                if argv[1] == "print":
+                    return done(0 if label in self.loaded else 113)
+                if argv[1] == "bootout" and label not in self.stuck:
+                    self.loaded.discard(label)
+                return done(0)
+            if argv[0] == "/fake/hermes":
+                return done(0)
+            return real_run(argv, *a, **k)
+
+        monkeypatch.setattr(legacy.subprocess, "run", run)
 
 
-def _no_processes(monkeypatch):
-    real_run = legacy.subprocess.run
-
-    def run(argv, *a, **k):
-        if argv[:1] == ["ps"]:
-            return subprocess.CompletedProcess(argv, 0, "", "")
-        return real_run(argv, *a, **k)
-
-    monkeypatch.setattr(legacy.subprocess, "run", run)
+@pytest.fixture
+def fake_system(monkeypatch):
+    return FakeSystem(monkeypatch)
 
 
-def test_legacy_scan_finds_every_old_piece_and_none_of_the_new_ones(tmp_path, monkeypatch):
-    _no_processes(monkeypatch)
+def _ctx(tmp_path: Path, home: Path, hermes_dir: Path | None, **kw):
+    system_apps = tmp_path / "SystemApplications"
+    system_apps.mkdir(exist_ok=True)
+    return legacy.Context(home=home, hermes_dir=hermes_dir, profiles=[], spotlight=kw.pop("spotlight", False),
+                          new_bundle_id=_NEW_ID, system_apps=system_apps, new_plugin_dir=_PLUGIN_SRC,
+                          confine=tmp_path, **kw)
+
+
+def test_legacy_scan_finds_every_old_piece_and_none_of_the_new_ones(tmp_path, fake_system):
     home, hermes_dir = tmp_path / "home", tmp_path / "hermes-agent"
     planted = _plant_old_install(home, hermes_dir)
 
-    findings = legacy.scan(_ctx(home, hermes_dir))
+    findings = legacy.scan(_ctx(tmp_path, home, hermes_dir))
 
-    found = {f.path for f in findings}
-    assert found == set(planted["old"].values()) - {planted["old"]["profile_pool"]} | {
-        planted["old"]["profile_pool"] / "slots"}
-    assert not found & set(planted["keep"].values())
+    removable = {f.path for f in findings if f.removable}
+    assert removable == set(planted["old"].values())
+    assert not {f.path for f in findings} & (set(planted["keep"].values()) - {planted["keep"]["mention_only"]})
     assert legacy.report(findings) == legacy.EXIT_FOUND
 
 
-def test_legacy_remove_moves_everything_into_a_backup_with_a_manifest(tmp_path, monkeypatch):
-    _no_processes(monkeypatch)
+def test_a_plugin_that_only_mentions_agent_lights_is_reported_not_moved(tmp_path, fake_system):
+    """Review round 4, finding 4."""
     home, hermes_dir = tmp_path / "home", tmp_path / "hermes-agent"
     planted = _plant_old_install(home, hermes_dir)
-    ctx = _ctx(home, hermes_dir)
+    ctx = _ctx(tmp_path, home, hermes_dir)
+
+    mention = [f for f in legacy.scan(ctx) if f.path == planted["keep"]["mention_only"]]
+    assert len(mention) == 1 and mention[0].removable is False
+
+    assert legacy.remove(ctx, legacy.scan(ctx), tmp_path / "backup", "/fake/hermes") == legacy.EXIT_NONE
+    assert planted["keep"]["mention_only"].exists()
+
+
+def test_legacy_remove_moves_everything_into_a_new_backup_and_verifies(tmp_path, fake_system):
+    home, hermes_dir = tmp_path / "home", tmp_path / "hermes-agent"
+    planted = _plant_old_install(home, hermes_dir)
+    fake_system.loaded.add("com.friend.agentlights")
+    ctx = _ctx(tmp_path, home, hermes_dir)
     backup = tmp_path / "backup"
-    calls = []
-    real_run = legacy.subprocess.run
-    monkeypatch.setattr(legacy.subprocess, "run", lambda argv, *a, **k: calls.append(argv) or (
-        subprocess.CompletedProcess(argv, 0, "", "") if argv[0] in {"ps", "launchctl", "/fake/hermes"}
-        else real_run(argv, *a, **k)))
 
     assert legacy.remove(ctx, legacy.scan(ctx), backup, "/fake/hermes") == legacy.EXIT_NONE
 
     for path in planted["old"].values():
-        if path != planted["old"]["profile_pool"]:
-            assert not path.exists(), path
+        assert not path.exists(), path
     for path in planted["keep"].values():
         assert path.exists(), path
     manifest = (backup / "MANIFEST.txt").read_text()
-    assert str(planted["old"]["user_app"]) in manifest
-    assert len(list(backup.iterdir())) == len(planted["old"]) + 1
-    assert ["launchctl", "bootout", f"gui/{os.getuid()}/com.friend.agentlights"] in calls
-    assert ["/fake/hermes", "-p", "work", "plugins", "disable", "lights"] in calls
+    assert all(str(path) in manifest for path in planted["old"].values())
+    assert "com.friend.agentlights" not in fake_system.loaded
+    assert ["/fake/hermes", "-p", "work", "plugins", "disable", "lights"] in fake_system.calls
+    assert [f for f in legacy.scan(ctx) if f.removable] == []
+
+
+def test_backups_are_never_reused_or_overwritten(tmp_path, fake_system):
+    """Review round 4, finding 2."""
+    home, hermes_dir = tmp_path / "home", tmp_path / "hermes-agent"
+    planted = _plant_old_install(home, hermes_dir)
+    ctx = _ctx(tmp_path, home, hermes_dir)
+    reused = tmp_path / "backup"
+    reused.mkdir()
+    (reused / "01-app-AgentLightsMenuBar.app").write_text("earlier backup")
+
+    assert legacy.remove(ctx, legacy.scan(ctx), reused, "/fake/hermes") == legacy.EXIT_FAILED
+    assert (reused / "01-app-AgentLightsMenuBar.app").read_text() == "earlier backup"
+    assert planted["old"]["user_app"].exists()
+
+    first, second = legacy._new_backup_dir(home), legacy._new_backup_dir(home)
+    assert first != second and first.is_dir() and second.is_dir()
+
+
+def test_moves_outside_the_allowed_root_are_refused(tmp_path, fake_system):
+    """Review round 4, finding 3: tests (and anything confined) can't move other files."""
+    home, hermes_dir = tmp_path / "home", tmp_path / "hermes-agent"
+    _plant_old_install(home, hermes_dir)
+    elsewhere = _old_bundle(tmp_path / "elsewhere" / "AgentLightsMenuBar.app")
+    fake_system.spotlight = [str(elsewhere)]
+    ctx = _ctx(tmp_path, home, hermes_dir, spotlight=True)
+    ctx.confine = home
+
+    assert legacy.remove(ctx, legacy.scan(ctx), tmp_path / "backup", "/fake/hermes") == legacy.EXIT_FAILED
+    assert elsewhere.exists()
+
+
+def test_backed_up_apps_found_by_spotlight_are_not_active_installs(tmp_path, fake_system):
+    """Review round 4, finding 5."""
+    home = tmp_path / "home"
+    (home / ".hermes").mkdir(parents=True)
+    archived = _old_bundle(home / ".hermes" / "agent-lights-legacy-backup-20261015-110338-abc123"
+                           / "01-app-AgentLightsMenuBar.app")
+    trashed = _old_bundle(home / ".Trash" / "AgentLightsMenuBar.app")
+    fake_system.spotlight = [str(archived), str(trashed)]
+
+    assert legacy.scan(_ctx(tmp_path, home, None, spotlight=True)) == []
+
+
+def test_standalone_scan_knows_the_current_login_item(tmp_path, fake_system, monkeypatch):
+    """Review round 4, finding 6: no --new-bundle-id given."""
+    home = tmp_path / "home"
+    (home / ".hermes").mkdir(parents=True)
+    _write_plist(home / "Library" / "LaunchAgents" / f"{_NEW_ID}.plist",
+                 {"Label": _NEW_ID, "ProgramArguments": ["/usr/bin/open", "-g", "AgentLightsMenuBar-v2.app"]})
+    monkeypatch.setattr(legacy.Path, "home", lambda: home)
+    monkeypatch.setenv("AGENT_LIGHTS_SYSTEM_APPLICATIONS", str(tmp_path / "none"))
+
+    assert legacy.main(["scan", "--no-spotlight"]) == legacy.EXIT_NONE
+
+
+def test_an_existing_agent_lights_plugin_is_backed_up_unless_identical(tmp_path, fake_system):
+    """Review round 4, finding 7: a same-named old plugin was deleted unsaved."""
+    home = tmp_path / "home"
+    plugin = home / ".hermes" / "plugins" / "agent-lights"
+    plugin.mkdir(parents=True)
+    (plugin / "__init__.py").write_text("from agent.light_cues import LightCueService  # improvised\n")
+    ctx = _ctx(tmp_path, home, None)
+
+    [finding] = legacy.scan(ctx)
+    assert finding.removable and not finding.auto  # needs --remove-legacy
+    assert legacy.remove(ctx, [finding], tmp_path / "backup", "/fake/hermes") == legacy.EXIT_NONE
+    assert (tmp_path / "backup" / "01-plugin-agent-lights" / "__init__.py").exists()
+
+    # A previous install of this plugin is backed up automatically...
+    shutil.copytree(_PLUGIN_SRC, plugin, ignore=shutil.ignore_patterns("__pycache__"))
+    (plugin / "protocol.py").write_text((plugin / "protocol.py").read_text() + "\n# local tweak\n")
+    [previous] = legacy.scan(ctx)
+    assert previous.auto
+    assert legacy.report([previous]) == legacy.EXIT_NONE
+    assert legacy.remove(ctx, [previous], tmp_path / "backup2", None, auto_only=True) == legacy.EXIT_NONE
+    assert "local tweak" in (tmp_path / "backup2" / "01-plugin-agent-lights" / "protocol.py").read_text()
+
+    # ...and an identical copy is just replaced.
+    shutil.copytree(_PLUGIN_SRC, plugin, ignore=shutil.ignore_patterns("__pycache__"))
     assert legacy.scan(ctx) == []
 
 
-def test_a_hermes_core_patch_blocks_and_is_never_touched(tmp_path, monkeypatch):
-    _no_processes(monkeypatch)
+def test_another_app_at_the_new_apps_path_is_backed_up(tmp_path, fake_system):
+    home = tmp_path / "home"
+    (home / ".hermes").mkdir(parents=True)
+    _old_bundle(home / "Applications" / "AgentLightsMenuBar-v2.app")  # old id at the new path
+    ctx = _ctx(tmp_path, home, None)
+
+    [finding] = legacy.scan(ctx)
+    assert finding.removable and "new app's path" in finding.detail
+
+
+def test_an_alias_and_the_app_it_points_to_are_both_set_aside(tmp_path, fake_system):
+    """Review round 4, finding 8."""
+    home, hermes_dir = tmp_path / "home", tmp_path / "hermes-agent"
+    (home / ".hermes").mkdir(parents=True)
+    real = _old_bundle(tmp_path / "builds" / "AgentLightsMenuBar.app")
+    (home / "Applications").mkdir()
+    alias = home / "Applications" / "AgentLightsMenuBar.app"
+    alias.symlink_to(real)
+    ctx = _ctx(tmp_path, home, hermes_dir)
+
+    assert {f.path for f in legacy.scan(ctx)} == {alias, real}
+    assert legacy.remove(ctx, legacy.scan(ctx), tmp_path / "backup", None) == legacy.EXIT_NONE
+    assert not os.path.lexists(alias) and not real.exists()
+
+
+def test_failures_win_over_an_allowed_core_patch(tmp_path, fake_system):
+    """Review round 4, finding 9."""
+    home, hermes_dir = tmp_path / "home", tmp_path / "hermes-agent"
+    (hermes_dir / "agent").mkdir(parents=True)
+    (hermes_dir / "agent" / "light_cues.py").write_text("# patch\n")
+    (home / ".hermes").mkdir(parents=True)
+    outside = _old_bundle(tmp_path / "outside" / "AgentLightsMenuBar.app")
+    fake_system.spotlight = [str(outside)]
+    ctx = _ctx(tmp_path, home, hermes_dir, spotlight=True)
+    ctx.confine = home
+
+    assert legacy.remove(ctx, legacy.scan(ctx), tmp_path / "backup", None) == legacy.EXIT_FAILED
+
+
+def test_a_login_item_that_will_not_unload_or_an_old_copy_still_running_fails(tmp_path, fake_system):
+    """Review round 4, finding 10."""
+    home, hermes_dir = tmp_path / "home", tmp_path / "hermes-agent"
+    planted = _plant_old_install(home, hermes_dir)
+    fake_system.loaded.add("com.friend.agentlights")
+    fake_system.stuck.add("com.friend.agentlights")
+    ctx = _ctx(tmp_path, home, hermes_dir)
+
+    assert legacy.remove(ctx, legacy.scan(ctx), tmp_path / "backup", None) == legacy.EXIT_FAILED
+    assert planted["old"]["launch_agent"].exists()  # not moved while still loaded
+
+    fake_system.stuck.clear()
+    fake_system.processes = [("4242", str(tmp_path / "old" / "AgentLightsMenuBar.app/Contents/MacOS/AgentLightsMenuBar"))]
+    assert legacy.remove(ctx, legacy.scan(ctx), tmp_path / "backup2", None) == legacy.EXIT_FAILED
+
+
+def test_a_hermes_core_patch_blocks_and_is_never_touched(tmp_path, fake_system):
     home, hermes_dir = tmp_path / "home", tmp_path / "hermes-agent"
     (hermes_dir / "agent").mkdir(parents=True)
     (hermes_dir / "agent" / "light_cues.py").write_text("_AGENT_LIGHTS_POOL = 'v1'\n")
     (home / ".hermes").mkdir(parents=True)
-    ctx = _ctx(home, hermes_dir)
+    ctx = _ctx(tmp_path, home, hermes_dir)
 
     findings = legacy.scan(ctx)
     assert [f.kind for f in findings] == ["core"]
@@ -567,11 +749,27 @@ def test_install_stops_on_an_old_install_then_sets_it_aside_with_remove_legacy(t
     done = _run("install.sh", box, "--no-test", "--yes", "--remove-legacy")
     assert done.returncode == 0, done.stderr
     for path in planted["old"].values():
-        if path != planted["old"]["profile_pool"]:
-            assert not path.exists(), path
+        assert not path.exists(), path
+    assert planted["keep"]["mention_only"].exists()
     backups = list((box["home"] / ".hermes").glob("agent-lights-legacy-backup-*"))
     assert len(backups) == 1 and (backups[0] / "MANIFEST.txt").exists()
     assert (box["home"] / "Applications" / "AgentLightsMenuBar-v2.app" / "Contents" / "Info.plist").exists()
+
+
+@pytest.mark.macos_only
+@pytest.mark.skipif(shutil.which("swift") is None, reason="needs the Swift toolchain")
+def test_reinstalling_after_a_local_plugin_edit_backs_it_up_without_extra_flags(tmp_path):
+    box = _sandbox(tmp_path)
+    box["env"]["PATH"] = os.pathsep.join([box["env"]["PATH"], os.path.dirname(shutil.which("swift"))])
+    plugin = box["home"] / ".hermes" / "plugins" / "agent-lights"
+    shutil.copytree(_PLUGIN_SRC, plugin, ignore=shutil.ignore_patterns("__pycache__"))
+    (plugin / "protocol.py").write_text((plugin / "protocol.py").read_text() + "\n# local tweak\n")
+
+    done = _run("install.sh", box, "--no-test", "--no-plugin", "--yes")
+    assert done.returncode == 0, done.stderr
+    backups = list((box["home"] / ".hermes").glob("agent-lights-legacy-backup-*"))
+    assert len(backups) == 1
+    assert "local tweak" in next(backups[0].glob("*-plugin-agent-lights")).joinpath("protocol.py").read_text()
 
 
 @pytest.mark.macos_only

@@ -27,7 +27,7 @@ app. Options:
 | `--login-item` | Open the app at login (a LaunchAgent). Not needed for normal use: Hermes opens the app when a session starts. |
 | `--no-plugin` | Install only the app. |
 | `--no-test` | Skip `swift test`. |
-| `--remove-legacy` | Move the pieces of an older Agent Lights install into `~/.hermes/agent-lights-legacy-backup-<time>/` (see "Replacing an older install"). |
+| `--remove-legacy` | Move the pieces of an older Agent Lights install into a new `~/.hermes/agent-lights-legacy-backup-<time>-<id>/` (see "Replacing an older install"). |
 | `--allow-core-producer` | Install even though Hermes itself carries an Agent Lights patch. Only for the Hermes fork Agent Lights came from. |
 | `--sign-identity ID` | Sign with a certificate you have instead of ad-hoc. |
 | `--yes` | Don't ask before quitting a running copy. |
@@ -59,24 +59,45 @@ Earlier Agent Lights builds were installed by patching Hermes itself
 `tools/kanban_tools.py`). That patch builds and opens its own
 `apps/agent-lights-menu-bar/.build/AgentLightsMenuBar.app` inside the Hermes
 checkout and writes status files under each profile's `agent-lights/` folder,
-none of which the current app reads. `install.sh` checks for every such piece
-before building (`python3 scripts/legacy_agent_lights.py scan` runs the same
-check on its own):
+none of which the current app reads. Before building, `install.sh` runs
+`scripts/legacy_agent_lights.py scan` (you can run it on its own too):
 
-- **Old apps, login items, plugins and status files:** install stops and
-  lists them. Re-run with `--remove-legacy` to quit any old copy and move
-  them all into `~/.hermes/agent-lights-legacy-backup-<time>/`, with a
-  `MANIFEST.txt` of where each came from. Nothing is deleted; an app in
-  `/Applications` that you can't write to is listed for you to remove.
-- **A Hermes core patch:** install stops; the script never edits Hermes
-  source. Restore those files to stock Hermes, for example in the Hermes
-  checkout (`hermes --version` prints its "Install directory"):
-  `git status` and `git diff` to see the local changes, save them with
-  `git diff > ~/agent-lights-core-patch.diff` (and copy any untracked
-  `agent/light_cues.py`, `agent/wiz_light.py`), then `git checkout --` the
-  changed files and remove the untracked ones. If the patch was committed,
-  compare with `git log origin/main..HEAD` instead. Check that `hermes`
-  still starts, restart running Hermes sessions, and run `install.sh` again.
+- **Set aside with `--remove-legacy`:** old Agent Lights apps (and aliases to
+  them, and the apps they point to), login items that open one, plugins whose
+  code is an Agent Lights producer, pre-v2 status folders, and anything
+  already at the new app's or plugin's install path that isn't what is being
+  installed. Without the flag, install stops and lists them. With it, install
+  quits old copies, moves each item into a new
+  `~/.hermes/agent-lights-legacy-backup-<time>-<id>/` (never reused, never
+  overwritten, one `MANIFEST.txt` line per move), then checks that every item
+  is gone, every old login item is unloaded and no old copy still runs.
+  Nothing is deleted.
+- **Backed up automatically:** a previous install of this plugin, when you
+  re-run `install.sh` after changes.
+- **Reported only:** a plugin that merely mentions Agent Lights (a README, a
+  comment), an app you can't write to, and anything already inside a backup
+  folder or the Trash (never touched).
+- **A Hermes core patch (blocking):** this tool never edits Hermes source.
+  Use `scripts/hermes_core_patch.py` in the Hermes checkout (`hermes
+  --version` prints its "Install directory"):
+  1. `python3 scripts/hermes_core_patch.py inventory --hermes-dir <dir>`
+     finds the stock baseline (merge-base with the branch's upstream, else
+     `origin/main`; override with `--baseline`) and lists committed, staged,
+     unstaged and untracked changes, classifying each changed path as
+     `agent-lights-file`, `agent-lights-only`, `mixed` or `unrelated` (and
+     printing the hunks of mixed files).
+  2. `... backup --hermes-dir <dir>` saves all of it (patches for staged,
+     unstaged and committed changes, a tar of untracked files, and git refs
+     to HEAD and the working tree) into a new
+     `~/.hermes/agent-lights-core-backup-<time>-<id>/`.
+  3. `... restore --hermes-dir <dir> --backup <that folder> --yes <paths>`
+     takes `agent-lights-file` and `agent-lights-only` paths back to the
+     baseline in both the index and the working tree (untracked ones are
+     moved into the backup). It refuses `mixed` and `unrelated` paths, and
+     refuses if the checkout changed since the backup. Edit mixed files by
+     hand, removing only the Agent Lights hunks.
+  Then check `hermes` still starts, restart running Hermes sessions, and run
+  `install.sh` again.
 
 ### How the plugin reports state
 
