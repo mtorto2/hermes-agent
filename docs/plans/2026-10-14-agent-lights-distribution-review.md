@@ -141,3 +141,38 @@ tarball goes to a friend or the branch goes live:
 Merging to live `main` additionally costs one Accessibility + Terminal
 automation re-grant on Matt's Mac (bundle id change) and needs Matt's
 approval.
+
+## Round 4 (not yet reviewed): replacing an older install
+
+Range: `792583a141..5ee4d3df4c`. Requested 2026-10-15 because the friend's
+Mac has an older Agent Lights that his Hermes agent installed.
+
+- `scripts/legacy_agent_lights.py`: `scan` finds old app bundles (in
+  `~/Applications`, `/Applications`, the Hermes checkout's
+  `apps/agent-lights-menu-bar/.build`, and via Spotlight by bundle id
+  `com.savant.hermes-agent-lights` or name), running old copies, LaunchAgents,
+  plugins and pre-v2 pools in every profile, and a Hermes core patch
+  (`agent/light_cues.py`). `remove` moves the removable ones into
+  `~/.hermes/agent-lights-legacy-backup-<time>/` with `MANIFEST.txt`; never
+  deletes, never edits Hermes source; a core patch is reported as blocking.
+- `install.sh`: runs the scan before building; stops with the list unless
+  `--remove-legacy` (applied after quitting old copies); a core patch stops it
+  unless `--allow-core-producer`. Hermes checkout found via `hermes --version`.
+- Plugin: stands down only for a core producer whose `_AGENT_LIGHTS_POOL` is
+  `"v2"`; beside an older patch it runs (that patch writes a pool the app
+  ignores).
+- `package-source.sh` writes a `.zip`.
+
+Evidence: 818 Python tests (new: legacy scan/remove/core-block, install.sh
+refusal then `--remove-legacy`, core-patch refusal, plugin beside a pre-v2
+core), all with `ps`/`mdfind` stubbed so tests never see or move real apps.
+The packaged zip, unpacked with `ditto -x -k` (execute bits kept), was run
+from a throwaway HOME with an old install planted: refused, then set all six
+pieces aside and installed. A read-only `scan` on Matt's Mac correctly
+reported his fork's core producer (blocking), the repo-built bundle, the
+running app and old per-profile pools.
+
+Delivered to Matt's Desktop: `agent-lights-src-20261015-5ee4d3df4c.zip`
+(+ `.sha256`) and `agent-lights-prompt-for-hermes.md`, a step-by-step prompt
+for the friend's Hermes agent (inventory, git-restore of a core patch with
+his OK and a backup, `install.sh --remove-legacy`, verification).
