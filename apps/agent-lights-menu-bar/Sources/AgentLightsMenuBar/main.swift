@@ -38,6 +38,12 @@ private final class AgentLightsApp: NSObject, NSApplicationDelegate, NSMenuDeleg
     private var terminalTitlesByTTY: [String: String] = [:]
     private var terminalSnapshotLoadedAt: Date?
     private var terminalSnapshotInFlight = false
+    /// Terminal tab titles in on-screen order, read via Accessibility, with
+    /// the last good read kept through brief failures.
+    private var tabBarCache = TabBarCache()
+    private var tabBarTrusted = false
+    private let dotOrderItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+    private let tabOrderPromptDefaultsKey = "TabOrderPermissionPromptedForBuild"
     private var errorFlashOn = true
     private var tickCount = 0
     private var heartbeatFailureLogged = false
@@ -78,6 +84,7 @@ private final class AgentLightsApp: NSObject, NSApplicationDelegate, NSMenuDeleg
             return
         }
         refreshHeartbeat()
+        promptForTabOrderPermissionOncePerBuild()
         configureMenu()
         // A stable name lets macOS (and bar managers such as Ice) remember
         // where the item sits across relaunches.
@@ -95,6 +102,8 @@ private final class AgentLightsApp: NSObject, NSApplicationDelegate, NSMenuDeleg
         statusMenu.delegate = self
         statusSummaryItem.isEnabled = false
         statusMenu.addItem(statusSummaryItem)
+        dotOrderItem.target = self
+        statusMenu.addItem(dotOrderItem)
         statusMenu.addItem(NSMenuItem.separator())
 
         let refreshItem = NSMenuItem(title: "Refresh", action: #selector(refreshNow), keyEquivalent: "r")
@@ -171,11 +180,19 @@ private final class AgentLightsApp: NSObject, NSApplicationDelegate, NSMenuDeleg
         let legacyAgentStatuses = slotStatuses.filter(\.isKanbanWorker)
         let hermesStatuses = slotStatuses.filter { !$0.isKanbanWorker }
         let allAgentStatuses = agentStatuses + legacyAgentStatuses
-        // Keep normal Hermes lights stable by their Agent Lights slot letters (A-F).
-        // Terminal window/tab ordering is still used for click-to-focus association,
-        // but not for visual ordering; Terminal's AppleScript window order changes
-        // with focus and made the dots jump around.
-        let orderedHermesStatuses = hermesStatuses.sorted { $0.slot < $1.slot }
+        // Order dots by Terminal's real tab bar when it can be read and its
+        // titles carry each tab's TTY (TabBarOrder); otherwise by when each
+        // session's tab was opened (DotOrder), which never jumps on focus
+        // changes. Slot letters (A-F) still label the menu rows.
+        refreshTerminalSnapshotIfStale()
+        tabBarCache.expire(at: Date())
+        let tabBarResult = TabBarOrder.ordered(
+            fallbackOrdered: DotOrder.ordered(hermesStatuses),
+            tabTitles: tabBarCache.titles,
+            ttyOf: { $0.pid.flatMap { ProcessInspector.tty(pid: $0) } }
+        )
+        let orderedHermesStatuses = tabBarResult.statuses
+        updateDotOrderItem(matched: tabBarResult.matchedCount, total: hermesStatuses.count)
         // Agent Lights must not write Terminal tab titles. Terminal Inspector titles
         // are user-owned and should persist across Hermes prompts; Agent Lights only
         // reads manual titles for menu labels and click-to-focus context.
@@ -222,6 +239,8 @@ private final class AgentLightsApp: NSObject, NSApplicationDelegate, NSMenuDeleg
         if let loadedAt = terminalSnapshotLoadedAt, Date().timeIntervalSince(loadedAt) < terminalSnapshotMaxAge { return }
         guard let processIdentifier = terminalProcessIdentifier() else {
             terminalTitlesByTTY = [:]
+            tabBarCache.reset()
+            tabBarTrusted = AXIsProcessTrusted()
             terminalSnapshotLoadedAt = Date()
             return
         }
@@ -230,8 +249,20 @@ private final class AgentLightsApp: NSObject, NSApplicationDelegate, NSMenuDeleg
             // PID-targeted Apple events fail harmlessly if Terminal exits; unlike a
             // bundle-targeted `tell application "Terminal"`, they cannot relaunch it.
             let output = AgentLightsTerminalTabSnapshot(processIdentifier) as String? ?? ""
+            let tabBar = TerminalTabBar.read(terminalPid: processIdentifier)
             await MainActor.run {
                 self.terminalTitlesByTTY = self.parseTerminalTitles(output)
+                switch tabBar {
+                case .untrusted:
+                    self.tabBarTrusted = false
+                    self.tabBarCache.reset()
+                case .failed(let reason):
+                    self.tabBarTrusted = true
+                    self.tabBarCache.recordFailure(reason, at: Date())
+                case .snapshot(let titles):
+                    self.tabBarTrusted = true
+                    self.tabBarCache.recordSuccess(titles, at: Date())
+                }
                 self.terminalSnapshotLoadedAt = Date()
                 self.terminalSnapshotInFlight = false
             }
@@ -401,6 +432,56 @@ private final class AgentLightsApp: NSObject, NSApplicationDelegate, NSMenuDeleg
             return false
         }
         return true
+    }
+
+    private func updateDotOrderItem(matched: Int, total: Int) {
+        let titlesHaveTTYs = tabBarCache.titles.contains { !TabBarOrder.ttys(inTitle: $0).isEmpty }
+        if !tabBarTrusted {
+            setDotOrderItem("tab opened \u{2014} Allow Accessibility to follow tabs\u{2026}", action: #selector(requestTabOrderPermission))
+        } else if tabBarCache.isUnavailable {
+            setDotOrderItem("tab opened \u{2014} can\u{2019}t read Terminal\u{2019}s tab bar (\(tabBarCache.lastFailure ?? "unknown"))", action: nil)
+        } else if matched < total && !titlesHaveTTYs {
+            setDotOrderItem("tab opened \u{2014} add \u{201C}TTY\u{201D} to Terminal tab titles\u{2026}", action: #selector(showTabTitleHelp))
+        } else if matched < total {
+            let count = total - matched
+            setDotOrderItem("Terminal tab bar; \(count) session\(count == 1 ? "" : "s") not matched to a Terminal tab", action: nil)
+        } else {
+            setDotOrderItem("Terminal tab bar", action: nil)
+        }
+    }
+
+    private func setDotOrderItem(_ detail: String, action: Selector?) {
+        dotOrderItem.title = "Dot order: \(detail)"
+        dotOrderItem.action = action
+        dotOrderItem.isEnabled = action != nil
+    }
+
+    /// Ask once per build: macOS ties the Accessibility grant to the app's
+    /// signature, and local builds are re-signed every time.
+    private func promptForTabOrderPermissionOncePerBuild() {
+        guard !AXIsProcessTrusted() else { return }
+        let executable = Bundle.main.executableURL
+        let modified = (try? executable?.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
+        let build = "\(executable?.path ?? "?")@\(modified?.timeIntervalSince1970 ?? 0)"
+        guard UserDefaults.standard.string(forKey: tabOrderPromptDefaultsKey) != build else { return }
+        UserDefaults.standard.set(build, forKey: tabOrderPromptDefaultsKey)
+        TerminalTabBar.requestPermission()
+    }
+
+    @objc private func requestTabOrderPermission(_ sender: NSMenuItem) {
+        if !TerminalTabBar.requestPermission() {
+            TerminalTabBar.openAccessibilitySettings()
+        }
+        terminalSnapshotLoadedAt = nil
+    }
+
+    @objc private func showTabTitleHelp(_ sender: NSMenuItem) {
+        let alert = NSAlert()
+        alert.messageText = "Show each tab's TTY in Terminal tab titles"
+        alert.informativeText = "Agent Lights matches Terminal tabs to Hermes sessions by the terminal device name in the tab title.\n\nIn Terminal: Settings \u{2192} Profiles \u{2192} (each profile you use) \u{2192} Tab \u{2192} turn on \u{201C}TTY\u{201D}.\n\nUntil then, dots follow the order tabs were opened."
+        alert.addButton(withTitle: "OK")
+        NSApp.activate(ignoringOtherApps: true)
+        alert.runModal()
     }
 
     @objc private func refreshNow(_ sender: NSMenuItem) {

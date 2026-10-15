@@ -425,6 +425,34 @@ public enum ProcessInspector {
         let tty = String(cString: name)
         return tty.isEmpty || tty == "??" ? nil : tty
     }
+
+    /// Parent process id, or nil if no such process.
+    public static func parentPid(pid: Int) -> Int? {
+        guard pid > 0, let info = kinfo(pid: pid) else { return nil }
+        let parent = Int(info.kp_eproc.e_ppid)
+        return parent > 0 ? parent : nil
+    }
+
+    /// When the terminal tab hosting `pid` was opened: the start time of the
+    /// oldest ancestor on the same controlling terminal (the tab's login
+    /// shell). Nil when the process has no terminal. Unlike the process's own
+    /// start time, this stays put when Hermes is relaunched in the same tab or
+    /// restarts a backend process.
+    public static func terminalSessionStartTime(
+        pid: Int,
+        ttyOf: (Int) -> String? = ProcessInspector.tty,
+        parentOf: (Int) -> Int? = ProcessInspector.parentPid,
+        startTimeOf: (Int) -> Double? = ProcessInspector.startTime
+    ) -> Double? {
+        guard let tty = ttyOf(pid) else { return nil }
+        var oldest = pid
+        var seen: Set<Int> = [pid]
+        while let parent = parentOf(oldest), !seen.contains(parent), ttyOf(parent) == tty {
+            seen.insert(parent)
+            oldest = parent
+        }
+        return startTimeOf(oldest)
+    }
 }
 
 /// Removes a dead owner's slot files without racing a new claimant.
@@ -481,6 +509,206 @@ public enum SlotFilePruner {
             removed = true
         }
         return removed
+    }
+}
+
+/// Left-to-right order of the normal Hermes dots.
+///
+/// Slots are reused lowest-free-first, so slot order drifts away from the
+/// Terminal tab order as sessions come and go. Terminal's own window/tab order
+/// follows focus, which made the dots jump. Ordering by when each session's
+/// tab was opened (falling back to the process start time without a terminal)
+/// matches tabs opened left to right and never moves with focus. Ties and
+/// sessions with no time sort by slot.
+public enum DotOrder {
+    public static func ordered(
+        _ statuses: [SlotStatus],
+        sessionStartTime: (SlotStatus) -> Double? = DotOrder.defaultSessionStartTime,
+        processStartTime: (SlotStatus) -> Double? = { $0.processStartTime }
+    ) -> [SlotStatus] {
+        // Earlier first; a missing time sorts after any known one.
+        func compare(_ left: Double?, _ right: Double?) -> Bool? {
+            switch (left, right) {
+            case let (l?, r?) where l != r: return l < r
+            case (_?, nil): return true
+            case (nil, _?): return false
+            default: return nil
+            }
+        }
+        let keyed = statuses.map { (status: $0, session: sessionStartTime($0), process: processStartTime($0)) }
+        return keyed.sorted { left, right in
+            compare(left.session, right.session)
+                ?? compare(left.process, right.process)
+                ?? (left.status.slot < right.status.slot)
+        }.map(\.status)
+    }
+
+    /// When the session's Terminal tab was opened, or the process start time
+    /// for a session without a terminal.
+    public static func defaultSessionStartTime(_ status: SlotStatus) -> Double? {
+        if let pid = status.pid, let tabOpened = ProcessInspector.terminalSessionStartTime(pid: pid) {
+            return tabOpened
+        }
+        return status.processStartTime
+    }
+}
+
+/// Last good Terminal tab bar read. A failed or incomplete Accessibility read
+/// must not swap the dots into fallback order for a moment, so a failure keeps
+/// the last good titles until they are `staleAfter` seconds old, then reports
+/// the tab bar as unavailable.
+public struct TabBarCache: Equatable {
+    public static let staleAfter: TimeInterval = 10
+
+    public private(set) var titles: [String] = []
+    public private(set) var lastGoodAt: Date?
+    public private(set) var lastFailure: String?
+
+    public init() {}
+
+    /// True when reads are failing and no recent good read remains.
+    public var isUnavailable: Bool {
+        lastFailure != nil && lastGoodAt == nil
+    }
+
+    public mutating func recordSuccess(_ titles: [String], at now: Date) {
+        self.titles = titles
+        lastGoodAt = now
+        lastFailure = nil
+    }
+
+    public mutating func recordFailure(_ reason: String, at now: Date) {
+        lastFailure = reason
+        if let lastGoodAt, now.timeIntervalSince(lastGoodAt) <= Self.staleAfter {
+            return
+        }
+        titles = []
+        lastGoodAt = nil
+    }
+
+    /// Enforce the age limit when the titles are used, so a read that is
+    /// slow or stuck (not just one that fails) cannot keep stale order alive.
+    public mutating func expire(at now: Date) {
+        guard let lastGoodAt, now.timeIntervalSince(lastGoodAt) > Self.staleAfter else { return }
+        titles = []
+        self.lastGoodAt = nil
+        lastFailure = lastFailure ?? "no tab bar read in \(Int(Self.staleAfter))s"
+    }
+
+    /// Permission revoked or Terminal gone: nothing to keep.
+    public mutating func reset() {
+        self = TabBarCache()
+    }
+}
+
+/// Dot order from Terminal's real tab bar.
+///
+/// Terminal's tab titles are the only place the on-screen tab order is
+/// exposed (through Accessibility), and titles are often identical
+/// ("Terminal"). With the profile's Tab title set to include "TTY", each title
+/// carries its tab's `ttysNNN`, which matches a session's controlling terminal
+/// exactly. Sessions whose terminal is not found in the tab bar keep their
+/// fallback (tab-opened) order after the matched ones.
+public enum TabBarOrder {
+    public enum Source: Equatable {
+        /// Every session was placed by its tab's position.
+        case tabBar
+        /// Some or all sessions fell back to tab-opened order, and why.
+        case tabOpened(reason: String)
+    }
+
+    public static func ttys(inTitle title: String) -> [String] {
+        guard let regex = try? NSRegularExpression(pattern: #"\bttys[0-9]+\b"#) else { return [] }
+        let range = NSRange(title.startIndex..., in: title)
+        return regex.matches(in: title, range: range).compactMap { match in
+            Range(match.range, in: title).map { String(title[$0]) }
+        }
+    }
+
+    /// One Terminal window as Accessibility reports it.
+    public struct WindowTabs: Equatable {
+        public let x: Double
+        public let y: Double
+        /// Tab titles in tab-bar order, or nil when the window shows no tab bar.
+        public let tabTitles: [String]?
+        public let windowTitle: String?
+
+        public init(x: Double, y: Double, tabTitles: [String]?, windowTitle: String?) {
+            self.x = x
+            self.y = y
+            self.tabTitles = tabTitles
+            self.windowTitle = windowTitle
+        }
+    }
+
+    /// Flatten windows into on-screen tab order: windows left to right, then
+    /// top to bottom, tabs left to right. Windows at the same position (stacked,
+    /// full screen, other Spaces) are ordered by their lowest TTY number, which
+    /// never changes, rather than by Accessibility's reporting order, which
+    /// follows focus.
+    ///
+    /// Each tab of a tabbed window is also reported as its own window (the
+    /// unselected ones hidden, at the same position, with no tab bar). Such a
+    /// window is only a real single tab if its terminal is not already in some
+    /// tab bar, so tab bars are placed first and duplicates are dropped.
+    public static func onScreenTabTitles(_ windows: [WindowTabs]) -> [String] {
+        func identity(_ window: WindowTabs) -> (tty: Int, title: String) {
+            let titles = window.tabTitles ?? window.windowTitle.map { [$0] } ?? []
+            let numbers = titles.flatMap(ttys(inTitle:)).compactMap { Int($0.dropFirst("ttys".count)) }
+            return (numbers.min() ?? Int.max, titles.joined(separator: "\u{1F}"))
+        }
+        let ordered = windows.enumerated().sorted { left, right in
+            if left.element.x != right.element.x { return left.element.x < right.element.x }
+            if left.element.y != right.element.y { return left.element.y < right.element.y }
+            let l = identity(left.element), r = identity(right.element)
+            if l.tty != r.tty { return l.tty < r.tty }
+            if l.title != r.title { return l.title < r.title }
+            return left.offset < right.offset
+        }.map(\.element)
+        let inTabBars = Set(ordered.flatMap { ($0.tabTitles ?? []).flatMap(ttys(inTitle:)) })
+        var titles: [String] = []
+        for window in ordered {
+            if let tabTitles = window.tabTitles {
+                titles.append(contentsOf: tabTitles)
+            } else if let title = window.windowTitle {
+                let found = ttys(inTitle: title)
+                if found.isEmpty || !found.allSatisfy(inTabBars.contains) {
+                    titles.append(title)
+                }
+            }
+        }
+        return titles
+    }
+
+    /// `tabTitles` are Terminal tab titles in on-screen order (windows left to
+    /// right, tabs left to right). `fallbackOrdered` is the tab-opened order.
+    public static func ordered(
+        fallbackOrdered: [SlotStatus],
+        tabTitles: [String],
+        ttyOf: (SlotStatus) -> String?
+    ) -> (statuses: [SlotStatus], matchedCount: Int) {
+        var rank: [String: Int] = [:]
+        for (index, title) in tabTitles.enumerated() {
+            let found = ttys(inTitle: title)
+            // A title naming several terminals cannot place one tab.
+            guard found.count == 1, rank[found[0]] == nil else { continue }
+            rank[found[0]] = index
+        }
+        var matched: [(rank: Int, status: SlotStatus)] = []
+        var unmatched: [SlotStatus] = []
+        for status in fallbackOrdered {
+            if let tty = ttyOf(status).map(normalizedTTY), let position = rank[tty] {
+                matched.append((position, status))
+            } else {
+                unmatched.append(status)
+            }
+        }
+        let placed = matched.sorted { $0.rank < $1.rank }.map(\.status)
+        return (placed + unmatched, matched.count)
+    }
+
+    private static func normalizedTTY(_ tty: String) -> String {
+        tty.hasPrefix("/dev/") ? String(tty.dropFirst(5)) : tty
     }
 }
 
@@ -619,7 +847,6 @@ public struct StatusIndicatorLayout: Equatable {
     public init(hermesStatuses: [SlotStatus], agentGroup: AgentRingGroup, flashOn: Bool = true) {
         self.normalSlotIndicators = hermesStatuses
             .filter { (1...6).contains($0.slot) }
-            .sorted { $0.slot < $1.slot }
             .map { NormalSlotIndicator(status: $0, flashOn: flashOn) }
         self.filledDotCount = normalSlotIndicators.filter { $0.style == .filled }.count
         self.agentRingCount = agentGroup.shouldRender ? agentGroup.capacity : 0

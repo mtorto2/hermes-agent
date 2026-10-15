@@ -257,6 +257,178 @@ final class SlotStatusTests: XCTestCase {
         XCTAssertEqual(layout.filledDotCount, 6)
     }
 
+    func testStatusIndicatorLayoutKeepsTheGivenDotOrder() throws {
+        let statuses = try [3, 1, 2].map { slot in
+            try SlotStatus.decode(from: "{\"slot\":\(slot),\"state\":\"working\",\"source\":\"hermes\"}".data(using: .utf8)!)
+        }
+        let layout = StatusIndicatorLayout(hermesStatuses: statuses, agentGroup: AgentRingGroup(statuses: []))
+
+        XCTAssertEqual(layout.normalSlotIndicators.map(\.slot), [3, 1, 2])
+    }
+
+    func testDotsFollowTabOpeningOrderNotSlotNumbers() throws {
+        // The reported case: Hermes (tab 1, opened first) got slot 2 because
+        // slot 1 was busy; Tate (tab 2) later took the freed slot 1.
+        let hermes = try SlotStatus.decode(from: #"{"slot":2,"state":"idle","source":"hermes","pid":200,"profile":"default"}"#.data(using: .utf8)!)
+        let tate = try SlotStatus.decode(from: #"{"slot":1,"state":"idle","source":"hermes","pid":100,"profile":"business"}"#.data(using: .utf8)!)
+        let tabOpened: [Int: Double] = [200: 1_000, 100: 2_000]
+
+        let ordered = DotOrder.ordered([tate, hermes], sessionStartTime: { $0.pid.flatMap { tabOpened[$0] } })
+
+        XCTAssertEqual(ordered.map(\.profile), ["default", "business"])
+    }
+
+    func testDotOrderPutsSessionsWithoutATimeLastAndBreaksTiesBySlot() throws {
+        let a = try SlotStatus.decode(from: #"{"slot":3,"state":"idle","pid":1}"#.data(using: .utf8)!)
+        let b = try SlotStatus.decode(from: #"{"slot":1,"state":"idle","pid":2}"#.data(using: .utf8)!)
+        let c = try SlotStatus.decode(from: #"{"slot":2,"state":"idle","pid":3}"#.data(using: .utf8)!)
+        let times: [Int: Double] = [1: 50, 2: 50]
+
+        let ordered = DotOrder.ordered([a, b, c], sessionStartTime: { $0.pid.flatMap { times[$0] } })
+
+        XCTAssertEqual(ordered.map(\.slot), [1, 3, 2])
+    }
+
+    private func hermesStatus(slot: Int, pid: Int, profile: String) throws -> SlotStatus {
+        try SlotStatus.decode(from: "{\"slot\":\(slot),\"state\":\"idle\",\"source\":\"hermes\",\"pid\":\(pid),\"profile\":\"\(profile)\"}".data(using: .utf8)!)
+    }
+
+    func testTabBarOrderFollowsOnScreenTabsIncludingMidRowInsertions() throws {
+        // Tabs on screen: Hermes | Aurelius (opened last, via cmd-T from tab 1) | Tate
+        let hermes = try hermesStatus(slot: 2, pid: 1, profile: "default")
+        let tate = try hermesStatus(slot: 1, pid: 2, profile: "business")
+        let aurelius = try hermesStatus(slot: 3, pid: 3, profile: "personal")
+        let tty: [Int: String] = [1: "ttys001", 2: "ttys000", 3: "ttys004"]
+        let titles = ["Terminal — ttys001", "Terminal — ttys004", "Terminal — ttys000"]
+
+        let result = TabBarOrder.ordered(
+            fallbackOrdered: [hermes, tate, aurelius],
+            tabTitles: titles,
+            ttyOf: { $0.pid.flatMap { tty[$0] } }
+        )
+
+        XCTAssertEqual(result.statuses.map(\.profile), ["default", "personal", "business"])
+        XCTAssertEqual(result.matchedCount, 3)
+    }
+
+    func testTabBarOrderKeepsUnmatchedSessionsAfterMatchedOnesInFallbackOrder() throws {
+        let a = try hermesStatus(slot: 1, pid: 1, profile: "a")
+        let b = try hermesStatus(slot: 2, pid: 2, profile: "b")
+        let c = try hermesStatus(slot: 3, pid: 3, profile: "c")
+        let tty: [Int: String] = [1: "/dev/ttys007", 2: "ttys008"]
+        // Identical titles without a TTY (the default Terminal setting) cannot
+        // place anything; a title naming two terminals is ignored too.
+        let result = TabBarOrder.ordered(
+            fallbackOrdered: [a, b, c],
+            tabTitles: ["Terminal", "Terminal", "Terminal — ttys008", "ttys007 ttys009"],
+            ttyOf: { $0.pid.flatMap { tty[$0] } }
+        )
+
+        XCTAssertEqual(result.statuses.map(\.profile), ["b", "a", "c"])
+        XCTAssertEqual(result.matchedCount, 1)
+        XCTAssertEqual(TabBarOrder.ttys(inTitle: "matt — -zsh — ttys012 — 80×24"), ["ttys012"])
+        XCTAssertEqual(TabBarOrder.ttys(inTitle: "nottys1 Terminal"), [])
+    }
+
+    func testHiddenPerTabWindowsDoNotJumpAheadOfTheRealTabBar() {
+        // Live Terminal: the selected tab's window carries the tab bar; the
+        // other tab is also reported as a bar-less window at the same spot,
+        // and may be listed first.
+        let windows = [
+            TabBarOrder.WindowTabs(x: 0, y: 33, tabTitles: nil, windowTitle: "Terminal \u{2014} ttys001"),
+            TabBarOrder.WindowTabs(x: 0, y: 33, tabTitles: ["ttys000", "ttys001"], windowTitle: "Terminal \u{2014} ttys000"),
+        ]
+
+        XCTAssertEqual(TabBarOrder.onScreenTabTitles(windows), ["ttys000", "ttys001"])
+    }
+
+    func testSeparateWindowsOrderLeftToRightAndKeepRealSingleTabWindows() {
+        let windows = [
+            TabBarOrder.WindowTabs(x: 800, y: 0, tabTitles: ["ttys005", "ttys006"], windowTitle: nil),
+            TabBarOrder.WindowTabs(x: 0, y: 0, tabTitles: nil, windowTitle: "Terminal \u{2014} ttys009"),
+            TabBarOrder.WindowTabs(x: 0, y: 500, tabTitles: ["ttys002"], windowTitle: nil),
+        ]
+
+        XCTAssertEqual(TabBarOrder.onScreenTabTitles(windows), ["Terminal \u{2014} ttys009", "ttys002", "ttys005", "ttys006"])
+    }
+
+    func testSamePositionWindowsKeepAStableOrderWhateverTheReportingOrder() {
+        let a = TabBarOrder.WindowTabs(x: 0, y: 33, tabTitles: ["ttys004", "ttys002"], windowTitle: nil)
+        let b = TabBarOrder.WindowTabs(x: 0, y: 33, tabTitles: ["ttys001"], windowTitle: nil)
+
+        let forward = TabBarOrder.onScreenTabTitles([a, b])
+        let reversed = TabBarOrder.onScreenTabTitles([b, a])
+
+        XCTAssertEqual(forward, reversed)
+        XCTAssertEqual(forward, ["ttys001", "ttys004", "ttys002"])
+    }
+
+    func testTabBarCacheRidesOutBriefFailuresThenReportsUnavailable() {
+        var cache = TabBarCache()
+        let start = Date(timeIntervalSince1970: 1_000)
+        cache.recordSuccess(["ttys000", "ttys001"], at: start)
+
+        cache.recordFailure("AXWindows read failed", at: start.addingTimeInterval(2))
+        XCTAssertEqual(cache.titles, ["ttys000", "ttys001"])
+        XCTAssertFalse(cache.isUnavailable)
+
+        cache.recordFailure("AXWindows read failed", at: start.addingTimeInterval(TabBarCache.staleAfter + 1))
+        XCTAssertEqual(cache.titles, [])
+        XCTAssertTrue(cache.isUnavailable)
+
+        cache.recordSuccess(["ttys001"], at: start.addingTimeInterval(30))
+        XCTAssertEqual(cache.titles, ["ttys001"])
+        XCTAssertFalse(cache.isUnavailable)
+        XCTAssertNil(cache.lastFailure)
+    }
+
+    func testTabBarCacheExpiresOnUseWhenReadsStall() {
+        var cache = TabBarCache()
+        let start = Date(timeIntervalSince1970: 1_000)
+        cache.recordSuccess(["ttys000"], at: start)
+
+        cache.expire(at: start.addingTimeInterval(TabBarCache.staleAfter))
+        XCTAssertEqual(cache.titles, ["ttys000"])
+
+        // No failure was reported: the read is simply stuck.
+        cache.expire(at: start.addingTimeInterval(TabBarCache.staleAfter + 0.5))
+        XCTAssertEqual(cache.titles, [])
+        XCTAssertTrue(cache.isUnavailable)
+        XCTAssertNotNil(cache.lastFailure)
+    }
+
+    func testFallbackBreaksTabOpenedTiesByProcessStartTimeBeforeSlot() throws {
+        let older = try hermesStatus(slot: 3, pid: 1, profile: "older")
+        let newer = try hermesStatus(slot: 1, pid: 2, profile: "newer")
+        let process: [Int: Double] = [1: 10, 2: 20]
+
+        let ordered = DotOrder.ordered(
+            [newer, older],
+            sessionStartTime: { _ in 5 },
+            processStartTime: { $0.pid.flatMap { process[$0] } }
+        )
+
+        XCTAssertEqual(ordered.map(\.profile), ["older", "newer"])
+    }
+
+    func testTerminalSessionStartTimeIsTheTabsOldestAncestorOnTheSameTTY() {
+        // Terminal(1) -> login(10, ttys000) -> zsh(11) -> hermes(12) -> node(13) -> gateway python(14)
+        let tty: [Int: String] = [10: "ttys000", 11: "ttys000", 12: "ttys000", 13: "ttys000", 14: "ttys000"]
+        let parent: [Int: Int] = [14: 13, 13: 12, 12: 11, 11: 10, 10: 1]
+        let start: [Int: Double] = [10: 100, 11: 101, 12: 500, 13: 501, 14: 900]
+
+        let tabOpened = ProcessInspector.terminalSessionStartTime(
+            pid: 14, ttyOf: { tty[$0] }, parentOf: { parent[$0] }, startTimeOf: { start[$0] }
+        )
+
+        XCTAssertEqual(tabOpened, 100)
+        XCTAssertNil(ProcessInspector.terminalSessionStartTime(pid: 1, ttyOf: { tty[$0] }, parentOf: { parent[$0] }, startTimeOf: { start[$0] }))
+        // A parent cycle cannot loop forever.
+        XCTAssertEqual(ProcessInspector.terminalSessionStartTime(
+            pid: 11, ttyOf: { _ in "ttys000" }, parentOf: { $0 == 11 ? 10 : 11 }, startTimeOf: { start[$0] }
+        ), 100)
+    }
+
     func testFloatingMonitorLayoutSupportsSixNormalHermesSlots() throws {
         let statuses = try (1...6).map { slot in
             try SlotStatus.decode(

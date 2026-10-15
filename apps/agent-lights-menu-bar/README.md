@@ -62,6 +62,36 @@ workers and files without a `pid` keep a 120-second freshness grace.
 | error | red, flashing (filled/outline each 0.75 s tick) in the menu-bar dots; steady red for Kanban circles and the floating monitor |
 | idle live session | dim gray outline |
 
+### Dot order
+
+Slots are reused lowest-free-first, so slot numbers do not follow your tabs.
+The dots are ordered instead:
+
+1. **By Terminal's real tab bar** (windows left to right, then tabs left to
+   right), when Agent Lights has Accessibility permission and each tab title
+   includes its TTY. This follows tabs opened mid-row with ⌘T and tabs you
+   drag. Set it up once:
+   - Terminal → Settings → Profiles → (each profile you use) → Tab →
+     turn on **TTY**. Titles are often identical ("Terminal"); the TTY is what
+     identifies each tab's session.
+   - System Settings → Privacy & Security → Accessibility → allow
+     **Hermes Agent Lights** (the app asks once per build; local builds are
+     re-signed each time, so the grant must be renewed after an update).
+2. **Otherwise by when each session's tab was opened** (the oldest process on
+   the session's terminal, so relaunching Hermes in a tab keeps its place),
+   then by process start time for sessions without a terminal. This is right
+   when new tabs open at the end; it does not follow mid-row inserts or drags.
+
+Sessions the tab bar cannot place keep fallback order after the placed ones.
+Windows at the same position (stacked, full screen, other Spaces) are ordered
+by their lowest TTY number, so focus changes never reorder them. A failed,
+incomplete or slow tab-bar read (any Accessibility error other than an
+attribute that does not exist, or more than 3 seconds) keeps the last good
+order for at most 10 seconds, enforced each time the dots are drawn, before
+falling back. The menu's "Dot order" line says which ordering
+is in effect: tab bar, needs Accessibility, needs TTY in tab titles, tab bar
+unreadable (with the reason), or sessions not matched to a Terminal tab.
+
 Normal Hermes CLI/TUI instances render as horizontal dots in the primary
 menu-bar item; an empty normal slot adds nothing. Kanban workers render as
 compact filled-circle groups in that same visible item so Ice/menu-bar managers
