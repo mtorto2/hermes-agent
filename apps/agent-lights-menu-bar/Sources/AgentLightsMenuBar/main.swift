@@ -36,7 +36,7 @@ private final class AgentLightsApp: NSObject, NSApplicationDelegate, NSMenuDeleg
     /// Terminal tab titles keyed by TTY, refreshed off the main thread: the
     /// Apple Event round-trip to Terminal can take up to a second.
     private var terminalTitlesByTTY: [String: String] = [:]
-    private var terminalSnapshotLoadedAt: Date?
+    private var terminalSnapshotLoadedAt: ContinuousClock.Instant?
     private var terminalSnapshotInFlight = false
     /// Terminal tab titles in on-screen order, read via Accessibility, with
     /// the last good read kept through brief failures.
@@ -185,7 +185,7 @@ private final class AgentLightsApp: NSObject, NSApplicationDelegate, NSMenuDeleg
         // session's tab was opened (DotOrder), which never jumps on focus
         // changes. Slot letters (A-F) still label the menu rows.
         refreshTerminalSnapshotIfStale()
-        tabBarCache.expire(at: Date())
+        tabBarCache.expire(at: .now)
         let tabBarResult = TabBarOrder.ordered(
             fallbackOrdered: DotOrder.ordered(hermesStatuses),
             tabTitles: tabBarCache.titles,
@@ -236,12 +236,12 @@ private final class AgentLightsApp: NSObject, NSApplicationDelegate, NSMenuDeleg
     /// Results land on the next render tick; the main thread never waits.
     private func refreshTerminalSnapshotIfStale() {
         if terminalSnapshotInFlight { return }
-        if let loadedAt = terminalSnapshotLoadedAt, Date().timeIntervalSince(loadedAt) < terminalSnapshotMaxAge { return }
+        if let loadedAt = terminalSnapshotLoadedAt, ContinuousClock.now - loadedAt < .seconds(terminalSnapshotMaxAge) { return }
         guard let processIdentifier = terminalProcessIdentifier() else {
             terminalTitlesByTTY = [:]
             tabBarCache.reset()
             tabBarTrusted = AXIsProcessTrusted()
-            terminalSnapshotLoadedAt = Date()
+            terminalSnapshotLoadedAt = .now
             return
         }
         terminalSnapshotInFlight = true
@@ -258,12 +258,12 @@ private final class AgentLightsApp: NSObject, NSApplicationDelegate, NSMenuDeleg
                     self.tabBarCache.reset()
                 case .failed(let reason):
                     self.tabBarTrusted = true
-                    self.tabBarCache.recordFailure(reason, at: Date())
+                    self.tabBarCache.recordFailure(reason, at: .now)
                 case .snapshot(let titles):
                     self.tabBarTrusted = true
-                    self.tabBarCache.recordSuccess(titles, at: Date())
+                    self.tabBarCache.recordSuccess(titles, at: .now)
                 }
-                self.terminalSnapshotLoadedAt = Date()
+                self.terminalSnapshotLoadedAt = .now
                 self.terminalSnapshotInFlight = false
             }
         }
@@ -459,11 +459,14 @@ private final class AgentLightsApp: NSObject, NSApplicationDelegate, NSMenuDeleg
     /// Ask once per build: macOS ties the Accessibility grant to the app's
     /// signature, and local builds are re-signed every time.
     private func promptForTabOrderPermissionOncePerBuild() {
-        guard !AXIsProcessTrusted() else { return }
         let executable = Bundle.main.executableURL
         let modified = (try? executable?.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
-        let build = "\(executable?.path ?? "?")@\(modified?.timeIntervalSince1970 ?? 0)"
-        guard UserDefaults.standard.string(forKey: tabOrderPromptDefaultsKey) != build else { return }
+        let build = AccessibilityPrompt.buildKey(executablePath: executable?.path, modifiedAt: modified)
+        guard AccessibilityPrompt.shouldPrompt(
+            trusted: AXIsProcessTrusted(),
+            buildKey: build,
+            lastPromptedBuildKey: UserDefaults.standard.string(forKey: tabOrderPromptDefaultsKey)
+        ) else { return }
         UserDefaults.standard.set(build, forKey: tabOrderPromptDefaultsKey)
         TerminalTabBar.requestPermission()
     }

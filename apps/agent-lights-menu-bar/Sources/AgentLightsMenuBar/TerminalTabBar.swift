@@ -128,6 +128,8 @@ enum TerminalTabBar {
         try checkBudget(deadline)
         let children: [AXUIElement] = try optionalAttribute(element, kAXChildrenAttribute, "children") ?? []
         for child in children {
+            // Each role read is its own Accessibility round trip.
+            try checkBudget(deadline)
             let childRole: String? = try optionalAttribute(child, kAXRoleAttribute, "role")
             if childRole == role { return child }
         }

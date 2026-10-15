@@ -365,18 +365,18 @@ final class SlotStatusTests: XCTestCase {
 
     func testTabBarCacheRidesOutBriefFailuresThenReportsUnavailable() {
         var cache = TabBarCache()
-        let start = Date(timeIntervalSince1970: 1_000)
+        let start = ContinuousClock.now
         cache.recordSuccess(["ttys000", "ttys001"], at: start)
 
-        cache.recordFailure("AXWindows read failed", at: start.addingTimeInterval(2))
+        cache.recordFailure("AXWindows read failed", at: start.advanced(by: .seconds(2)))
         XCTAssertEqual(cache.titles, ["ttys000", "ttys001"])
         XCTAssertFalse(cache.isUnavailable)
 
-        cache.recordFailure("AXWindows read failed", at: start.addingTimeInterval(TabBarCache.staleAfter + 1))
+        cache.recordFailure("AXWindows read failed", at: start.advanced(by: .seconds(TabBarCache.staleAfter + 1)))
         XCTAssertEqual(cache.titles, [])
         XCTAssertTrue(cache.isUnavailable)
 
-        cache.recordSuccess(["ttys001"], at: start.addingTimeInterval(30))
+        cache.recordSuccess(["ttys001"], at: start.advanced(by: .seconds(30)))
         XCTAssertEqual(cache.titles, ["ttys001"])
         XCTAssertFalse(cache.isUnavailable)
         XCTAssertNil(cache.lastFailure)
@@ -384,17 +384,32 @@ final class SlotStatusTests: XCTestCase {
 
     func testTabBarCacheExpiresOnUseWhenReadsStall() {
         var cache = TabBarCache()
-        let start = Date(timeIntervalSince1970: 1_000)
+        let start = ContinuousClock.now
         cache.recordSuccess(["ttys000"], at: start)
 
-        cache.expire(at: start.addingTimeInterval(TabBarCache.staleAfter))
+        cache.expire(at: start.advanced(by: .seconds(TabBarCache.staleAfter)))
         XCTAssertEqual(cache.titles, ["ttys000"])
 
         // No failure was reported: the read is simply stuck.
-        cache.expire(at: start.addingTimeInterval(TabBarCache.staleAfter + 0.5))
+        cache.expire(at: start.advanced(by: .seconds(TabBarCache.staleAfter + 0.5)))
         XCTAssertEqual(cache.titles, [])
         XCTAssertTrue(cache.isUnavailable)
         XCTAssertNotNil(cache.lastFailure)
+    }
+
+    func testAccessibilityPromptAsksOncePerBuildAndNeverWhenTrusted() {
+        let build1 = AccessibilityPrompt.buildKey(executablePath: "/A.app/x", modifiedAt: Date(timeIntervalSince1970: 1))
+        let build2 = AccessibilityPrompt.buildKey(executablePath: "/A.app/x", modifiedAt: Date(timeIntervalSince1970: 2))
+        XCTAssertNotEqual(build1, build2)
+
+        // First launch of a build: ask.
+        XCTAssertTrue(AccessibilityPrompt.shouldPrompt(trusted: false, buildKey: build1, lastPromptedBuildKey: nil))
+        // Relaunch of the same build: already asked.
+        XCTAssertFalse(AccessibilityPrompt.shouldPrompt(trusted: false, buildKey: build1, lastPromptedBuildKey: build1))
+        // A rebuild (new signature, grant lost): ask again.
+        XCTAssertTrue(AccessibilityPrompt.shouldPrompt(trusted: false, buildKey: build2, lastPromptedBuildKey: build1))
+        // Granted: never ask.
+        XCTAssertFalse(AccessibilityPrompt.shouldPrompt(trusted: true, buildKey: build2, lastPromptedBuildKey: build1))
     }
 
     func testFallbackBreaksTabOpenedTiesByProcessStartTimeBeforeSlot() throws {

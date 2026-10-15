@@ -557,11 +557,17 @@ public enum DotOrder {
 /// must not swap the dots into fallback order for a moment, so a failure keeps
 /// the last good titles until they are `staleAfter` seconds old, then reports
 /// the tab bar as unavailable.
+///
+/// Ages use `ContinuousClock`: monotonic, so wall-clock changes cannot make a
+/// read look fresh or stale, and still counting during sleep, so a read from
+/// before the Mac slept is not treated as fresh after it wakes.
 public struct TabBarCache: Equatable {
+    public typealias Instant = ContinuousClock.Instant
+
     public static let staleAfter: TimeInterval = 10
 
     public private(set) var titles: [String] = []
-    public private(set) var lastGoodAt: Date?
+    public private(set) var lastGoodAt: Instant?
     public private(set) var lastFailure: String?
 
     public init() {}
@@ -571,15 +577,15 @@ public struct TabBarCache: Equatable {
         lastFailure != nil && lastGoodAt == nil
     }
 
-    public mutating func recordSuccess(_ titles: [String], at now: Date) {
+    public mutating func recordSuccess(_ titles: [String], at now: Instant) {
         self.titles = titles
         lastGoodAt = now
         lastFailure = nil
     }
 
-    public mutating func recordFailure(_ reason: String, at now: Date) {
+    public mutating func recordFailure(_ reason: String, at now: Instant) {
         lastFailure = reason
-        if let lastGoodAt, now.timeIntervalSince(lastGoodAt) <= Self.staleAfter {
+        if let lastGoodAt, now - lastGoodAt <= .seconds(Self.staleAfter) {
             return
         }
         titles = []
@@ -588,8 +594,8 @@ public struct TabBarCache: Equatable {
 
     /// Enforce the age limit when the titles are used, so a read that is
     /// slow or stuck (not just one that fails) cannot keep stale order alive.
-    public mutating func expire(at now: Date) {
-        guard let lastGoodAt, now.timeIntervalSince(lastGoodAt) > Self.staleAfter else { return }
+    public mutating func expire(at now: Instant) {
+        guard let lastGoodAt, now - lastGoodAt > .seconds(Self.staleAfter) else { return }
         titles = []
         self.lastGoodAt = nil
         lastFailure = lastFailure ?? "no tab bar read in \(Int(Self.staleAfter))s"
@@ -598,6 +604,22 @@ public struct TabBarCache: Equatable {
     /// Permission revoked or Terminal gone: nothing to keep.
     public mutating func reset() {
         self = TabBarCache()
+    }
+}
+
+/// Whether to show the system Accessibility prompt at launch.
+///
+/// macOS ties the grant to the app's signature and local builds are ad-hoc
+/// signed, so each build needs a new grant. Ask once per build (identified by
+/// `buildKey`), never when already trusted, and never twice for one build.
+public enum AccessibilityPrompt {
+    public static func shouldPrompt(trusted: Bool, buildKey: String, lastPromptedBuildKey: String?) -> Bool {
+        !trusted && buildKey != lastPromptedBuildKey
+    }
+
+    /// Identifies one build: the executable's path and modification time.
+    public static func buildKey(executablePath: String?, modifiedAt: Date?) -> String {
+        "\(executablePath ?? "?")@\(modifiedAt?.timeIntervalSince1970 ?? 0)"
     }
 }
 

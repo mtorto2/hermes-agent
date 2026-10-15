@@ -295,3 +295,12 @@ The menu should show two temporary filled dots plus the 8-circle agent group
 (two 2×2 banks) in the same menu-bar item, with one active colored circle and
 seven gray placeholders, then hide them after the status files become stale unless a live
 `pid` is present.
+
+To smoke test the once-per-build Accessibility prompt (the decision itself is
+unit tested as `AccessibilityPrompt`):
+
+1. `tccutil reset Accessibility <CFBundleIdentifier>` and quit the app.
+2. Launch the app: macOS shows the Accessibility prompt once.
+3. Quit and relaunch without granting: no prompt.
+4. Rebuild and relaunch: one prompt again (each local build is a new
+   signature, so a previous grant no longer applies).
