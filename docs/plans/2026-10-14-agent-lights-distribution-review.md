@@ -100,3 +100,24 @@ and `v2026.8.31`; `git diff --check` clean.
 New dependency for `install.sh` / `uninstall.sh --purge`: `python3` (from the
 Command Line Tools, which Swift already requires). Release gates in "Not
 verified" above are unchanged.
+
+## Round 3: purge synchronization (changes requested → fixed)
+
+Re-review range: `fff204b808..HEAD` (fix `f98c7bbd64`, plus this note). Only
+`scripts/agent_lights_pool.py`, `uninstall.sh` (one line) and
+`tests/plugins/test_agent_lights_scripts.py` changed.
+
+| Finding | Fix | Proof |
+| --- | --- | --- |
+| P1 missing claim lock skipped | `purge` creates `slots/`, `agents/` if absent and opens each `.claim.lock` (root, `slots/`, `agents/`) with `O_RDWR|O_CREAT`, no truncate/replace, holding all three before the scan; they are kept by `_clear` | `test_a_first_kanban_worker_cannot_claim_between_the_scan_and_the_clear`: no `agents/` at start; a real core-producer Kanban worker runs between the scan and the clear and gets `none` (blocked, retries later); after purge a worker claims slot 1 normally |
+| P2 held `app.lock` deleted | `purge` takes `app.lock` exactly as the app does (`O_RDWR|O_CREAT`, `LOCK_EX|LOCK_NB`); held → refuse (exit 3); file and inode kept by `_clear`. `check` reports a held `app.lock` too. While purge holds it, an app starting then exits as "already running"; the next Hermes session relaunches it | `test_purge_refuses_while_an_app_holds_its_instance_lock_before_its_heartbeat` (lock held, no `app.json`: refused, inode unchanged, second lock still blocked), `test_purge_keeps_the_app_lock_file_so_a_later_app_locks_the_same_file` |
+| Found while fixing: pre-check refused whenever the app ran | `uninstall.sh` pre-check uses `check --ignore-app` (it quits the app before purging); the final `purge` still covers `app.json`/`app.lock` | `test_uninstall_purge_quits_a_running_app_then_clears_the_pool` (fails without `--ignore-app`) |
+
+Lock order: root, `slots/`, `agents/` (waiting up to 2 s each), then
+`app.lock` (no wait). Producers never hold two claim locks at once and the
+app only tries `slots/.claim.lock` non-blocking, so no deadlock.
+
+All four tests touching changed behavior fail on the round-2 helper (4 of 4)
+and pass now. Rerun: 812 Python tests across the same four files, `git diff
+--check` clean. Swift and E2E unchanged since round 2 (no Swift or plugin
+changes).
