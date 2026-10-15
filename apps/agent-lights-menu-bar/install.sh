@@ -28,7 +28,8 @@ usage() {
 Usage: ./install.sh [options]
 
   --profile NAME       Also install the plugin into Hermes profile NAME
-                       (repeatable). The default Hermes home is always used.
+                       (repeatable). The default profile (~/.hermes) is
+                       always included.
   --no-plugin          Install only the app.
   --no-test            Skip `swift test`.
   --login-item         Open the app at login (a LaunchAgent).
@@ -76,11 +77,53 @@ swift_major="$(swift --version 2>&1 | sed -nE 's/.*Swift version ([0-9]+).*/\1/p
 [ -f "$INFO_PLIST" ] || die "Missing $INFO_PLIST."
 bundle_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$INFO_PLIST")"
 
-hermes_root="${HERMES_HOME:-$HOME/.hermes}"
 hermes_bin="$(command -v hermes || true)"
 if [ "$install_plugin" -eq 1 ] && [ -z "$hermes_bin" ]; then
   die "\`hermes\` is not on PATH. Install Hermes first, or pass --no-plugin to install only the app."
 fi
+
+# Agent Lights and its plugin follow Hermes's profile layout under ~/.hermes;
+# each target is a profile name, passed to hermes with -p so the config it
+# edits is always the home the files go into (HERMES_HOME pointing at the
+# root would still follow a sticky `hermes profile use` selection).
+profile_home() {
+  if [ "$1" = "default" ]; then echo "$HOME/.hermes"; else echo "$HOME/.hermes/profiles/$1"; fi
+}
+targets=(default)
+for profile in ${profiles[@]+"${profiles[@]}"}; do
+  [ "$profile" = "default" ] || targets+=("$profile")
+done
+if [ "$install_plugin" -eq 1 ]; then
+  for target in "${targets[@]}"; do
+    [ -d "$(profile_home "$target")" ] || die "Hermes profile '$target' not found at $(profile_home "$target")."
+  done
+fi
+
+# python3 for path checks: Swift already requires Xcode or the Command Line
+# Tools, which provide it.
+python_bin="$(command -v python3 || true)"
+[ -n "$python_bin" ] || die "python3 is required (it comes with the Command Line Tools)."
+
+# -- destination checks (before building) -----------------------------------
+
+# The app refuses to run from an aliased bundle (see README, "Upgrading from
+# pre-v2 builds"); refuse to install into one rather than install a dead app.
+# A legacy AgentLightsMenuBar.app alias may dangle until v2 exists, so resolve
+# where it *would* point (non-strict realpath follows dangling links too).
+[ -L "$DEST" ] && die "$DEST is a symlink; remove it and re-run."
+legacy_problem="$("$python_bin" -I - "$DEST_DIR" "$APP_NAME" "$EXECUTABLE" <<'PYCODE'
+import os, sys
+dest_dir, app_name, exe = sys.argv[1:4]
+dest = os.path.realpath(os.path.join(dest_dir, app_name))
+legacy = os.path.join(dest_dir, "AgentLightsMenuBar.app")
+for probe in (legacy, os.path.join(legacy, "Contents", "MacOS", exe)):
+    reached = os.path.realpath(probe)
+    if reached == dest or reached.startswith(dest + os.sep):
+        print(f"{probe} resolves into {dest}")
+        break
+PYCODE
+)"
+[ -z "$legacy_problem" ] || die "$legacy_problem; remove the old AgentLightsMenuBar.app alias and re-run."
 
 # -- build -------------------------------------------------------------------
 
@@ -105,18 +148,7 @@ codesign --verify --strict "$stage/$APP_NAME"
 
 # -- install the app ---------------------------------------------------------
 
-# The app refuses to run from an aliased bundle (see README, "Upgrading from
-# pre-v2 builds"); refuse to install into one rather than install a dead app.
 mkdir -p "$DEST_DIR"
-[ -L "$DEST" ] && die "$DEST is a symlink; remove it and re-run."
-legacy_exe="$DEST_DIR/AgentLightsMenuBar.app/Contents/MacOS/$EXECUTABLE"
-if [ -e "$legacy_exe" ] && [ -e "$DEST" ]; then
-  reached="$(realpath "$legacy_exe")"
-  real_dest="$(realpath "$DEST")"
-  case "$reached" in
-    "$real_dest"|"$real_dest"/*) die "$legacy_exe resolves into $DEST; remove the old AgentLightsMenuBar.app alias and re-run." ;;
-  esac
-fi
 
 if pgrep -x "$EXECUTABLE" >/dev/null 2>&1; then
   if confirm "Agent Lights is running. Quit it so the new build can be installed?"; then
@@ -139,21 +171,19 @@ ditto "$stage/$APP_NAME" "$DEST"
 # -- install the plugin ------------------------------------------------------
 
 install_plugin_into() {
-  local home="$1"
-  [ -d "$home" ] || die "Hermes home $home does not exist."
+  local profile="$1" home
+  home="$(profile_home "$profile")"
   mkdir -p "$home/plugins"
   rm -rf "$home/plugins/$PLUGIN_NAME"
   cp -R "$HERE/plugin/$PLUGIN_NAME" "$home/plugins/$PLUGIN_NAME"
   find "$home/plugins/$PLUGIN_NAME" -name __pycache__ -type d -prune -exec rm -rf {} +
-  HERMES_HOME="$home" "$hermes_bin" plugins enable "$PLUGIN_NAME"
+  env -u HERMES_HOME "$hermes_bin" -p "$profile" plugins enable "$PLUGIN_NAME"
 }
 
 if [ "$install_plugin" -eq 1 ]; then
-  say "Installing the Hermes plugin into $hermes_root"
-  install_plugin_into "$hermes_root"
-  for profile in ${profiles[@]+"${profiles[@]}"}; do
-    say "Installing the Hermes plugin into profile $profile"
-    install_plugin_into "$HOME/.hermes/profiles/$profile"
+  for target in "${targets[@]}"; do
+    say "Installing the Hermes plugin into profile $target ($(profile_home "$target"))"
+    install_plugin_into "$target"
   done
 fi
 

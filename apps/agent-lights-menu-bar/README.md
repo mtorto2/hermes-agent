@@ -23,7 +23,7 @@ app. Options:
 
 | Option | Effect |
 | --- | --- |
-| `--profile NAME` | Also install the plugin into Hermes profile `NAME` (repeatable; plugins are per profile). |
+| `--profile NAME` | Also install the plugin into Hermes profile `NAME` (repeatable; plugins are per profile). The default profile is always included, whichever profile `hermes profile use` selected. |
 | `--login-item` | Open the app at login (a LaunchAgent). Not needed for normal use: Hermes opens the app when a session starts. |
 | `--no-plugin` | Install only the app. |
 | `--no-test` | Skip `swift test`. |
@@ -44,8 +44,11 @@ Then, once:
 
 To change the app or plugin, edit the source and re-run `./install.sh`. The
 bundle id lives in `Resources/Info.plist`. To remove everything,
-`./uninstall.sh` (`--purge` also deletes the status files, the app's
-preferences and its privacy grants; `--profile NAME` for profiles).
+`./uninstall.sh` (`--profile NAME` for profiles). `--purge` also deletes the
+status files, the app's preferences and its privacy grants; it is refused
+(before anything is removed) while any Hermes session still owns a dot,
+because clearing the pool under a running session lets two sessions share a
+slot. Exit those sessions first.
 
 ### How the plugin reports state
 
@@ -56,6 +59,12 @@ and an interrupted one **idle**. Kanban workers report blocked and completed
 tasks. Hermes builds from before the `on_human_input_*` hooks (2026-10) fall
 back to the clarify tool and approval hooks, so sudo prompts don't turn the
 dot yellow there.
+
+Waiting-for-you counts only for the session's own open turn: a subagent's
+prompts, or a background subagent's after the turn ended, never change the
+dot. A Kanban worker that blocks its task stays yellow (and one that
+completes it, red) through the end of its turn and after it exits; only a
+failed turn overrides that, with error.
 
 Known limits: a session's dot appears on its first message, not when the tab
 opens (no hook runs earlier); secret-entry prompts don't turn the dot yellow;
