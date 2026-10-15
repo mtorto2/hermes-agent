@@ -1,13 +1,15 @@
 """apps/agent-lights-menu-bar/scripts/hermes_core_patch.py against real git fixtures.
 
-Pins Hermes review round 4, P1: removing an old Agent Lights patch must keep
-every other change (staged, unstaged, committed, untracked), back everything
-up first, and take index and working tree back to the stock baseline.
+Hermes review rounds 4 and 5: removing an old Agent Lights patch must keep
+every other change (staged, unstaged, committed, untracked, even when an
+unrelated staged edit is hidden by the working tree), only remove what is
+provably Agent Lights *and* was approved by digest, and be fully recoverable.
 """
 
 from __future__ import annotations
 
 import importlib.util
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -48,30 +50,75 @@ def repo(tmp_path):
     return repo
 
 
-def _baseline(repo):
+def _base(repo):
     return core.resolve_baseline(repo, None)
 
 
+def _categories(repo, base):
+    return {r.path: r.category for r in core.inventory(repo, base)}
+
+
+def _backup_and_restore(repo, tmp_path, paths):
+    label, base = _base(repo)
+    backup = core.backup(repo, label, base, parent=tmp_path / "backups")
+    digest, _ = core.review_digest(repo, base, paths)
+    return backup, core.restore(repo, base, backup, paths, digest)
+
+
+def test_adjacent_agent_lights_and_unrelated_edits_are_mixed_and_refused(repo, tmp_path):
+    """Round 5 #1: one Agent Lights line made the whole hunk 'Agent Lights'."""
+    _edit(repo / "cli.py", 5, "self._emit_light_cue(LightCueEvent.WORKING)")
+    _edit(repo / "cli.py", 6, "my_own_tweak = True")  # same -U0 hunk
+    _, base = _base(repo)
+
+    assert _categories(repo, base)["cli.py"] == "mixed"
+    _, status = _backup_and_restore(repo, tmp_path, ["cli.py"])
+    assert status == 3
+    assert "my_own_tweak = True" in (repo / "cli.py").read_text()
+
+
+def test_a_new_file_that_only_mentions_agent_lights_is_review_and_stays(repo, tmp_path):
+    """Round 5 #1: a notes file mentioning agent-lights was moved out."""
+    (repo / "notes.md").write_text("Remember to try agent-lights someday.\n")
+    _, base = _base(repo)
+
+    assert _categories(repo, base)["notes.md"] == "review"
+    _, status = _backup_and_restore(repo, tmp_path, ["notes.md"])
+    assert status == 3
+    assert (repo / "notes.md").exists()
+
+
+def test_an_unrelated_staged_edit_hidden_by_the_working_tree_blocks_restore(repo, tmp_path):
+    """Round 5 #2: staged 'line 30 -> tweak', working tree back to 'line 30',
+    plus an Agent Lights edit: the combined diff showed only Agent Lights."""
+    _edit(repo / "cli.py", 30, "staged_tweak = 1")
+    _git(repo, "add", "cli.py")
+    _edit(repo / "cli.py", 30, "line 30")
+    _edit(repo / "cli.py", 5, "self._emit_light_cue(LightCueEvent.WORKING)")
+    _, base = _base(repo)
+
+    assert _categories(repo, base)["cli.py"] == "mixed"
+    _, status = _backup_and_restore(repo, tmp_path, ["cli.py"])
+    assert status == 3
+    assert "staged_tweak = 1" in _git(repo, "show", ":cli.py")
+
+
 def test_staged_patch_plus_unrelated_unstaged_edit_is_mixed_and_refused(repo, tmp_path):
-    """The reviewer's fixture: `git checkout -- file` kept the staged patch and
-    dropped the unrelated edit; the tool must refuse instead."""
+    """Round 4 #1, the original fixture."""
     _edit(repo / "cli.py", 5, "self._emit_light_cue(LightCueEvent.WORKING)")
     _git(repo, "add", "cli.py")
     _edit(repo / "cli.py", 30, "my_own_tweak = True")
-    label, base = _baseline(repo)
+    label, base = _base(repo)
 
-    reports = {r.path: r for r in core.inventory(repo, base)}
-    assert reports["cli.py"].category == "mixed"
-
-    backup = core.backup(repo, label, base, parent=tmp_path / "backups")
+    assert _categories(repo, base)["cli.py"] == "mixed"
+    backup, status = _backup_and_restore(repo, tmp_path, ["cli.py"])
+    assert status == 3
     assert b"LightCueEvent.WORKING" in (backup / "staged.patch").read_bytes()
     assert b"my_own_tweak" in (backup / "unstaged.patch").read_bytes()
-    assert core.restore(repo, base, backup, ["cli.py"]) == 3
     assert "my_own_tweak = True" in (repo / "cli.py").read_text()
-    assert "LightCueEvent" in _git(repo, "diff", "--cached")
 
 
-def test_committed_staged_and_untracked_patch_comes_out_and_other_work_stays(repo, tmp_path):
+def test_a_pure_patch_comes_out_of_index_and_working_tree_and_other_work_stays(repo, tmp_path):
     (repo / "agent").mkdir()
     (repo / "agent" / "light_cues.py").write_text("class LightCueService: ...\n")
     _edit(repo / "cli.py", 3, "from agent.light_cues import LightCueService")
@@ -83,55 +130,90 @@ def test_committed_staged_and_untracked_patch_comes_out_and_other_work_stays(rep
     (repo / "apps" / "agent-lights-menu-bar" / "Package.swift").write_text("// swift\n")
     (repo / "other.py").write_text("x = 2  # unrelated, unstaged\n")
     (repo / "notes.txt").write_text("unrelated untracked\n")
-    label, base = _baseline(repo)
+    _, base = _base(repo)
 
-    reports = {r.path: r.category for r in core.inventory(repo, base)}
-    assert reports == {
+    assert _categories(repo, base) == {
         "agent/light_cues.py": "agent-lights-file",
         "apps/agent-lights-menu-bar/Package.swift": "agent-lights-file",
         "cli.py": "agent-lights-only",
         "notes.txt": "unrelated",
         "other.py": "unrelated",
     }
-    backup = core.backup(repo, label, base, parent=tmp_path / "backups")
-    assert core.restore(repo, base, backup, ["cli.py", "agent/light_cues.py", "apps/agent-lights-menu-bar"]) == 0
-
-    # Index and working tree are stock for the patched paths...
+    backup, status = _backup_and_restore(repo, tmp_path,
+                                         ["cli.py", "agent/light_cues.py", "apps/agent-lights-menu-bar"])
+    assert status == 0
     assert (repo / "cli.py").read_text() == BASE_CLI
     assert _git(repo, "show", ":cli.py") == BASE_CLI
-    assert not (repo / "agent" / "light_cues.py").exists()
     assert "agent/light_cues.py" not in _git(repo, "ls-files")
-    # ...the untracked Agent Lights folder is in the backup, not deleted...
     assert (backup / "removed" / "apps" / "agent-lights-menu-bar" / "Package.swift").exists()
-    # ...and everything unrelated is untouched.
     assert (repo / "other.py").read_text() == "x = 2  # unrelated, unstaged\n"
     assert (repo / "notes.txt").exists()
-    # The backup can rebuild the old state: refs and patches are there.
-    refs = _git(repo, "for-each-ref", "--format=%(refname)", "refs/agent-lights-backup")
-    assert "/head" in refs and "/worktree" in refs
-    assert b"light_cues" in (backup / "committed.patch").read_bytes()
 
 
-def test_restore_refuses_a_stale_backup_and_unrelated_paths(repo, tmp_path):
+def test_restore_needs_the_digest_of_exactly_what_was_reviewed(repo, tmp_path):
     _edit(repo / "cli.py", 5, "self._emit_light_cue(LightCueEvent.WORKING)")
-    label, base = _baseline(repo)
+    label, base = _base(repo)
+    digest, text = core.review_digest(repo, base, ["cli.py"])
+    assert "LightCueEvent.WORKING" in text
+    _edit(repo / "cli.py", 6, "self._emit_light_cue(LightCueEvent.IDLE)")  # changed after review
     backup = core.backup(repo, label, base, parent=tmp_path / "backups")
-    (repo / "other.py").write_text("x = 3\n")  # changed after the backup
 
-    assert core.restore(repo, base, backup, ["cli.py"]) == 2
-    assert "LightCueEvent" in (repo / "cli.py").read_text()
+    assert core.restore(repo, base, backup, ["cli.py"], digest) == 2
+    assert "LightCueEvent.IDLE" in (repo / "cli.py").read_text()
+    assert core.main(["restore", "--hermes-dir", str(repo), "--backup", str(backup), "--yes", "cli.py"]) == 2
 
+
+def test_restore_refuses_a_stale_backup(repo, tmp_path):
+    _edit(repo / "cli.py", 5, "self._emit_light_cue(LightCueEvent.WORKING)")
+    label, base = _base(repo)
+    backup = core.backup(repo, label, base, parent=tmp_path / "backups")
+    (repo / "other.py").write_text("x = 3\n")
+    digest, _ = core.review_digest(repo, base, ["cli.py"])
+
+    assert core.restore(repo, base, backup, ["cli.py"], digest) == 2
     fresh = core.backup(repo, label, base, parent=tmp_path / "backups")
     assert fresh != backup  # never reuses a backup folder
-    assert core.restore(repo, base, fresh, ["other.py"]) == 3
-    assert core.restore(repo, base, fresh, ["cli.py"]) == 0
-    assert (repo / "other.py").read_text() == "x = 3\n"
 
 
-def test_cli_restore_requires_explicit_confirmation(repo, tmp_path):
-    _edit(repo / "cli.py", 5, "self._emit_light_cue(LightCueEvent.WORKING)")
-    label, base = _baseline(repo)
+def _messy_state(repo):
+    """Committed, staged, unstaged, untracked and binary changes together."""
+    (repo / "agent").mkdir()
+    (repo / "agent" / "light_cues.py").write_text("class LightCueService: ...\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "patch")
+    _edit(repo / "cli.py", 3, "self._emit_light_cue(LightCueEvent.WORKING)")
+    _git(repo, "add", "cli.py")
+    (repo / "other.py").write_text("x = 9\n")
+    (repo / "blob.bin").write_bytes(bytes(range(256)))
+    (repo / "notes.md").write_text("mine\n")
+
+
+def test_recover_puts_the_checkout_back_exactly(repo, tmp_path):
+    """Round 5 #7: a full recovery round trip, verified by fingerprint."""
+    _messy_state(repo)
+    label, base = _base(repo)
+    before = core.state_fingerprint(repo)
     backup = core.backup(repo, label, base, parent=tmp_path / "backups")
+    digest, _ = core.review_digest(repo, base, ["agent/light_cues.py", "cli.py"])
+    assert core.restore(repo, base, backup, ["agent/light_cues.py", "cli.py"], digest) == 0
+    assert core.state_fingerprint(repo) != before
 
-    assert core.main(["restore", "--hermes-dir", str(repo), "--backup", str(backup), "cli.py"]) == 2
-    assert "LightCueEvent" in (repo / "cli.py").read_text()
+    assert core.main(["recover", "--backup", str(backup), "--yes"]) == 0
+    assert core.state_fingerprint(repo) == before
+
+
+def test_the_readme_commands_also_recover_exactly(repo, tmp_path):
+    """The by-hand commands in the backup README use absolute paths and work."""
+    _messy_state(repo)
+    label, base = _base(repo)
+    before = core.state_fingerprint(repo)
+    backup = core.backup(repo, label, base, parent=tmp_path / "backups")
+    digest, _ = core.review_digest(repo, base, ["cli.py"])
+    assert core.restore(repo, base, backup, ["cli.py"], digest) == 0
+
+    readme = (backup / "README.txt").read_text()
+    by_hand = readme.split("Or by hand (skip a patch file that is empty):\n", 1)[1].split("\n\n", 1)[0]
+    for command in by_hand.strip().splitlines():
+        subprocess.run(["/bin/bash", "-c", command], check=True, cwd=tmp_path)
+    assert core.state_fingerprint(repo) == before
+    assert re.search(r"recover --backup \S+ --yes", readme)

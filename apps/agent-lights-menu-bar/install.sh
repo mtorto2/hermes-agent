@@ -146,6 +146,11 @@ legacy_args=(--new-bundle-id "$bundle_id" --new-plugin-dir "$HERE/plugin/$PLUGIN
 [ -n "$hermes_dir" ] && legacy_args+=(--hermes-dir "$hermes_dir")
 [ -n "$hermes_bin" ] && legacy_args+=(--hermes-bin "$hermes_bin")
 for profile in ${profiles[@]+"${profiles[@]}"}; do legacy_args+=(--profile "$profile"); done
+# Only the profiles this install writes the plugin into may have a previous
+# copy backed up and replaced automatically.
+if [ "$install_plugin" -eq 1 ]; then
+  for target in "${targets[@]}"; do legacy_args+=(--install-profile "$target"); done
+fi
 legacy_tool="$HERE/scripts/legacy_agent_lights.py"
 
 say "Checking for an older Agent Lights install"

@@ -44,6 +44,7 @@ and AGENT_LIGHTS_LEGACY_CONFINE refuses any move outside that directory.
 from __future__ import annotations
 
 import argparse
+import ast
 import filecmp
 import os
 import plistlib
@@ -66,13 +67,11 @@ OLD_BUNDLE_IDS = ("com.savant.hermes-agent-lights",)
 BACKUP_PREFIXES = ("agent-lights-legacy-backup-", "agent-lights-core-backup-")
 # Text that mentions Agent Lights somewhere (report-only for plugins).
 MENTIONS = re.compile(r"AgentLightsMenuBar|agent-lights|agent_lights|light_cues|LightCue")
-# Code that *is* an Agent Lights producer or launcher.
-PRODUCER_CODE = re.compile(
-    r"AgentLightsMenuBar"
-    r"|(from|import)\s+agent\.light_cues"
-    r"|SlotStatusFileBackend"
-    r"|[\"']agent-lights[\"']\s*\)?\s*/\s*[\"'](slots|agents|v2)[\"']"
-)
+# Evidence, in executable code (not comments or docstrings), that a plugin
+# *is* an Agent Lights producer or launcher.
+PRODUCER_NAMES = {"SlotStatusFileBackend", "LightCueService", "AgentLightsMenuBarLauncher",
+                  "build_light_cue_service_from_config", "AgentLightsProducer", "InstalledAppLauncher"}
+POOL_STRING = re.compile(r"agent-lights[/\\](slots|agents|v2)")
 
 
 @dataclass
@@ -99,6 +98,8 @@ class Context:
     system_apps: Path = Path("/Applications")
     new_plugin_dir: Path | None = None
     confine: Path | None = None
+    # Profiles this install writes the plugin into; None = no plugin install.
+    install_profiles: set[str] | None = None
     new_dest: Path = field(init=False)
 
     def __post_init__(self) -> None:
@@ -141,6 +142,39 @@ def _code_files(directory: Path, limit: int = 300) -> list[Path]:
 def _text_files(directory: Path, limit: int = 300) -> list[Path]:
     suffixes = {".py", ".yaml", ".yml", ".json", ".toml", ".md", ".sh", ".txt"}
     return [p for p in directory.rglob("*") if p.is_file() and p.suffix in suffixes][:limit]
+
+
+def _producer_evidence(directory: Path) -> str | None:
+    """Why the plugin's *code* is an Agent Lights producer, or None.
+
+    Parses each .py file and looks only at executable code: imports of
+    agent.light_cues, Agent Lights class/function names, and string literals
+    naming the app or its status pool. Comments and docstrings don't count.
+    """
+    for path in _code_files(directory):
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8", errors="ignore"))
+        except (SyntaxError, ValueError, OSError):
+            continue
+        bare_strings = {id(node.value) for node in ast.walk(tree)
+                        if isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant)
+                        and isinstance(node.value.value, str)}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import) and any(a.name.startswith("agent.light_cues") for a in node.names):
+                return f"{path.name} imports agent.light_cues"
+            if isinstance(node, ast.ImportFrom) and (
+                    (node.module or "").startswith("agent.light_cues")
+                    or (node.module == "agent" and any(a.name == "light_cues" for a in node.names))):
+                return f"{path.name} imports agent.light_cues"
+            name = node.id if isinstance(node, ast.Name) else node.attr if isinstance(node, ast.Attribute) else None
+            if name in PRODUCER_NAMES:
+                return f"{path.name} uses {name}"
+            if isinstance(node, ast.ClassDef) and node.name in PRODUCER_NAMES:
+                return f"{path.name} defines {node.name}"
+            if isinstance(node, ast.Constant) and isinstance(node.value, str) and id(node) not in bare_strings:
+                if "AgentLightsMenuBar" in node.value or POOL_STRING.search(node.value) or node.value == "agent-lights":
+                    return f"{path.name} names the Agent Lights app or status files in code"
+    return None
 
 
 def _any_match(files: list[Path], pattern: re.Pattern) -> bool:
@@ -223,10 +257,21 @@ def scan(ctx: Context) -> list[Finding]:
         parts = Path(command).parts
         if len(parts) >= 4 and parts[-2:] == ("MacOS", EXECUTABLE) and parts[-3] == "Contents":
             candidates.append(Path(*parts[:-3]))
+    # Whatever occupies the new app's path is replaced by install.sh: keep it
+    # unless it is a previous install of this same app.
+    dest = ctx.new_dest
+    if os.path.lexists(dest):
+        previous = (dest.is_dir() and not dest.is_symlink() and (dest / "Contents" / "MacOS" / EXECUTABLE).is_file()
+                    and ctx.new_bundle_id is not None and _bundle_id(dest) == ctx.new_bundle_id)
+        if not previous:
+            add(Finding("app", dest, "something else occupies the new app's path (not a previous install of "
+                        f"this app; bundle id {_bundle_id(dest) or 'none'}); backed up before replacing"))
     queue = list(candidates)
     while queue:
         app = queue.pop(0)
         if _archived(app):
+            continue
+        if os.path.abspath(app) == os.path.abspath(dest):
             continue
         if app.is_symlink():
             target = Path(os.path.realpath(app))
@@ -236,13 +281,6 @@ def scan(ctx: Context) -> list[Finding]:
                 queue.append(target)
             continue
         if not app.is_dir() or not _is_agent_lights_bundle(app):
-            continue
-        if app == ctx.new_dest:
-            # install.sh replaces this path; keep anything there that is not a
-            # previous install of this same app.
-            if ctx.new_bundle_id and _bundle_id(app) == ctx.new_bundle_id:
-                continue
-            add(Finding("app", app, f"another app at the new app's path (bundle id {_bundle_id(app) or 'unknown'})"))
             continue
         add(Finding("app", app, f"old Agent Lights app (bundle id {_bundle_id(app) or 'unknown'})",
                     removable=os.access(app.parent, os.W_OK)))
@@ -271,39 +309,55 @@ def scan(ctx: Context) -> list[Finding]:
     # -- per-profile plugins and status pools ---------------------------------
     for name, home in ctx.all_profile_homes():
         plugins = home / "plugins"
+        target = ctx.install_profiles is not None and name in ctx.install_profiles
+        dest_plugin = plugins / NEW_PLUGIN_DIR
+        if target and os.path.lexists(dest_plugin) and (dest_plugin.is_symlink() or not dest_plugin.is_dir()):
+            add(Finding("plugin", dest_plugin, f"a file or link occupies the plugin path in profile {name}; "
+                        "backed up before replacing", profile=name))
         if plugins.is_dir():
-            for plugin in sorted(p for p in plugins.iterdir() if p.is_dir() or p.is_symlink()):
+            for plugin in sorted(plugins.iterdir()):
+                if plugin.name == NEW_PLUGIN_DIR and (plugin.is_symlink() or not plugin.is_dir()):
+                    continue  # handled above (install targets) or not ours to judge
+                if not plugin.is_dir():
+                    continue
                 plugin_name = plugin.name
                 manifest = plugin / "plugin.yaml"
                 if manifest.is_file():
                     match = re.search(r"^name:\s*['\"]?([^'\"\n]+)", manifest.read_text(errors="ignore"), re.M)
                     plugin_name = match.group(1).strip() if match else plugin_name
-                if plugin.name == NEW_PLUGIN_DIR:
-                    # install.sh replaces this directory: keep it unless it is
-                    # exactly the plugin being installed.
-                    real_dir = plugin.is_dir() and not plugin.is_symlink()
-                    if ctx.new_plugin_dir and real_dir and _same_tree(plugin, ctx.new_plugin_dir):
+                is_link = plugin.is_symlink()
+                code_dir = Path(os.path.realpath(plugin)) if is_link else plugin
+                where = f" (a link to {code_dir}; only the link is moved)" if is_link else ""
+                is_current = _any_match([code_dir / "__init__.py"], re.compile(r"class AgentLightsProducer\b"))
+                if plugin.name == NEW_PLUGIN_DIR and not is_link:
+                    if not target:
+                        # Not replaced by this install: a current plugin there is
+                        # simply another profile's install; judge anything else
+                        # like any other plugin below.
+                        if is_current:
+                            continue
+                    elif ctx.new_plugin_dir and _same_tree(plugin, ctx.new_plugin_dir):
                         continue
-                    previous = real_dir and _any_match([plugin / "__init__.py"],
-                                                       re.compile(r"class AgentLightsProducer\b"))
-                    if previous:
-                        add(Finding("plugin", plugin,
-                                    f"previous install of this plugin in profile {name}; backed up before "
-                                    "being replaced", profile=name, plugin_name=plugin_name, auto=True))
+                    elif is_current:
+                        add(Finding("plugin", plugin, f"previous install of this plugin in profile {name}; "
+                                    "backed up before being replaced", profile=name, plugin_name=plugin_name,
+                                    auto=True))
+                        continue
                     else:
-                        add(Finding("plugin", plugin,
-                                    f"another '{plugin.name}' plugin in profile {name} (not this one); "
-                                    "backed up before being replaced", profile=name, plugin_name=plugin_name))
-                    continue
-                if plugin.is_symlink():
-                    continue
-                if _any_match(_code_files(plugin), PRODUCER_CODE):
-                    add(Finding("plugin", plugin, f"old Agent Lights plugin '{plugin_name}' in profile {name}",
-                                profile=name, plugin_name=plugin_name))
-                elif _any_match(_text_files(plugin), MENTIONS):
+                        add(Finding("plugin", plugin, f"another '{plugin.name}' plugin in profile {name} "
+                                    "(not this one); backed up before being replaced",
+                                    profile=name, plugin_name=plugin_name))
+                        continue
+                if is_current:
+                    continue  # the current plugin under another name (or linked): leave it
+                evidence = _producer_evidence(code_dir)
+                if evidence:
+                    add(Finding("plugin", plugin, f"old Agent Lights plugin '{plugin_name}' in profile {name}: "
+                                f"{evidence}{where}", profile=name, plugin_name=plugin_name))
+                elif _any_match(_text_files(code_dir), MENTIONS):
                     add(Finding("plugin", plugin,
-                                f"plugin '{plugin_name}' in profile {name} mentions Agent Lights but is not "
-                                "recognizably part of it; review it yourself",
+                                f"plugin '{plugin_name}' in profile {name} mentions Agent Lights but its code is "
+                                f"not recognizably part of it{where}; review it yourself",
                                 removable=False, profile=name, plugin_name=plugin_name))
         lights = home / "agent-lights"
         if lights.is_dir():
@@ -476,6 +530,8 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--new-bundle-id", default=_default_new_bundle_id())
     parser.add_argument("--new-plugin-dir", default=str(HERE.parent / "plugin" / NEW_PLUGIN_DIR))
     parser.add_argument("--no-spotlight", action="store_true")
+    parser.add_argument("--install-profile", action="append", default=None,
+                        help="a profile this install writes the plugin into (repeatable)")
     parser.add_argument("--auto-only", action="store_true",
                         help="remove: only back up what the install replaces, not older pieces")
     args = parser.parse_args(argv)
@@ -489,6 +545,7 @@ def main(argv: list[str]) -> int:
         system_apps=Path(os.environ.get("AGENT_LIGHTS_SYSTEM_APPLICATIONS", "/Applications")),
         new_plugin_dir=Path(args.new_plugin_dir) if Path(args.new_plugin_dir).is_dir() else None,
         confine=Path(confine) if confine else None,
+        install_profiles=set(args.install_profile) if args.install_profile else None,
     )
     findings = scan(ctx)
     if args.command == "scan":

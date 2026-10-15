@@ -530,6 +530,7 @@ def fake_system(monkeypatch):
 def _ctx(tmp_path: Path, home: Path, hermes_dir: Path | None, **kw):
     system_apps = tmp_path / "SystemApplications"
     system_apps.mkdir(exist_ok=True)
+    kw.setdefault("install_profiles", {"default"})
     return legacy.Context(home=home, hermes_dir=hermes_dir, profiles=[], spotlight=kw.pop("spotlight", False),
                           new_bundle_id=_NEW_ID, system_apps=system_apps, new_plugin_dir=_PLUGIN_SRC,
                           confine=tmp_path, **kw)
@@ -737,6 +738,70 @@ def test_a_login_item_that_will_not_unload_or_an_old_copy_still_running_fails(tm
     assert legacy.remove(ctx, legacy.scan(ctx), tmp_path / "backup2", None) == legacy.EXIT_FAILED
 
 
+def test_automatic_plugin_backup_only_in_profiles_this_install_writes(tmp_path, fake_system):
+    """Round 5 #3."""
+    home = tmp_path / "home"
+    for profile_home in (home / ".hermes", home / ".hermes" / "profiles" / "work"):
+        plugin = profile_home / "plugins" / "agent-lights"
+        shutil.copytree(_PLUGIN_SRC, plugin, ignore=shutil.ignore_patterns("__pycache__"))
+        (plugin / "protocol.py").write_text((plugin / "protocol.py").read_text() + "\n# tweak\n")
+
+    def profiles_hit(targets):
+        return {f.profile for f in legacy.scan(_ctx(tmp_path, home, None, install_profiles=targets))}
+
+    assert profiles_hit({"default"}) == {"default"}
+    assert profiles_hit({"default", "work"}) == {"default", "work"}
+    assert profiles_hit(None) == set()  # --no-plugin
+
+
+def test_files_and_links_at_the_install_paths_are_caught(tmp_path, fake_system):
+    """Round 5 #4."""
+    home = tmp_path / "home"
+    (home / "Applications").mkdir(parents=True)
+    (home / "Applications" / "AgentLightsMenuBar-v2.app").write_text("a plain file\n")
+    (home / ".hermes" / "plugins").mkdir(parents=True)
+    (home / ".hermes" / "plugins" / "agent-lights").write_text("a plain file\n")
+
+    paths = {f.path for f in legacy.scan(_ctx(tmp_path, home, None)) if f.removable}
+    assert paths == {home / "Applications" / "AgentLightsMenuBar-v2.app",
+                     home / ".hermes" / "plugins" / "agent-lights"}
+
+
+def test_comments_and_docstrings_are_not_producer_code(tmp_path, fake_system):
+    """Round 5 #5."""
+    home = tmp_path / "home"
+    plugin = home / ".hermes" / "plugins" / "notes"
+    plugin.mkdir(parents=True)
+    (plugin / "__init__.py").write_text(
+        '"""Works next to AgentLightsMenuBar; from agent.light_cues import nothing."""\n'
+        "# AgentLightsMenuBar, SlotStatusFileBackend, agent-lights/slots\n"
+        "def register(ctx):\n    \"\"\"See agent-lights.\"\"\"\n    return None\n")
+
+    [finding] = legacy.scan(_ctx(tmp_path, home, None))
+    assert finding.removable is False
+
+    (plugin / "__init__.py").write_text("import agent.light_cues\n")
+    [finding] = legacy.scan(_ctx(tmp_path, home, None))
+    assert finding.removable is True and "imports agent.light_cues" in finding.detail
+
+
+def test_a_symlinked_old_plugin_is_found_and_only_the_link_moves(tmp_path, fake_system):
+    """Round 5 #6."""
+    home = tmp_path / "home"
+    code = tmp_path / "src" / "old-lights"
+    code.mkdir(parents=True)
+    (code / "__init__.py").write_text("from agent.light_cues import LightCueService\n")
+    link = home / ".hermes" / "plugins" / "old-lights"
+    link.parent.mkdir(parents=True)
+    link.symlink_to(code)
+    ctx = _ctx(tmp_path, home, None)
+
+    [finding] = legacy.scan(ctx)
+    assert finding.path == link and finding.removable and str(code) in finding.detail
+    assert legacy.remove(ctx, [finding], tmp_path / "backup", None) == legacy.EXIT_NONE
+    assert not os.path.lexists(link) and (code / "__init__.py").exists()
+
+
 def test_a_hermes_core_patch_blocks_and_is_never_touched(tmp_path, fake_system):
     home, hermes_dir = tmp_path / "home", tmp_path / "hermes-agent"
     (hermes_dir / "agent").mkdir(parents=True)
@@ -790,11 +855,55 @@ def test_reinstalling_after_a_local_plugin_edit_backs_it_up_without_extra_flags(
     shutil.copytree(_PLUGIN_SRC, plugin, ignore=shutil.ignore_patterns("__pycache__"))
     (plugin / "protocol.py").write_text((plugin / "protocol.py").read_text() + "\n# local tweak\n")
 
-    done = _run("install.sh", box, "--no-test", "--no-plugin", "--yes")
+    done = _run("install.sh", box, "--no-test", "--yes")
     assert done.returncode == 0, done.stderr
     backups = list((box["home"] / ".hermes").glob("agent-lights-legacy-backup-*"))
     assert len(backups) == 1
     assert "local tweak" in next(backups[0].glob("*-plugin-agent-lights")).joinpath("protocol.py").read_text()
+    assert "local tweak" not in (plugin / "protocol.py").read_text()  # replaced by the new one
+
+
+@pytest.mark.macos_only
+@pytest.mark.skipif(shutil.which("swift") is None, reason="needs the Swift toolchain")
+def test_no_plugin_install_and_other_profiles_leave_plugins_alone(tmp_path):
+    """Round 5 #3: plugins were removed from profiles the install never writes."""
+    box = _sandbox(tmp_path)
+    box["env"]["PATH"] = os.pathsep.join([box["env"]["PATH"], os.path.dirname(shutil.which("swift"))])
+    mine = box["home"] / ".hermes" / "plugins" / "agent-lights"
+    theirs = box["home"] / ".hermes" / "profiles" / "work" / "plugins" / "agent-lights"
+    for plugin in (mine, theirs):
+        shutil.copytree(_PLUGIN_SRC, plugin, ignore=shutil.ignore_patterns("__pycache__"))
+        (plugin / "protocol.py").write_text((plugin / "protocol.py").read_text() + "\n# local tweak\n")
+
+    done = _run("install.sh", box, "--no-test", "--yes", "--no-plugin")
+    assert done.returncode == 0, done.stderr
+    assert "local tweak" in (mine / "protocol.py").read_text()
+    assert "local tweak" in (theirs / "protocol.py").read_text()
+
+    again = _run("install.sh", box, "--no-test", "--yes")  # default profile only
+    assert again.returncode == 0, again.stderr
+    assert "local tweak" not in (mine / "protocol.py").read_text()
+    assert "local tweak" in (theirs / "protocol.py").read_text()
+
+
+@pytest.mark.macos_only
+@pytest.mark.skipif(shutil.which("swift") is None, reason="needs the Swift toolchain")
+def test_unrecognized_contents_at_the_new_app_path_survive_install(tmp_path):
+    """Round 5 #4: a folder there without an Agent Lights executable was rm -rf'd."""
+    box = _sandbox(tmp_path)
+    box["env"]["PATH"] = os.pathsep.join([box["env"]["PATH"], os.path.dirname(shutil.which("swift"))])
+    dest = box["home"] / "Applications" / "AgentLightsMenuBar-v2.app"
+    dest.mkdir(parents=True)
+    (dest / "my-notes.txt").write_text("keep me\n")
+
+    refused = _run("install.sh", box, "--no-test", "--yes", "--no-plugin")
+    assert refused.returncode != 0
+    assert (dest / "my-notes.txt").read_text() == "keep me\n"
+
+    done = _run("install.sh", box, "--no-test", "--yes", "--no-plugin", "--remove-legacy")
+    assert done.returncode == 0, done.stderr
+    [backup] = (box["home"] / ".hermes").glob("agent-lights-legacy-backup-*")
+    assert (next(backup.glob("*-app-AgentLightsMenuBar-v2.app")) / "my-notes.txt").read_text() == "keep me\n"
 
 
 @pytest.mark.macos_only
