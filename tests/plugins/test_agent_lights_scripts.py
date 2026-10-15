@@ -102,7 +102,7 @@ def test_purge_clears_a_dead_pool_but_keeps_the_claim_locks(tmp_path, monkeypatc
     assert pool_tool.main(["purge", str(pool)]) == 0
 
     remaining = sorted(str(p.relative_to(pool)) for p in pool.rglob("*"))
-    assert remaining == [".claim.lock", "agents", "agents/.claim.lock", "slots", "slots/.claim.lock"]
+    assert remaining == [".claim.lock", "agents", "agents/.claim.lock", "app.lock", "slots", "slots/.claim.lock"]
     assert (pool / "slots" / ".claim.lock").stat().st_ino == slots_lock_inode
     monkeypatch.setenv("HERMES_AGENT_LIGHTS_HOME", str(tmp_path))
     monkeypatch.delenv("HERMES_SLOT", raising=False)
@@ -123,6 +123,89 @@ def test_purge_waits_out_a_claim_in_progress_then_gives_up(tmp_path):
         assert (pool / "slots" / "4.json").exists()
     finally:
         os.close(lock)
+
+
+_FIRST_WORKER_CHILD = """
+import os
+from agent.light_cues import SlotStatusFileBackend
+backend = SlotStatusFileBackend.from_env(auto_assign=True)
+print(backend.slot if backend else "none", flush=True)
+os._exit(0)  # keep whatever it claimed, like a worker that is still running
+"""
+
+
+def test_a_first_kanban_worker_cannot_claim_between_the_scan_and_the_clear(tmp_path, monkeypatch):
+    """Hermes review round 2, P1: with no agents/.claim.lock yet, purge locked
+    nothing for that pool, so a first worker claimed slot 1 after the scan and
+    purge then erased its claim."""
+    pool = tmp_path / "agent-lights" / "v2"
+    (pool / "slots").mkdir(parents=True)
+    (pool / "slots" / ".claim.lock").write_text("")
+    env = {**os.environ, "HERMES_AGENT_LIGHTS_HOME": str(tmp_path), "PYTHONPATH": str(_REPO_ROOT),
+           "HERMES_KANBAN_TASK": "t_1"}
+    env.pop("HERMES_SLOT", None)
+    claimed_during_purge = []
+    real_live_owners = pool_tool.live_owners
+
+    def scan_then_race(scanned_pool):
+        owners = real_live_owners(scanned_pool)
+        # A worker starts right after the scan, before the clear.
+        child = subprocess.run([sys.executable, "-c", _FIRST_WORKER_CHILD], env=env,
+                               capture_output=True, text=True, timeout=60)
+        claimed_during_purge.append(child.stdout.strip())
+        return owners
+
+    monkeypatch.setattr(pool_tool, "live_owners", scan_then_race)
+
+    assert pool_tool.purge(pool) == 0
+    assert claimed_during_purge == ["none"]  # blocked by purge, retries later
+    # Afterwards a worker claims normally in the cleared pool.
+    after = subprocess.run([sys.executable, "-c", _FIRST_WORKER_CHILD], env=env,
+                           capture_output=True, text=True, timeout=60)
+    assert after.stdout.strip() == "1"
+    assert (pool / "agents" / "1.lock").exists()
+
+
+def _hold_app_lock(pool: Path) -> int:
+    """What the app does at startup, before it writes its heartbeat."""
+    fd = os.open(pool / "app.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    return fd
+
+
+def test_purge_refuses_while_an_app_holds_its_instance_lock_before_its_heartbeat(tmp_path):
+    """Hermes review round 2, P2: purge deleted a held app.lock, so a second
+    app could lock a fresh file while the first still held the old one."""
+    pool = tmp_path / "agent-lights" / "v2"
+    (pool / "slots").mkdir(parents=True)
+    (pool / "context").mkdir()
+    (pool / "context" / "1.json").write_text("{}")
+    fd = _hold_app_lock(pool)
+    try:
+        inode = (pool / "app.lock").stat().st_ino
+        assert not (pool / "app.json").exists()
+
+        assert pool_tool.main(["check", str(pool)]) == pool_tool.EXIT_LIVE
+        assert pool_tool.main(["purge", str(pool)]) == pool_tool.EXIT_LIVE
+
+        assert (pool / "app.lock").stat().st_ino == inode
+        assert (pool / "context" / "1.json").exists()
+        # The single-instance guarantee holds: a second app cannot lock it.
+        with pytest.raises(BlockingIOError):
+            os.close(_hold_app_lock(pool))
+    finally:
+        os.close(fd)
+
+
+def test_purge_keeps_the_app_lock_file_so_a_later_app_locks_the_same_file(tmp_path):
+    pool = tmp_path / "agent-lights" / "v2"
+    pool.mkdir(parents=True)
+    os.close(os.open(pool / "app.lock", os.O_RDWR | os.O_CREAT, 0o600))
+    inode = (pool / "app.lock").stat().st_ino
+
+    assert pool_tool.purge(pool) == 0
+
+    assert (pool / "app.lock").stat().st_ino == inode
 
 
 def test_check_and_purge_of_a_missing_pool_succeed(tmp_path):
@@ -220,6 +303,34 @@ def test_uninstall_purge_refuses_up_front_while_a_session_owns_a_slot(tmp_path):
     finally:
         owner.stdin.close()
         owner.wait(timeout=10)
+
+
+@pytest.mark.macos_only
+def test_uninstall_purge_quits_a_running_app_then_clears_the_pool(tmp_path):
+    """The app's own heartbeat must not block --purge: uninstall quits it first."""
+    box = _sandbox(tmp_path)
+    _fake_install(box["home"])
+    pool = box["home"] / ".hermes" / "agent-lights" / "v2"
+    # An orphaned stand-in "app" (reaped by launchd when killed, so it never
+    # lingers as a zombie of this test).
+    app_pid = int(subprocess.run(["/bin/sh", "-c", "sleep 300 >/dev/null 2>&1 & echo $!"],
+                                 capture_output=True, text=True, check=True).stdout)
+    try:
+        (pool / "slots").mkdir(parents=True)
+        (pool / "app.json").write_text(json.dumps({"pid": app_pid, "pool": "v2"}))
+        # Stand-ins for quitting the app: pkill ends the heartbeat's process.
+        (box["home"].parent / "shims" / "pkill").write_text(f"#!/bin/bash\nkill {app_pid}\nexit 0\n")
+        (box["home"].parent / "shims" / "pgrep").write_text(f"#!/bin/bash\nkill -0 {app_pid} 2>/dev/null\n")
+
+        done = _run("uninstall.sh", box, "--purge", "--yes")
+    finally:
+        try:
+            os.kill(app_pid, 9)
+        except ProcessLookupError:
+            pass
+
+    assert done.returncode == 0, done.stderr
+    assert not (pool / "app.json").exists()
 
 
 @pytest.mark.macos_only

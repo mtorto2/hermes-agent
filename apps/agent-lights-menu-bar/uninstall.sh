@@ -76,7 +76,8 @@ if [ "$purge" -eq 1 ]; then
   # Clearing the pool under a running session would let two sessions share
   # a slot (each producer keeps its slot number). Running sessions must exit
   # first; the plugin stays loaded in them even after it is removed.
-  if ! "$python_bin" -I "$POOL_TOOL" check "$POOL"; then
+  # The app itself is quit below, before the pool is cleared.
+  if ! "$python_bin" -I "$POOL_TOOL" check --ignore-app "$POOL"; then
     die "--purge refused; nothing was removed. Exit those sessions, or uninstall without --purge."
   fi
 fi

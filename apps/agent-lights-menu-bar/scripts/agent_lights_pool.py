@@ -4,15 +4,29 @@
 Clearing the pool while a Hermes session still owns a slot breaks slot
 ownership: the session keeps writing its cached slot number while a new
 session claims the same slot in the emptied pool. So this refuses while any
-slot, worker, or app owner is still alive, and clears under the same
-``.claim.lock`` flocks every producer and the app hold while claiming, so no
-claim can interleave. The ``.claim.lock`` files themselves are kept (a
-claimant may already hold one open; replacing it would split the lock).
+slot, worker, or app owner is still alive. Before it even looks, it holds
+every lock a producer or the app takes to claim anything:
+
+- the ``.claim.lock`` of the pool root (app launch) and of ``slots/`` and
+  ``agents/``, creating any that do not exist yet (a pool that never had a
+  Kanban worker has no ``agents/.claim.lock``, and a first worker must not be
+  able to claim between the scan and the clear);
+- ``app.lock``, the app's single-instance flock, which the app takes before
+  it writes its ``app.json`` heartbeat. If it is held, an app is running or
+  starting, and purge refuses. (An app that starts while purge holds it
+  exits as "already running"; the next Hermes session relaunches it.)
+
+Lock files are opened like the producers open them (create if missing, never
+truncate or replace) and are kept when clearing: replacing a lock file would
+let two holders lock different files.
 
 Liveness is PID-only here (no start-time match), which can only err toward
 refusing. Standard library only.
 
-    agent_lights_pool.py check [POOL]   exit 0 if clearable, 3 if owners live
+    agent_lights_pool.py check [--ignore-app] [POOL]
+                                        exit 0 if clearable, 3 if owners live;
+                                        --ignore-app skips the app itself (for
+                                        a caller about to quit it)
     agent_lights_pool.py purge [POOL]   clear it; 3 if owners live, 4 if busy
 """
 
@@ -28,6 +42,7 @@ from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
 CLAIM_LOCK = ".claim.lock"
+APP_LOCK = "app.lock"
 POOL_DIRS = ("slots", "agents")
 EXIT_LIVE = 3
 EXIT_BUSY = 4
@@ -56,7 +71,7 @@ def _owner_pid(path: Path) -> int | None:
     return pid if isinstance(pid, int) and not isinstance(pid, bool) and pid > 0 else None
 
 
-def live_owners(pool: Path) -> list[tuple[Path, int]]:
+def live_owners(pool: Path, *, include_app: bool = True) -> list[tuple[Path, int]]:
     """Status, lock, and heartbeat files whose owning process is alive."""
     candidates: list[Path] = []
     for name in POOL_DIRS:
@@ -66,7 +81,8 @@ def live_owners(pool: Path) -> list[tuple[Path, int]]:
                 path for path in sorted(directory.iterdir())
                 if path.suffix in {".json", ".lock"} and path.name != CLAIM_LOCK
             )
-    candidates.append(pool / "app.json")
+    if include_app:
+        candidates.append(pool / "app.json")
     owners = []
     for path in candidates:
         pid = _owner_pid(path)
@@ -75,10 +91,18 @@ def live_owners(pool: Path) -> list[tuple[Path, int]]:
     return owners
 
 
+class AppRunning(Exception):
+    """app.lock is held: an Agent Lights app is running or starting."""
+
+
 @contextmanager
 def _flock(path: Path, timeout_s: float):
-    """Exclusive flock on an existing lock file (never creates one)."""
-    fd = os.open(path, os.O_RDWR)
+    """Exclusive flock, opening the file as producers and the app do.
+
+    O_CREAT without O_TRUNC: an existing lock file keeps its inode, so anyone
+    already holding or waiting on it contends with this lock.
+    """
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
     try:
         deadline = time.monotonic() + timeout_s
         while True:
@@ -96,6 +120,8 @@ def _flock(path: Path, timeout_s: float):
 
 def _clear(pool: Path) -> None:
     for entry in pool.iterdir():
+        if entry.name in (CLAIM_LOCK, APP_LOCK):
+            continue
         if entry.name in POOL_DIRS and entry.is_dir() and not entry.is_symlink():
             for item in entry.iterdir():
                 if item.name == CLAIM_LOCK:
@@ -104,8 +130,6 @@ def _clear(pool: Path) -> None:
                     shutil.rmtree(item)
                 else:
                     item.unlink()
-        elif entry.name == CLAIM_LOCK:
-            continue
         elif entry.is_dir() and not entry.is_symlink():
             shutil.rmtree(entry)
         else:
@@ -115,18 +139,29 @@ def _clear(pool: Path) -> None:
 def purge(pool: Path, *, lock_timeout_s: float = 2.0) -> int:
     if not pool.is_dir():
         return 0
-    lock_files = [pool / CLAIM_LOCK] + [pool / name / CLAIM_LOCK for name in POOL_DIRS]
     try:
         with ExitStack() as stack:
-            # Fixed order; producers never hold two of these at once.
-            for lock_file in lock_files:
-                if lock_file.exists():
-                    stack.enter_context(_flock(lock_file, lock_timeout_s))
+            # Fixed order. Producers never hold two claim locks at once, and
+            # the app only ever tries its claim lock without waiting, so this
+            # cannot deadlock with them.
+            stack.enter_context(_flock(pool / CLAIM_LOCK, lock_timeout_s))
+            for name in POOL_DIRS:
+                (pool / name).mkdir(exist_ok=True)
+                stack.enter_context(_flock(pool / name / CLAIM_LOCK, lock_timeout_s))
+            # The app holds this for its whole life: don't wait for it.
+            try:
+                stack.enter_context(_flock(pool / APP_LOCK, 0))
+            except TimeoutError:
+                raise AppRunning() from None
             owners = live_owners(pool)
             if owners:
                 _report(owners)
                 return EXIT_LIVE
             _clear(pool)
+    except AppRunning:
+        print("An Agent Lights app is running or starting (it holds app.lock); quit it, then try again.",
+              file=sys.stderr)
+        return EXIT_LIVE
     except TimeoutError as exc:
         print(f"Agent Lights pool is busy (a session is claiming a slot: {exc}); try again.", file=sys.stderr)
         return EXIT_BUSY
@@ -144,9 +179,22 @@ def main(argv: list[str]) -> int:
     if not argv or argv[0] not in {"check", "purge"}:
         print(__doc__, file=sys.stderr)
         return 2
-    pool = Path(argv[1]) if len(argv) > 1 else default_pool()
-    if argv[0] == "check":
-        owners = live_owners(pool) if pool.is_dir() else []
+    command, rest = argv[0], argv[1:]
+    include_app = True
+    if command == "check" and rest[:1] == ["--ignore-app"]:
+        include_app, rest = False, rest[1:]
+    pool = Path(rest[0]) if rest else default_pool()
+    if command == "check":
+        if not pool.is_dir():
+            return 0
+        if include_app:
+            try:
+                with _flock(pool / APP_LOCK, 0):
+                    pass
+            except TimeoutError:
+                print("An Agent Lights app is running or starting (it holds app.lock).", file=sys.stderr)
+                return EXIT_LIVE
+        owners = live_owners(pool, include_app=include_app)
         if owners:
             _report(owners)
             return EXIT_LIVE
