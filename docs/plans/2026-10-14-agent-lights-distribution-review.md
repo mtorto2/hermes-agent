@@ -210,3 +210,30 @@ six aside and installed, keeping the mention-only plugin and new pieces; a
 plain re-run then succeeded. Read-only `scan` and `inventory` on Matt's Mac
 ran cleanly (baseline = merge-base with `fork/main`). Swift code unchanged
 since round 2.
+
+## Round 6: response to round 5 (changes requested → fixed, not yet reviewed)
+
+Re-review range: `46e3efadda..HEAD` (fixes `f42dbca5af`, README `dcc2afdd47`,
+plus this note) and the updated `~/Desktop/agent-lights-prompt-for-hermes.md`.
+Zip rebuilt from `dcc2afdd47`: `~/Desktop/agent-lights-src-20261015-dcc2afdd47.zip`
+(+ `.sha256`); earlier zips moved off the Desktop.
+
+| # | Finding | Fix | Proof |
+| --- | --- | --- | --- |
+| 1 | Text authorized removal | Classification is eligibility only. A hunk is Agent Lights only if **every added line** (what a restore discards) names an Agent Lights symbol or is bare syntax (brackets, `try:`, `pass`, `except …:`), and pure-deletion hunks never are. New files are eligible only at known Agent Lights paths (`agent/light_cues.py`, `agent/wiz_light.py`, their tests, `apps/agent-lights-menu-bar/…`); others that mention it are `review`. `restore` additionally needs `--approved` = the digest printed by the new `review` command over exactly the changes it will discard. The prompt now calls categories "the tool's guess", has the agent show `review` output and get the friend's confirmation, and never restores `mixed`/`review` paths | `test_adjacent_agent_lights_and_unrelated_edits_are_mixed_and_refused`, `test_a_new_file_that_only_mentions_agent_lights_is_review_and_stays`, `test_restore_needs_the_digest_of_exactly_what_was_reviewed` |
+| 2 | Hidden staged change | Index (baseline→index) and working tree (index→working tree) classified separately; either layer's unrelated hunk makes the file `mixed` | `test_an_unrelated_staged_edit_hidden_by_the_working_tree_blocks_restore` (staged tweak survives in the index) |
+| 3 | Auto plugin removal outside install targets | Scanner gets `--install-profile` per profile this install writes (none with `--no-plugin`); automatic backup/replacement only there; a current plugin in another profile is left alone | `test_automatic_plugin_backup_only_in_profiles_this_install_writes`, `test_no_plugin_install_and_other_profiles_leave_plugins_alone` (replaces the test that accepted removal) |
+| 4 | Unrecognized destination contents | Anything at `~/Applications/AgentLightsMenuBar-v2.app` that isn't a previous install of this app (directory with the executable and the new bundle id), and any file or link at an install-target `plugins/agent-lights`, is a finding before replacement | `test_files_and_links_at_the_install_paths_are_caught`, `test_unrecognized_contents_at_the_new_app_path_survive_install` (refused, then backed up with `--remove-legacy`) |
+| 5 | Comments counted as code | Producer evidence from the Python AST only: imports of `agent.light_cues`, Agent Lights class/function names, string literals in code naming the app or pool; bare string statements (docstrings) and comments ignored | `test_comments_and_docstrings_are_not_producer_code` |
+| 6 | Symlinked plugins skipped | Links are resolved and judged by their target's code; a producer link is moved (link only, target kept); links to the current plugin are left alone | `test_a_symlinked_old_plugin_is_found_and_only_the_link_moves` |
+| 7 | README recovery paths | New `recover --backup DIR --yes`: reset to the recorded HEAD, apply non-empty staged (`--index`) and unstaged patches, restore untracked files, verify against the recorded fingerprint. README gives that command and by-hand commands with absolute, `shlex`-quoted paths | `test_recover_puts_the_checkout_back_exactly`, `test_the_readme_commands_also_recover_exactly` (runs the README lines with bash; committed + staged + unstaged + untracked + binary state, fingerprint equal) |
+
+Evidence: 846 Python tests across the five suites. All three helper
+scripts run on the Command Line Tools' Python 3.9.6 (what the friend's
+`python3` likely is). From the unzipped Desktop zip: the install harness
+(old install planted in a throwaway HOME) refused, set all six aside with
+`--remove-legacy` keeping all six new/unrelated pieces, and a plain re-run
+succeeded; the core flow `inventory → backup → review → restore → recover`
+under `/usr/bin/python3` on a git fixture removed only the Agent Lights
+changes (untracked `notes.md` kept) and `recover` returned the exact prior
+state.
