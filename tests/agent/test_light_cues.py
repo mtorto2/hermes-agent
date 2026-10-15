@@ -1360,7 +1360,10 @@ def _launcher_with_binary(tmp_path):
     binary.parent.mkdir(parents=True)
     binary.write_bytes(b"v2-binary")
     _install_info_plist(tmp_path / "repo")
-    return AgentLightsMenuBarLauncher(repo_root=tmp_path / "repo")
+    launcher = AgentLightsMenuBarLauncher(repo_root=tmp_path / "repo")
+    # Never pick up an app really installed on the test machine.
+    launcher._installed_app_candidates = lambda: []
+    return launcher
 
 
 def test_launcher_trusts_a_live_v2_heartbeat_and_launches_nothing(tmp_path, monkeypatch):
@@ -1435,6 +1438,29 @@ def test_launcher_opens_the_app_only_when_none_is_running_and_waits_for_it(tmp_p
     assert commands[-1][2].endswith("AgentLightsMenuBar-v2.app")
     assert polls["after_open"] >= 3
 
+
+
+def test_launcher_opens_an_installed_app_without_packaging_the_repo_build(tmp_path, monkeypatch):
+    import psutil
+
+    monkeypatch.setenv("HERMES_AGENT_LIGHTS_HOME", str(tmp_path))
+    monkeypatch.delenv("HERMES_AGENT_LIGHTS_AUTO_LAUNCH", raising=False)
+    commands = _record_launch_commands(monkeypatch)
+    launcher = _launcher_with_binary(tmp_path)
+    installed = tmp_path / "Applications" / "AgentLightsMenuBar-v2.app"
+    (installed / "Contents" / "MacOS").mkdir(parents=True)
+    (installed / "Contents" / "MacOS" / "AgentLightsMenuBar").write_bytes(b"installed")
+    launcher._installed_app_candidates = lambda: [tmp_path / "missing.app", installed]
+    opened = lambda: any(c[:2] == ["/usr/bin/open", "-g"] for c in commands)
+    monkeypatch.setattr(
+        psutil, "process_iter",
+        lambda *a, **k: [_FakeProc("AgentLightsMenuBar", 0.0)] if opened() else [],
+    )
+
+    assert launcher.ensure_running() is True
+    assert [c for c in commands if c[0] == "/usr/bin/open"] == [["/usr/bin/open", "-g", str(installed)]]
+    assert not (launcher.repo_root / launcher.bundle_relative_path).exists()
+    assert not any(c[0] == "/usr/bin/codesign" for c in commands)
 
 def test_launcher_reports_an_opened_app_that_never_appears(tmp_path, monkeypatch, caplog):
     import logging

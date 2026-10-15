@@ -168,7 +168,9 @@ class AgentLightsMenuBarLauncher:
                     "so the current app can start."
                 )
                 return False
-            app_path = self._ensure_app_bundle()
+            # An app installed by install.sh wins over packaging the repo's
+            # debug build; re-run install.sh to pick up local changes.
+            app_path = self._installed_app() or self._ensure_app_bundle()
             if app_path is None:
                 logger.info("Agent Lights launch skipped: no built app (run `swift build` in apps/agent-lights-menu-bar).")
                 return False
@@ -197,6 +199,17 @@ class AgentLightsMenuBarLauncher:
                 time.sleep(0.05)
             logger.info("Agent Lights app was opened but did not appear within %.0fs.", self.launch_ready_timeout_s)
             return False
+
+    def _installed_app_candidates(self) -> list[Path]:
+        bundle_name = self.bundle_relative_path.name
+        return [Path.home() / "Applications" / bundle_name, Path("/Applications") / bundle_name]
+
+    def _installed_app(self) -> Path | None:
+        """The app installed by install.sh, if any (opened as-is, never rewritten)."""
+        for app_path in self._installed_app_candidates():
+            if (app_path / "Contents" / "MacOS" / self.executable_name).is_file():
+                return app_path
+        return None
 
     def _candidate_binary_paths(self) -> list[Path]:
         candidates = [self.repo_root / self.binary_relative_path]
