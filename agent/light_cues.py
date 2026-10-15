@@ -125,6 +125,7 @@ class AgentLightsMenuBarLauncher:
     # appear, so the next launcher sees it instead of launching again.
     launch_ready_timeout_s = 3.0
     binary_relative_path = Path("apps/agent-lights-menu-bar/.build/debug/AgentLightsMenuBar")
+    info_plist_relative_path = Path("apps/agent-lights-menu-bar/Resources/Info.plist")
     arch_binary_relative_glob = "apps/agent-lights-menu-bar/.build/*/debug/AgentLightsMenuBar"
 
     def __init__(self, *, repo_root: Path | None = None):
@@ -277,6 +278,10 @@ class AgentLightsMenuBarLauncher:
         binary_path = self._built_binary_path()
         if binary_path is None:
             return app_path if executable_path.exists() else None
+        plist_source = self.repo_root / self.info_plist_relative_path
+        if not plist_source.is_file():
+            logger.info("Agent Lights launch skipped: missing %s.", plist_source)
+            return None
 
         try:
             executable_path.parent.mkdir(parents=True, exist_ok=True)
@@ -287,33 +292,10 @@ class AgentLightsMenuBarLauncher:
             staged_path.write_bytes(binary_path.read_bytes())
             staged_path.chmod(0o755)
             os.replace(staged_path, executable_path)
+            # The bundle's Info.plist (bundle id, LSUIElement, Apple Events
+            # usage text) is checked in next to the Swift package.
             plist_path = app_path / "Contents" / "Info.plist"
-            plist_path.write_text(
-                """<?xml version=\"1.0\" encoding=\"UTF-8\"?>
-<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">
-<plist version=\"1.0\">
-<dict>
-  <key>CFBundleExecutable</key>
-  <string>AgentLightsMenuBar</string>
-  <key>CFBundleIdentifier</key>
-  <string>com.savant.hermes-agent-lights</string>
-  <key>CFBundleName</key>
-  <string>Hermes Agent Lights</string>
-  <key>CFBundlePackageType</key>
-  <string>APPL</string>
-  <key>CFBundleShortVersionString</key>
-  <string>0.1</string>
-  <key>CFBundleVersion</key>
-  <string>1</string>
-  <key>LSUIElement</key>
-  <true/>
-  <key>NSAppleEventsUsageDescription</key>
-  <string>Hermes Agent Lights uses Terminal automation to focus the Terminal tab for the selected Hermes instance.</string>
-</dict>
-</plist>
-""",
-                encoding="utf-8",
-            )
+            plist_path.write_bytes(plist_source.read_bytes())
             signing = subprocess.run(
                 ["/usr/bin/codesign", "--force", "--sign", "-", "--timestamp=none", str(app_path)],
                 check=False,

@@ -3,6 +3,8 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import plistlib
+import shutil
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -487,10 +489,21 @@ def test_mark_slot_online_attempts_menu_bar_launch_before_idle_status(tmp_path, 
     assert (tmp_path / "agent-lights" / "v2" / "slots" / "1.json").exists()
 
 
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _install_info_plist(repo_root: Path) -> None:
+    """Copy the real checked-in Info.plist into a temp repo root."""
+    target = repo_root / AgentLightsMenuBarLauncher.info_plist_relative_path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(_REPO_ROOT / AgentLightsMenuBarLauncher.info_plist_relative_path, target)
+
+
 def test_agent_lights_menu_bar_launcher_prepares_app_bundle_from_existing_debug_binary(tmp_path):
     binary_path = tmp_path / "apps" / "agent-lights-menu-bar" / ".build" / "debug" / "AgentLightsMenuBar"
     binary_path.parent.mkdir(parents=True)
     binary_path.write_bytes(b"debug-binary")
+    _install_info_plist(tmp_path)
     launcher = AgentLightsMenuBarLauncher(repo_root=tmp_path)
 
     app_path = launcher._ensure_app_bundle()
@@ -499,10 +512,23 @@ def test_agent_lights_menu_bar_launcher_prepares_app_bundle_from_existing_debug_
     assert app_path == tmp_path / "apps" / "agent-lights-menu-bar" / ".build" / "AgentLightsMenuBar-v2.app"
     executable_path = app_path / "Contents" / "MacOS" / "AgentLightsMenuBar"
     assert executable_path.read_bytes() == b"debug-binary"
-    plist = (app_path / "Contents" / "Info.plist").read_text(encoding="utf-8")
-    assert "LSUIElement" in plist
-    assert "NSAppleEventsUsageDescription" in plist
-    assert "Terminal" in plist
+    # The bundle carries the checked-in plist unchanged, and that plist names
+    # the executable the launcher installs.
+    plist_bytes = (app_path / "Contents" / "Info.plist").read_bytes()
+    assert plist_bytes == (tmp_path / AgentLightsMenuBarLauncher.info_plist_relative_path).read_bytes()
+    plist = plistlib.loads(plist_bytes)
+    assert plist["CFBundleExecutable"] == AgentLightsMenuBarLauncher.executable_name
+    assert plist["LSUIElement"] is True
+    assert plist["NSAppleEventsUsageDescription"]
+
+
+def test_agent_lights_menu_bar_launcher_skips_without_info_plist(tmp_path):
+    binary_path = tmp_path / "apps" / "agent-lights-menu-bar" / ".build" / "debug" / "AgentLightsMenuBar"
+    binary_path.parent.mkdir(parents=True)
+    binary_path.write_bytes(b"debug-binary")
+    launcher = AgentLightsMenuBarLauncher(repo_root=tmp_path)
+
+    assert launcher._ensure_app_bundle() is None
 
 
 def test_agent_lights_menu_bar_launcher_ad_hoc_signs_the_refreshed_bundle(tmp_path, monkeypatch):
@@ -516,6 +542,7 @@ def test_agent_lights_menu_bar_launcher_ad_hoc_signs_the_refreshed_bundle(tmp_pa
         return SimpleNamespace(returncode=0)
 
     monkeypatch.setattr("agent.light_cues.subprocess.run", record_run)
+    _install_info_plist(tmp_path)
     launcher = AgentLightsMenuBarLauncher(repo_root=tmp_path)
 
     app_path = launcher._ensure_app_bundle()
@@ -543,6 +570,7 @@ def test_agent_lights_menu_bar_launcher_refreshes_existing_bundle_from_debug_bin
     )
     executable_path.parent.mkdir(parents=True)
     executable_path.write_bytes(b"old-binary")
+    _install_info_plist(tmp_path)
     launcher = AgentLightsMenuBarLauncher(repo_root=tmp_path)
 
     assert launcher._ensure_app_bundle() is not None
@@ -562,6 +590,7 @@ def test_agent_lights_menu_bar_launcher_uses_arch_specific_swiftpm_binary_after_
     )
     binary_path.parent.mkdir(parents=True)
     binary_path.write_bytes(b"arch-specific-binary")
+    _install_info_plist(tmp_path)
     launcher = AgentLightsMenuBarLauncher(repo_root=tmp_path)
 
     app_path = launcher._ensure_app_bundle()
@@ -586,6 +615,7 @@ def test_agent_lights_menu_bar_launcher_prefers_newer_swiftpm_binary_candidate(t
     arch_binary.parent.mkdir(parents=True)
     legacy_binary.write_bytes(b"old-legacy-binary")
     arch_binary.write_bytes(b"new-arch-binary")
+    _install_info_plist(tmp_path)
     launcher = AgentLightsMenuBarLauncher(repo_root=tmp_path)
 
     app_path = launcher._ensure_app_bundle()
@@ -595,6 +625,7 @@ def test_agent_lights_menu_bar_launcher_prefers_newer_swiftpm_binary_candidate(t
 
 
 def test_agent_lights_menu_bar_launcher_returns_none_without_built_binary(tmp_path):
+    _install_info_plist(tmp_path)
     launcher = AgentLightsMenuBarLauncher(repo_root=tmp_path)
 
     assert launcher._ensure_app_bundle() is None
@@ -1328,6 +1359,7 @@ def _launcher_with_binary(tmp_path):
     binary = tmp_path / "repo" / "apps" / "agent-lights-menu-bar" / ".build" / "debug" / "AgentLightsMenuBar"
     binary.parent.mkdir(parents=True)
     binary.write_bytes(b"v2-binary")
+    _install_info_plist(tmp_path / "repo")
     return AgentLightsMenuBarLauncher(repo_root=tmp_path / "repo")
 
 
