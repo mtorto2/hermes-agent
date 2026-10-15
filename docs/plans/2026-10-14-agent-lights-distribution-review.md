@@ -237,3 +237,32 @@ succeeded; the core flow `inventory → backup → review → restore → recove
 under `/usr/bin/python3` on a git fixture removed only the Agent Lights
 changes (untracked `notes.md` kept) and `recover` returned the exact prior
 state.
+
+## Round 7: response to round 6 (changes requested → fixed, not yet reviewed)
+
+Re-review range: `dd42cef602..HEAD` (fix `7ba004d303` plus this note). Zip
+rebuilt from `7ba004d303`: `~/Desktop/agent-lights-src-20261015-7ba004d303.zip`
+(+ `.sha256`); the prompt only changed its zip name. Earlier zips moved off
+the Desktop.
+
+Approach this round: remove heuristics rather than refine them.
+
+| # | Finding | Fix | Proof |
+| --- | --- | --- | --- |
+| 1 | `recover` wrote through a symlink (Py 3.9) | No tar extraction. Preflight before `reset --hard`: every entry relative with no `..`, every parent a real directory inside the checkout (no links), no directory in the way; refuse with "Nothing was changed". Then each file/link is replaced (unlink, then `O_EXCL\|O_NOFOLLOW` create + `fchmod`, or `symlink`). Fingerprint records type, mode and link target. README by-hand uses `tar -xUf` | `test_recover_replaces_a_symlink_instead_of_writing_through_it` (outside file unchanged, link replaced, fingerprint equal), `test_recover_refuses_before_changing_anything_when_a_parent_is_a_link`, `test_recover_symlink_case_on_the_system_python` (runs on `/usr/bin/python3` 3.9.6), `test_the_readme_tar_command_replaces_links_too` |
+| 2 | `--allow-core-producer` let a destination be deleted | Exit 10 from removal now always stops the install. New last guards `replaceable-app` / `replaceable-plugin` run immediately before each `rm -rf` (absent, or a previous install: app with the executable and the new bundle id; plugin identical to the new one or carrying the install marker). `uninstall.sh` likewise only removes this app (bundle id) and marked plugins | `test_allow_core_producer_never_lets_an_occupied_destination_be_deleted` (unrelated contents survive), `test_replace_guard_allows_only_absent_paths_and_previous_installs`, `test_uninstall_removes_only_what_install_put_there` |
+| 3 | Raw `class AgentLightsProducer` text identified/exempted | Removed. `install.sh` writes `.agent-lights-install` ("agent-lights plugin installed by install.sh" + time) into each plugin it installs; only that marker or an exact tree match identifies a previous install. Nothing else exempts a plugin from inspection | `test_comment_naming_the_producer_class_neither_identifies_nor_exempts` (both directions) |
+| 4 | A string literal proved ownership | Producer evidence is only (AST) importing `agent.light_cues` or defining `SlotStatusFileBackend` / `AgentLightsMenuBarLauncher` / `LightCueService`; any other mention is report-only | `test_a_string_mentioning_the_app_is_report_only` (plugin stays after remove) |
+| 5 | `agent-lights` link skipped outside targets | Every entry is inspected: files/dangling links matter only at install-target paths; links are judged by their target's marker or evidence; a marked current install (even linked) is left alone | `test_a_canonical_name_link_outside_install_targets_is_inspected` (install run and standalone scan) |
+
+Mutation check: with the round-6 scripts restored, 9 of the new tests fail
+(all five findings); the README-`tar` test passes on both because macOS
+`bsdtar` already refuses to write through the final link, and `-U` makes
+that explicit.
+
+Evidence: 856 Python tests across the five suites. From the unzipped
+Desktop zip in a throwaway HOME with every old-install shape planted:
+plain install refused, `--remove-legacy` set all six aside and kept the six
+new/unrelated pieces, a plain re-run succeeded, the plugin carried the
+install marker, and `uninstall.sh` removed exactly this app and the marked
+plugin.
