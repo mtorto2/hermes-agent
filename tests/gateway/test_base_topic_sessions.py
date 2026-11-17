@@ -160,6 +160,32 @@ class TestTelegramAutoTtsCaptionDelivery:
 
 
     @pytest.mark.asyncio
+    async def test_auto_tts_synthesizes_only_final_assistant_answer(self, tmp_path):
+        adapter = DummyTelegramAdapter()
+        adapter._keep_typing = self._hold_typing()
+        adapter._should_auto_tts_for_chat = lambda _chat_id: True
+        adapter.play_tts = AsyncMock(return_value=SendResult(success=True, message_id="tts-1"))
+        assistant_answer = "Synthetic assistant answer only."
+        adapter.set_message_handler(lambda _event: asyncio.sleep(0, result=assistant_answer))
+
+        tts_path = tmp_path / "reply.ogg"
+        tts_path.write_text("audio", encoding="utf-8")
+        event = self._make_voice_event()
+        event.text = '🎙️ "Synthetic inbound transcript"'
+
+        with patch("tools.tts_tool.check_tts_requirements", return_value=True), patch(
+            "tools.tts_tool.text_to_speech_tool",
+            return_value=json.dumps({"file_path": str(tts_path)}),
+        ) as mock_tts:
+            await adapter._process_message_background(event, build_session_key(event.source))
+
+        assert mock_tts.call_args.kwargs["text"] == assistant_answer
+        assert "Synthetic inbound transcript" not in mock_tts.call_args.kwargs["text"]
+        assert "🎙️" not in mock_tts.call_args.kwargs["text"]
+        adapter.play_tts.assert_awaited_once()
+        assert adapter.play_tts.await_args.kwargs["caption"] == assistant_answer
+
+    @pytest.mark.asyncio
     async def test_long_original_with_short_spoken_script_still_sends_full_reply(self, tmp_path):
         adapter = DummyTelegramAdapter()
         adapter._keep_typing = self._hold_typing()

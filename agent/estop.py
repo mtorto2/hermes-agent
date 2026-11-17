@@ -10,9 +10,9 @@
   agent run (``gateway/run.py:_handle_message``).
 
 In-flight work is NEVER killed — this is pause-new-work, not panic/exit.
-The check is a single ``os.stat`` so callers may run it every tick; no
-caching beyond the OS is performed, so engaging/disengaging takes effect on
-the very next check.
+The check is one or two ``os.stat`` calls (process home + fleet root when
+they differ) so callers may run it every tick; no caching beyond the OS is
+performed, so engaging/disengaging takes effect on the very next check.
 
 The sentinel body is optional JSON ``{"reason": ..., "engaged_at": ...}``.
 A corrupt or empty file still counts as engaged (fail safe): the pause must
@@ -51,21 +51,75 @@ def _hermes_home() -> Path:
         return Path(os.path.expanduser("~/.hermes"))
 
 
+def _canonical_root() -> Path:
+    """Fleet-wide Hermes root, even when this process is a profile gateway.
+
+    Profile gateways launch with HERMES_HOME=~/.hermes/profiles/<name>.
+    ``hermes pause`` from an operator seat writes ~/.hermes/ESTOP. If we
+    only inspect the profile home, the emergency stop does not bind
+    (jarvis-os/t_7b65ff88: fleet-analyst kept dispatching through pause).
+    """
+    try:
+        from hermes_constants import get_default_hermes_root
+        return Path(get_default_hermes_root())
+    except Exception:
+        return Path(os.path.expanduser("~/.hermes"))
+
+
 def sentinel_path(home: Optional[Path | str] = None) -> Path:
-    """Path of the ESTOP sentinel under *home* or the active HERMES_HOME."""
+    """Path of the ESTOP sentinel under *home* or the active HERMES_HOME.
+
+    This is the sentinel `hermes pause` writes; reads additionally consult
+    the fleet root (see :func:`_candidate_sentinel_paths`).
+    """
     return Path(home) / SENTINEL_NAME if home is not None else _hermes_home() / SENTINEL_NAME
 
 
-def is_engaged(home: Optional[Path | str] = None) -> bool:
-    """Cheap check (one stat): is this profile's emergency stop engaged?"""
+def _candidate_sentinel_paths(home: Optional[Path | str] = None) -> list:
+    """Profile home first, then the fleet root if it is a different directory.
+
+    *home* selects an explicit profile (a Kanban dispatcher checking the
+    assignee's pause); the fleet root is always appended so an operator's
+    ``hermes pause`` binds every profile.
+    """
+    # Call with no argument when unscoped so test doubles that replace
+    # ``sentinel_path`` with a zero-arg callable keep working.
+    primary = sentinel_path(home) if home is not None else sentinel_path()
+    paths = [primary]
     try:
-        return sentinel_path(home).exists()
-    except OSError:
-        return False
+        root = _canonical_root() / SENTINEL_NAME
+    except Exception:
+        return paths
+    try:
+        if root.resolve() != primary.resolve():
+            paths.append(root)
+    except Exception:
+        # Non-Path test doubles (fail-safe stat fixture) fail .resolve();
+        # the generic comparison below still dedupes plain equal paths.
+        if root != primary:
+            paths.append(root)
+    return paths
+
+
+def is_engaged(home: Optional[Path | str] = None) -> bool:
+    """Cheap check: is the emergency stop engaged for *home*?
+
+    Engaged if ANY candidate sentinel exists: the profile home (*home*, or
+    the process HERMES_HOME) or the fleet canonical root (~/.hermes). Fail
+    SAFE on stat errors so an unreadable sentinel still holds the pause.
+    """
+    saw_stat_error = False
+    for path in _candidate_sentinel_paths(home):
+        try:
+            if path.exists():
+                return True
+        except OSError:
+            saw_stat_error = True
+    return saw_stat_error
 
 
 def engage(reason: Optional[str] = None, *, home: Optional[Path | str] = None) -> Path:
-    """Create this profile's ESTOP sentinel; re-engaging updates the file."""
+    """Create the ESTOP sentinel for *home*; re-engaging updates the file."""
     path = sentinel_path(home)
     payload = {
         "engaged_at": datetime.now(timezone.utc).isoformat(),
@@ -84,15 +138,21 @@ def engage(reason: Optional[str] = None, *, home: Optional[Path | str] = None) -
 
 
 def disengage(*, home: Optional[Path | str] = None) -> bool:
-    """Remove this profile's ESTOP sentinel. Returns True if a pause was lifted."""
+    """Remove only the ESTOP sentinel selected by *home*.
+
+    A profile-scoped resume may lift its own pause, but it never clears the
+    fleet-root sentinel.  Calling without *home* targets the active
+    HERMES_HOME, which is the fleet root for the root operator.
+    """
+    path = sentinel_path(home) if home is not None else sentinel_path()
     try:
-        sentinel_path(home).unlink()
+        path.unlink()
         return True
     except FileNotFoundError:
         return False
     except OSError:
+        # If removal fails, pause remains engaged.  Caller reports failure.
         return False
-
 
 def get_state(home: Optional[Path | str] = None) -> Optional[dict]:
     """Return ``{"reason": ..., "engaged_at": ...}`` or None when not engaged.
@@ -100,24 +160,37 @@ def get_state(home: Optional[Path | str] = None) -> Optional[dict]:
     A sentinel with an unreadable/corrupt body still reports engaged, with
     both fields None — the pause is authoritative, the metadata is not.
     """
-    path = sentinel_path(home)
-    if not path.exists():
+    if not is_engaged(home):
         return None
     reason = None
     engaged_at = None
-    try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-        if isinstance(raw, dict):
-            reason = raw.get("reason") or None
-            engaged_at = raw.get("engaged_at") or None
-    except (OSError, ValueError):
-        pass
+    found = False
+    for path in _candidate_sentinel_paths(home):
+        try:
+            exists = path.exists()
+        except OSError:
+            return {"reason": None, "engaged_at": None}
+        except AttributeError:
+            continue
+        if not exists:
+            continue
+        found = True
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                reason = raw.get("reason") or None
+                engaged_at = raw.get("engaged_at") or None
+                break
+        except (OSError, ValueError, AttributeError):
+            continue
+    if not found:
+        return None
     return {"reason": reason, "engaged_at": engaged_at}
 
 
-def paused_reply() -> Optional[str]:
+def paused_reply(home: Optional[Path | str] = None) -> Optional[str]:
     """Short user-facing notice for new gateway turns, or None if not paused."""
-    state = get_state()
+    state = get_state(home)
     if state is None:
         return None
     reason = state.get("reason")

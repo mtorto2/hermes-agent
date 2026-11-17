@@ -19,6 +19,7 @@ import concurrent.futures
 import contextvars
 import json
 import threading
+from types import SimpleNamespace
 
 import pytest
 
@@ -99,6 +100,381 @@ def test_both_rpc_threads_use_propagation_helper():
         "remote file-RPC poll thread is not wrapped with "
         "propagate_context_to_thread — gateway approval routing will be lost."
     )
+
+
+def test_remote_execute_code_session_mount_passes_host_access_to_guard(monkeypatch, tmp_path):
+    """Remote execute_code must not take Docker's fast path across a host bind."""
+    import tools.code_execution_tool as cet
+    import tools.terminal_tool as tt
+
+    config = {
+        "env_type": "docker",
+        "docker_image": "python:3.11",
+        "cwd": "/root",
+        "timeout": 60,
+        "host_cwd": None,
+        "docker_mount_cwd_to_workspace": True,
+        "docker_volumes": [],
+    }
+    seen_host_access = []
+    monkeypatch.setattr(cet, "SANDBOX_AVAILABLE", True)
+    monkeypatch.setattr(tt, "_get_env_config", lambda: config)
+    monkeypatch.setattr(tt, "_resolve_task_host_cwd", lambda *_args: str(tmp_path))
+    monkeypatch.setattr(
+        A,
+        "check_execute_code_guard",
+        lambda _code, _env_type, **kwargs: (
+            seen_host_access.append(kwargs["has_host_access"]) or {"approved": True}
+        ),
+    )
+    monkeypatch.setattr(
+        cet,
+        "_execute_remote",
+        lambda *_args, **_kwargs: json.dumps({"status": "ok"}),
+    )
+
+    result = json.loads(cet.execute_code("print('ok')", task_id="mounted-code-session"))
+
+    assert result["status"] == "ok"
+    assert seen_host_access == [True]
+
+
+@pytest.mark.parametrize(
+    "volume_spec",
+    [r"\\server\share:/data", ".:/data", "..:/data"],
+)
+def test_remote_execute_code_host_path_volume_passes_host_access_to_guard(
+    monkeypatch, volume_spec,
+):
+    """Configured host-relative and UNC binds disable remote Docker fast path."""
+    import tools.code_execution_tool as cet
+    import tools.terminal_tool as tt
+
+    config = {
+        "env_type": "docker",
+        "docker_image": "python:3.11",
+        "cwd": "/root",
+        "timeout": 60,
+        "host_cwd": None,
+        "docker_mount_cwd_to_workspace": False,
+        "docker_volumes": [volume_spec],
+    }
+    seen_host_access = []
+    monkeypatch.setattr(cet, "SANDBOX_AVAILABLE", True)
+    monkeypatch.setattr(tt, "_get_env_config", lambda: config)
+    monkeypatch.setattr(tt, "_resolve_task_host_cwd", lambda *_args: None)
+    monkeypatch.setattr(
+        A,
+        "check_execute_code_guard",
+        lambda _code, _env_type, **kwargs: (
+            seen_host_access.append(kwargs["has_host_access"]) or {"approved": True}
+        ),
+    )
+    monkeypatch.setattr(
+        cet,
+        "_execute_remote",
+        lambda *_args, **_kwargs: json.dumps({"status": "ok"}),
+    )
+
+    result = json.loads(cet.execute_code("print('ok')", task_id="unc-volume-code"))
+
+    assert result["status"] == "ok"
+    assert seen_host_access == [True]
+
+
+def test_remote_execute_code_mapping_volume_passes_host_access_to_guard(monkeypatch):
+    """Nonempty malformed volume configuration must disable the fast path."""
+    import tools.code_execution_tool as cet
+    import tools.terminal_tool as tt
+
+    config = {
+        "env_type": "docker",
+        "docker_image": "python:3.11",
+        "cwd": "/root",
+        "timeout": 60,
+        "host_cwd": None,
+        "docker_mount_cwd_to_workspace": False,
+        "docker_volumes": {"./host:/data": True},
+    }
+    seen_host_access = []
+    monkeypatch.setattr(cet, "SANDBOX_AVAILABLE", True)
+    monkeypatch.setattr(tt, "_get_env_config", lambda: config)
+    monkeypatch.setattr(tt, "_resolve_task_host_cwd", lambda *_args: None)
+    monkeypatch.setattr(
+        A,
+        "check_execute_code_guard",
+        lambda _code, _env_type, **kwargs: (
+            seen_host_access.append(kwargs["has_host_access"]) or {"approved": True}
+        ),
+    )
+    monkeypatch.setattr(
+        cet,
+        "_execute_remote",
+        lambda *_args, **_kwargs: json.dumps({"status": "ok"}),
+    )
+
+    result = json.loads(cet.execute_code("print('ok')", task_id="mapping-volume-code"))
+
+    assert result["status"] == "ok"
+    assert seen_host_access == [True]
+
+
+@pytest.mark.parametrize(
+    "docker_extra_args",
+    [
+        ["--shm-size", "4g"],
+        ["-v", "/host:/data"],
+        ["--volume=/host:/data"],
+        ["--mount", "type=bind,source=/host,target=/data"],
+    ],
+)
+def test_remote_execute_code_extra_args_disable_approval_fast_path(
+    monkeypatch, docker_extra_args,
+):
+    """Any custom Docker run args conservatively count as host-capable."""
+    import tools.code_execution_tool as cet
+    import tools.terminal_tool as tt
+
+    config = {
+        "env_type": "docker",
+        "docker_image": "python:3.11",
+        "cwd": "/root",
+        "timeout": 60,
+        "host_cwd": None,
+        "docker_mount_cwd_to_workspace": False,
+        "docker_volumes": [],
+        "docker_extra_args": docker_extra_args,
+    }
+    seen_host_access = []
+    monkeypatch.setattr(cet, "SANDBOX_AVAILABLE", True)
+    monkeypatch.setattr(tt, "_get_env_config", lambda: config)
+    monkeypatch.setattr(tt, "_resolve_task_host_cwd", lambda *_args: None)
+    monkeypatch.setattr(
+        A,
+        "check_execute_code_guard",
+        lambda _code, _env_type, **kwargs: (
+            seen_host_access.append(kwargs["has_host_access"]) or {"approved": True}
+        ),
+    )
+    monkeypatch.setattr(
+        cet,
+        "_execute_remote",
+        lambda *_args, **_kwargs: json.dumps({"status": "ok"}),
+    )
+
+    result = json.loads(cet.execute_code("print('ok')", task_id="extra-args-code"))
+
+    assert result["status"] == "ok"
+    assert seen_host_access == [True]
+
+
+def test_remote_execute_code_mapping_extra_args_disable_approval_fast_path(monkeypatch):
+    """Mapping keys forwarded as Docker flags must disable the fast path."""
+    import tools.code_execution_tool as cet
+    import tools.terminal_tool as tt
+
+    config = {
+        "env_type": "docker",
+        "docker_image": "python:3.11",
+        "cwd": "/root",
+        "timeout": 60,
+        "host_cwd": None,
+        "docker_mount_cwd_to_workspace": False,
+        "docker_volumes": [],
+        "docker_extra_args": {"--privileged": True},
+    }
+    seen_host_access = []
+    monkeypatch.setattr(cet, "SANDBOX_AVAILABLE", True)
+    monkeypatch.setattr(tt, "_get_env_config", lambda: config)
+    monkeypatch.setattr(tt, "_resolve_task_host_cwd", lambda *_args: None)
+    monkeypatch.setattr(
+        A,
+        "check_execute_code_guard",
+        lambda _code, _env_type, **kwargs: (
+            seen_host_access.append(kwargs["has_host_access"]) or {"approved": True}
+        ),
+    )
+    monkeypatch.setattr(
+        cet,
+        "_execute_remote",
+        lambda *_args, **_kwargs: json.dumps({"status": "ok"}),
+    )
+
+    result = json.loads(cet.execute_code("print('ok')", task_id="mapping-extra-code"))
+
+    assert result["status"] == "ok"
+    assert seen_host_access == [True]
+
+
+def test_remote_environment_creation_uses_shared_task_plan_for_raw_session_override(
+    monkeypatch, tmp_path,
+):
+    """Remote code creation inherits terminal's CWD mapping and full Docker config."""
+    import tools.code_execution_tool as cet
+    import tools.terminal_tool as tt
+
+    task_id = "raw-session-override"
+    captured = {}
+    fake_env = object()
+    config = {
+        "env_type": "docker",
+        "docker_image": "python:3.11",
+        "cwd": "/root",
+        "host_cwd": None,
+        "timeout": 60,
+        "lifetime_seconds": 3600,
+        "container_cpu": 1,
+        "container_memory": 5120,
+        "container_disk": 51200,
+        "container_persistent": True,
+        "docker_mount_cwd_to_workspace": True,
+        "docker_volumes": [],
+        "docker_forward_env": [],
+        "docker_env": {},
+        "docker_extra_args": [],
+        "docker_run_as_host_user": False,
+        "docker_network": True,
+        "docker_persist_across_processes": True,
+        "docker_orphan_reaper": True,
+    }
+
+    def create(**kwargs):
+        captured.update(kwargs)
+        return fake_env
+
+    monkeypatch.setattr(tt, "_get_env_config", lambda: config)
+    monkeypatch.setattr(tt, "_active_environments", {})
+    monkeypatch.setattr(tt, "_last_activity", {})
+    monkeypatch.setattr(tt, "_creation_locks", {})
+    monkeypatch.setattr(tt, "_task_env_overrides", {task_id: {"cwd": str(tmp_path)}})
+    monkeypatch.setattr(tt, "_session_cwd", {})
+    monkeypatch.setattr(tt, "_resolve_container_task_id", lambda _task: "default")
+    monkeypatch.setattr(tt, "_resolve_task_host_cwd", lambda *_args: str(tmp_path))
+    monkeypatch.setattr(tt, "_start_cleanup_thread", lambda: None)
+    monkeypatch.setattr(tt, "_create_environment", create)
+
+    env, env_type = cet._get_or_create_env(task_id)
+
+    assert env is fake_env
+    assert env_type == "docker"
+    assert captured["cwd"] == "/workspace"
+    assert captured["host_cwd"] == str(tmp_path)
+    assert captured["container_config"]["docker_mount_cwd_to_workspace"] is True
+
+
+def test_remote_execute_code_reuses_the_plan_approved_at_entry(monkeypatch, tmp_path):
+    """Guarded remote execution must create from the exact approved plan."""
+    import tools.code_execution_tool as cet
+    import tools.terminal_tool as tt
+
+    task_id = "same-plan-remote"
+    config = {
+        "env_type": "docker",
+        "docker_mount_cwd_to_workspace": True,
+        "docker_volumes": [],
+    }
+    plan = SimpleNamespace(
+        config=config,
+        env_type="docker",
+        host_cwd=str(tmp_path),
+    )
+    seen = {}
+
+    monkeypatch.setattr(cet, "SANDBOX_AVAILABLE", True)
+    monkeypatch.setattr(tt, "_get_env_config", lambda: config)
+    def prepare(received_task_id):
+        seen["prepared_task_id"] = received_task_id
+        return plan
+
+    monkeypatch.setattr(tt, "_prepare_task_environment", prepare)
+    monkeypatch.setattr(
+        tt,
+        "_docker_has_host_access",
+        lambda received_config, received_host_cwd: (
+            seen.update(
+                guard_config=received_config,
+                guard_host_cwd=received_host_cwd,
+            )
+            or True
+        ),
+    )
+    monkeypatch.setattr(
+        A,
+        "check_execute_code_guard",
+        lambda _code, _env_type, **_kwargs: {"approved": True},
+    )
+
+    def execute_remote(_code, _task_id, _tools, *, reset, environment_plan):
+        seen["remote_plan"] = environment_plan
+        return json.dumps({"status": "ok"})
+
+    monkeypatch.setattr(cet, "_execute_remote", execute_remote)
+
+    result = json.loads(cet.execute_code("print('ok')", task_id=task_id))
+
+    assert result["status"] == "ok"
+    assert seen["prepared_task_id"] == task_id
+    assert seen["guard_config"] is config
+    assert seen["guard_host_cwd"] == str(tmp_path)
+    assert seen["remote_plan"] is plan
+
+
+_EXECUTE_CODE_SECRET = "OPENAI_API_KEY=«redacted:sk-…»"
+
+
+def _assert_execute_code_error_redacted(payload):
+    assert _EXECUTE_CODE_SECRET not in payload["error"]
+    assert "«redacted:sk-…»" not in payload["error"]
+    assert "***" in payload["error"]
+
+
+def test_remote_execute_code_exception_redacts_secret_text(monkeypatch):
+    """Backend errors must be redacted before remote JSON serialization."""
+    import tools.code_execution_tool as cet
+
+    class FailingEnv:
+        def execute(self, *_args, **_kwargs):
+            raise RuntimeError(f"remote backend failed with {_EXECUTE_CODE_SECRET}")
+
+    monkeypatch.setattr(cet, "_get_or_create_env", lambda *_args, **_kwargs: (FailingEnv(), "docker"))
+    monkeypatch.setattr(cet, "_load_config", lambda: {"timeout": 1, "max_tool_calls": 1})
+
+    result = json.loads(cet._execute_remote("print('ok')", "remote-redaction", None))
+
+    assert result["status"] == "error"
+    _assert_execute_code_error_redacted(result)
+
+
+def test_local_execute_code_exception_redacts_secret_text(monkeypatch):
+    """Local setup errors must be redacted before model-visible serialization."""
+    import tools.code_execution_tool as cet
+    import tools.terminal_tool as tt
+
+    local_plan = SimpleNamespace(
+        config={"env_type": "local"},
+        env_type="local",
+        host_cwd=None,
+    )
+    monkeypatch.setattr(cet, "SANDBOX_AVAILABLE", True)
+    monkeypatch.setattr(cet, "_get_kernel_mode", lambda: "per_call")
+    monkeypatch.setattr(tt, "_prepare_task_environment", lambda _task_id: local_plan)
+    monkeypatch.setattr(
+        cet,
+        "generate_hermes_tools_module",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError(f"local setup failed with {_EXECUTE_CODE_SECRET}")
+        ),
+    )
+    monkeypatch.setattr(
+        A,
+        "check_execute_code_guard",
+        lambda _code, _env_type, **_kwargs: {"approved": True},
+    )
+
+    result = json.loads(cet.execute_code("print('ok')", task_id="local-redaction"))
+
+    assert result["status"] == "error"
+    _assert_execute_code_error_redacted(result)
 
 
 # ---------------------------------------------------------------------------

@@ -31,7 +31,8 @@ def test_sibling_container_config_sites_carry_docker_network():
     import tools.file_tools as file_tools
 
     for module in (terminal_tool, file_tools, code_execution_tool):
-        tree = ast.parse(inspect.getsource(module))
+        source = inspect.getsource(module)
+        tree = ast.parse(source)
         sites = 0
         for node in ast.walk(tree):
             if not isinstance(node, ast.Dict):
@@ -44,7 +45,16 @@ def test_sibling_container_config_sites_carry_docker_network():
                     f"docker_run_as_host_user but without docker_network "
                     f"(line {node.lineno})"
                 )
-        assert sites >= 1, f"expected at least one container_config site in {module.__name__}"
+
+        if module is code_execution_tool:
+            # execute_code must use terminal's shared environment planner rather
+            # than rebuilding a partial container_config that could drift from
+            # terminal network, mount, CWD, or approval policy.
+            assert sites == 0
+            assert "_prepare_task_environment" in source
+            assert "_get_or_create_task_environment" in source
+        else:
+            assert sites >= 1, f"expected at least one container_config site in {module.__name__}"
 
 
 def _reuse_guard_harness(monkeypatch, *, existing_mode: str, network: bool):

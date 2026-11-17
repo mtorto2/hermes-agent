@@ -82,6 +82,28 @@ def test_container_creation_rejects_host_or_relative_session_cwd(monkeypatch):
             _clear(eff, task_id)
 
 
+def test_container_creation_maps_mounted_session_workspace(monkeypatch):
+    """Lazy creation lands in /workspace when this task's host workspace mounts."""
+    monkeypatch.setenv("TERMINAL_ENV", "docker")
+    monkeypatch.setenv("TERMINAL_CWD", "/root")
+    task_id = "acp-mounted-workspace"
+    host_workspace = "/Users/matt/project"
+    eff = tt._resolve_container_task_id(task_id)
+    monkeypatch.setattr(tt, "_task_env_overrides", {})
+    monkeypatch.setattr(tt, "_session_cwd", {})
+    monkeypatch.setattr(tt, "_resolve_task_host_cwd", lambda _config, _task: host_workspace)
+    tt.record_session_cwd(task_id, host_workspace)
+    _clear(eff, task_id)
+    fake = SimpleNamespace(execute=lambda *a, **k: {"returncode": 0, "output": ""})
+    try:
+        with patch.object(tt, "_create_environment", return_value=fake) as create:
+            assert tt.ensure_task_env(task_id) is fake
+        assert create.call_args.kwargs["cwd"] == "/workspace"
+        assert create.call_args.kwargs["host_cwd"] == host_workspace
+    finally:
+        _clear(eff, task_id)
+
+
 def test_creation_failure_returns_none_and_caches_nothing(monkeypatch):
     """A failed bring-up is best-effort: return None and leave no env cached so
     the caller keeps its fail-closed path."""

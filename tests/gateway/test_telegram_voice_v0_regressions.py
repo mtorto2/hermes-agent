@@ -64,6 +64,15 @@ class _PendingVoiceAdapter(BasePlatformAdapter):
         return {"id": chat_id, "type": "dm"}
 
 
+class _BackupOnlyPendingVoiceAdapter(_PendingVoiceAdapter):
+    def has_pending_interrupt(self, session_key: str) -> bool:
+        task = asyncio.current_task()
+        coroutine = task.get_coro() if task is not None else None
+        if "monitor_for_interrupt" in getattr(coroutine, "__qualname__", ""):
+            return False
+        return super().has_pending_interrupt(session_key)
+
+
 class _PendingVoiceAgent:
     messages = []
 
@@ -88,6 +97,28 @@ class _PendingVoiceAgent:
         type(self).messages.append(message)
         if len(type(self).messages) == 1:
             assert self._interrupted.wait(timeout=3), "pending voice interrupt was not delivered"
+            return {
+                "final_response": "interrupted",
+                "messages": [],
+                "api_calls": 1,
+                "interrupted": True,
+                "interrupt_message": self._interrupt_message,
+            }
+        return {
+            "final_response": "follow-up complete",
+            "messages": [],
+            "api_calls": 1,
+            "interrupted": False,
+        }
+
+
+class _BackupPendingVoiceAgent(_PendingVoiceAgent):
+    messages = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None, **kwargs):
+        type(self).messages.append(message)
+        if len(type(self).messages) == 1:
+            assert self._interrupted.wait(timeout=8), "backup pending voice interrupt was not delivered"
             return {
                 "final_response": "interrupted",
                 "messages": [],
@@ -163,7 +194,7 @@ async def test_pending_voice_interrupt_reuses_transcript_and_echo():
     assert interrupt_text == '"hello once"'
     assert drain_text == interrupt_text
     assert drain_transcripts == interrupt_transcripts == ["hello once"]
-    mock_transcribe.assert_called_once_with("/tmp/telegram-voice.ogg")
+    mock_transcribe.assert_called_once_with("/tmp/telegram-voice.ogg", None, "gateway")
     adapter.send.assert_awaited_once_with(
         "12345",
         '🎙️ "hello once"',
@@ -183,12 +214,30 @@ async def test_monitor_to_drain_transcribes_and_echoes_pending_voice_once(
 
     adapter = _PendingVoiceAdapter()
     runner = _run_agent_runner(adapter)
-    source = _source()
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="active-chat",
+        chat_type="forum",
+        thread_id="active-topic",
+        message_id="active-message",
+    )
+    pending_source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="pending-chat",
+        chat_type="forum",
+        thread_id="pending-topic",
+        message_id="pending-message",
+    )
+    runner._thread_metadata_for_source = GatewayRunner._thread_metadata_for_source.__get__(
+        runner, GatewayRunner
+    )
+    runner._reply_anchor_for_event = GatewayRunner._reply_anchor_for_event
     session_key = "telegram:dm:12345"
     event = MessageEvent(
         text="",
         message_type=MessageType.VOICE,
-        source=source,
+        source=pending_source,
+        message_id="pending-message",
         media_urls=["/tmp/telegram-pending-voice.ogg"],
         media_types=["audio/ogg"],
     )
@@ -216,8 +265,91 @@ async def test_monitor_to_drain_transcribes_and_echoes_pending_voice_once(
 
     assert result["final_response"] == "follow-up complete"
     assert _PendingVoiceAgent.messages == ["initial turn", '"hello once"']
-    mock_transcribe.assert_called_once_with("/tmp/telegram-pending-voice.ogg")
-    assert adapter.sent == [("12345", '🎙️ "hello once"', None)]
+    mock_transcribe.assert_called_once_with("/tmp/telegram-pending-voice.ogg", None, "gateway")
+    assert adapter.sent == [
+        (
+            "pending-chat",
+            '🎙️ "hello once"',
+            {"thread_id": "pending-topic"},
+        )
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("agent_timeout", ["0", "1"])
+async def test_backup_interrupt_paths_route_pending_voice_from_current_event(
+    tmp_path, monkeypatch, agent_timeout
+):
+    monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "off")
+    monkeypatch.setenv("HERMES_GATEWAY_NOTIFY_INTERVAL", "0")
+    monkeypatch.setenv("HERMES_AGENT_TIMEOUT", agent_timeout)
+    monkeypatch.setenv("HERMES_AGENT_TIMEOUT_WARNING", "0")
+    monkeypatch.setitem(sys.modules, "dotenv", types.SimpleNamespace(load_dotenv=lambda: None))
+    monkeypatch.setitem(
+        sys.modules, "run_agent", types.SimpleNamespace(AIAgent=_BackupPendingVoiceAgent)
+    )
+
+    adapter = _BackupOnlyPendingVoiceAdapter()
+    runner = _run_agent_runner(adapter)
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="active-chat",
+        chat_type="forum",
+        thread_id="active-topic",
+        message_id="active-message",
+    )
+    pending_source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="pending-chat",
+        chat_type="forum",
+        thread_id="pending-topic",
+        message_id="pending-message",
+    )
+    runner._thread_metadata_for_source = GatewayRunner._thread_metadata_for_source.__get__(
+        runner, GatewayRunner
+    )
+    runner._reply_anchor_for_event = GatewayRunner._reply_anchor_for_event
+    session_key = "telegram:dm:12345"
+    event = MessageEvent(
+        text="",
+        message_type=MessageType.VOICE,
+        source=pending_source,
+        message_id="pending-message",
+        media_urls=["/tmp/telegram-backup-voice.ogg"],
+        media_types=["audio/ogg"],
+    )
+    adapter._pending_messages[session_key] = event
+    adapter._active_sessions[session_key] = asyncio.Event()
+    adapter._active_sessions[session_key].set()
+    _BackupPendingVoiceAgent.messages = []
+
+    with (
+        patch("gateway.run._hermes_home", tmp_path),
+        patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"api_key": "fake"}),
+        patch(
+            "tools.transcription_tools.transcribe_audio",
+            return_value={"success": True, "transcript": "backup once", "provider": "mock"},
+        ) as mock_transcribe,
+    ):
+        result = await runner._run_agent(
+            message="initial turn",
+            context_prompt="",
+            history=[],
+            source=source,
+            session_id="pending-voice-session",
+            session_key=session_key,
+        )
+
+    assert result["final_response"] == "follow-up complete"
+    assert _BackupPendingVoiceAgent.messages == ["initial turn", '"backup once"']
+    mock_transcribe.assert_called_once_with("/tmp/telegram-backup-voice.ogg", None, "gateway")
+    assert adapter.sent == [
+        (
+            "pending-chat",
+            '🎙️ "backup once"',
+            {"thread_id": "pending-topic"},
+        )
+    ]
 
 
 @pytest.mark.asyncio

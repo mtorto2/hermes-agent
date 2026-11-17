@@ -289,7 +289,7 @@ For each upstream sync:
      tests/tools/test_file_write_safety.py \
      tests/hermes_cli/test_config.py \
      -q -o 'addopts='
-   
+
    cd apps/agent-lights-menu-bar && swift test
    ```
 

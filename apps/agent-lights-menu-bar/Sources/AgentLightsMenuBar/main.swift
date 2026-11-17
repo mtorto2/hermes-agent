@@ -27,17 +27,33 @@ private final class AgentLightsApp: NSObject, NSApplicationDelegate, NSMenuDeleg
     private var timer: Timer?
     private var monitorController: FloatingMonitorController?
     private let monitorOpacityDefaultsKey = "HermesFloatingMonitorOpacity"
+    private let agentLightsDirectory: URL
     private let slotsDirectory: URL
     private let agentsDirectory: URL
     private let contextDirectory: URL
     private let subprocessTimeout: TimeInterval = 2.0
-    private var terminalTTYOrderCache: (loadedAt: Date, ttys: [String])?
-    private var terminalCustomTitlesCache: (loadedAt: Date, titlesByTTY: [String: String])?
+    private let terminalSnapshotMaxAge: TimeInterval = 2.0
+    /// Terminal tab titles keyed by TTY, refreshed off the main thread: the
+    /// Apple Event round-trip to Terminal can take up to a second.
+    private var terminalTitlesByTTY: [String: String] = [:]
+    private var terminalSnapshotLoadedAt: ContinuousClock.Instant?
+    private var terminalSnapshotInFlight = false
+    /// Terminal tab titles in on-screen order, read via Accessibility, with
+    /// the last good read kept through brief failures.
+    private var tabBarCache = TabBarCache()
+    private var tabBarTrusted = false
+    private let dotOrderItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+    private let tabOrderPromptDefaultsKey = "TabOrderPermissionPromptedForBuild"
+    private var errorFlashOn = true
+    private var tickCount = 0
+    private var heartbeatFailureLogged = false
+    private var instanceLockFD: Int32?
 
     override init() {
         let agentLightsDirectory = AgentLightsPath.sharedDirectory(
             userHomeDirectory: NSHomeDirectory()
         )
+        self.agentLightsDirectory = agentLightsDirectory
         self.slotsDirectory = agentLightsDirectory
             .appendingPathComponent("slots")
         self.agentsDirectory = agentLightsDirectory
@@ -49,17 +65,45 @@ private final class AgentLightsApp: NSObject, NSApplicationDelegate, NSMenuDeleg
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
+        if let rejection = AppBundleIdentity.rejection(
+            bundleURL: Bundle.main.bundleURL,
+            executableURL: Bundle.main.executableURL,
+            environment: ProcessInfo.processInfo.environment
+        ) {
+            exitEarly("\(rejection); exiting so the versioned app can start.")
+            return
+        }
+        switch AppInstanceLock.acquire(directory: agentLightsDirectory) {
+        case .acquired(let lockFD):
+            instanceLockFD = lockFD
+        case .heldByAnotherApp:
+            exitEarly("another current app is already running; exiting.")
+            return
+        case .failed(let reason):
+            exitEarly("cannot take the instance lock (\(reason)); exiting.")
+            return
+        }
+        refreshHeartbeat()
+        promptForTabOrderPermissionOncePerBuild()
         configureMenu()
+        // A stable name lets macOS (and bar managers such as Ice) remember
+        // where the item sits across relaunches.
+        statusItem.autosaveName = "HermesAgentLights"
         statusItem.button?.toolTip = "Hermes Agent Lights"
         statusItem.menu = statusMenu
         render()
-        timer = Timer.scheduledTimer(timeInterval: 0.75, target: self, selector: #selector(tick), userInfo: nil, repeats: true)
+        let timer = Timer(timeInterval: 0.75, target: self, selector: #selector(tick), userInfo: nil, repeats: true)
+        // .common keeps the dots updating while the menu is open.
+        RunLoop.main.add(timer, forMode: .common)
+        self.timer = timer
     }
 
     private func configureMenu() {
         statusMenu.delegate = self
         statusSummaryItem.isEnabled = false
         statusMenu.addItem(statusSummaryItem)
+        dotOrderItem.target = self
+        statusMenu.addItem(dotOrderItem)
         statusMenu.addItem(NSMenuItem.separator())
 
         let refreshItem = NSMenuItem(title: "Refresh", action: #selector(refreshNow), keyEquivalent: "r")
@@ -89,12 +133,45 @@ private final class AgentLightsApp: NSObject, NSApplicationDelegate, NSMenuDeleg
         statusMenu.addItem(quitItem)
     }
 
+    private func exitEarly(_ reason: String) {
+        NSLog("Hermes Agent Lights: %@", reason)
+        NSStatusBar.system.removeStatusItem(statusItem)
+        NSApp.terminate(nil)
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        AppHeartbeat.removeIfOwned(directory: agentLightsDirectory, pid: Int(getpid()))
+    }
+
     func menuWillOpen(_ menu: NSMenu) {
         render()
     }
 
     @objc private func tick(_ timer: Timer) {
+        errorFlashOn.toggle()
+        tickCount += 1
+        if tickCount % 8 == 0 {
+            refreshHeartbeat()
+        }
         render()
+    }
+
+    /// Keep `app.json` naming this process: Hermes's launcher only treats a
+    /// current app as running while it does. Retried every few seconds, so a
+    /// transient write failure heals; a persistent one is logged once.
+    private func refreshHeartbeat() {
+        let pid = Int(getpid())
+        let ok = AppHeartbeat.ensure(
+            directory: agentLightsDirectory,
+            pid: pid,
+            processStartTime: ProcessInspector.startTime(pid: pid)
+        )
+        if ok {
+            heartbeatFailureLogged = false
+        } else if !heartbeatFailureLogged {
+            heartbeatFailureLogged = true
+            NSLog("Hermes Agent Lights: cannot write heartbeat in %@", agentLightsDirectory.path)
+        }
     }
 
     private func render() {
@@ -103,17 +180,25 @@ private final class AgentLightsApp: NSObject, NSApplicationDelegate, NSMenuDeleg
         let legacyAgentStatuses = slotStatuses.filter(\.isKanbanWorker)
         let hermesStatuses = slotStatuses.filter { !$0.isKanbanWorker }
         let allAgentStatuses = agentStatuses + legacyAgentStatuses
-        // Keep normal Hermes lights stable by their Agent Lights slot letters (A-F).
-        // Terminal window/tab ordering is still used for click-to-focus association,
-        // but not for visual ordering; Terminal's AppleScript window order changes
-        // with focus and made the dots jump around.
-        let orderedHermesStatuses = hermesStatuses.sorted { $0.slot < $1.slot }
+        // Order dots by Terminal's real tab bar when it can be read and its
+        // titles carry each tab's TTY (TabBarOrder); otherwise by when each
+        // session's tab was opened (DotOrder), which never jumps on focus
+        // changes. Slot letters (A-F) still label the menu rows.
+        refreshTerminalSnapshotIfStale()
+        tabBarCache.expire(at: .now)
+        let tabBarResult = TabBarOrder.ordered(
+            fallbackOrdered: DotOrder.ordered(hermesStatuses),
+            tabTitles: tabBarCache.titles,
+            ttyOf: { $0.pid.flatMap { ProcessInspector.tty(pid: $0) } }
+        )
+        let orderedHermesStatuses = tabBarResult.statuses
+        updateDotOrderItem(matched: tabBarResult.matchedCount, total: hermesStatuses.count)
         // Agent Lights must not write Terminal tab titles. Terminal Inspector titles
         // are user-owned and should persist across Hermes prompts; Agent Lights only
         // reads manual titles for menu labels and click-to-focus context.
 
         let agentGroup = AgentRingGroup(statuses: allAgentStatuses)
-        statusItem.button?.image = DotRenderer.image(for: orderedHermesStatuses, agentGroup: agentGroup)
+        statusItem.button?.image = DotRenderer.image(for: orderedHermesStatuses, agentGroup: agentGroup, flashOn: errorFlashOn)
         removeAgentStatusItemIfPresent()
         let terminalDisplayNames = terminalDisplayNamesBySlot(for: orderedHermesStatuses)
         let menuModel = SlotStatusMenuModel(
@@ -128,43 +213,13 @@ private final class AgentLightsApp: NSObject, NSApplicationDelegate, NSMenuDeleg
         monitorController?.update(hermesStatuses: orderedHermesStatuses, agentGroup: agentGroup)
     }
 
-    private func orderHermesStatusesForTerminal(_ statuses: [SlotStatus]) -> [SlotStatus] {
-        let pids = statuses.compactMap(\.pid)
-        guard !pids.isEmpty else { return statuses.sorted { $0.slot < $1.slot } }
-        let terminalOrder = terminalTTYOrder()
-        guard !terminalOrder.isEmpty else { return statuses.sorted { $0.slot < $1.slot } }
-        let ttyByPid = Dictionary(uniqueKeysWithValues: pids.compactMap { pid in
-            ttyForProcess(pid: pid).map { (pid, $0) }
-        })
-        return SlotStatus.orderedByTerminalTTY(statuses, ttyForPid: ttyByPid, terminalTTYOrder: terminalOrder)
-    }
-
     private func terminalProcessIdentifier() -> pid_t? {
         NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.Terminal").first?.processIdentifier
     }
 
-    private func terminalTabSnapshot() -> String {
-        guard let processIdentifier = terminalProcessIdentifier() else { return "" }
-        // PID-targeted Apple events fail harmlessly if Terminal exits; unlike a
-        // bundle-targeted `tell application "Terminal"`, they cannot relaunch it.
-        return AgentLightsTerminalTabSnapshot(processIdentifier) as String? ?? ""
-    }
-
-    private func terminalTTYOrder() -> [String] {
-        let now = Date()
-        if let cache = terminalTTYOrderCache, now.timeIntervalSince(cache.loadedAt) < 2.0 {
-            return cache.ttys
-        }
-        let ttys = terminalTabSnapshot()
-            .split(whereSeparator: \.isNewline)
-            .compactMap { $0.split(separator: "\t", maxSplits: 1, omittingEmptySubsequences: false).first.map(String.init) }
-            .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
-        terminalTTYOrderCache = (loadedAt: now, ttys: ttys)
-        return ttys
-    }
-
     private func terminalDisplayNamesBySlot(for statuses: [SlotStatus]) -> [Int: String] {
-        let titlesByTTY = terminalCustomTitlesByTTY()
+        refreshTerminalSnapshotIfStale()
+        let titlesByTTY = terminalTitlesByTTY
         guard !titlesByTTY.isEmpty else { return [:] }
         var result: [Int: String] = [:]
         for status in statuses {
@@ -177,12 +232,44 @@ private final class AgentLightsApp: NSObject, NSApplicationDelegate, NSMenuDeleg
         return result
     }
 
-    private func terminalCustomTitlesByTTY() -> [String: String] {
-        let now = Date()
-        if let cache = terminalCustomTitlesCache, now.timeIntervalSince(cache.loadedAt) < 2.0 {
-            return cache.titlesByTTY
+    /// Kick off a background Terminal snapshot when the cached one is stale.
+    /// Results land on the next render tick; the main thread never waits.
+    private func refreshTerminalSnapshotIfStale() {
+        if terminalSnapshotInFlight { return }
+        if let loadedAt = terminalSnapshotLoadedAt, ContinuousClock.now - loadedAt < .seconds(terminalSnapshotMaxAge) { return }
+        guard let processIdentifier = terminalProcessIdentifier() else {
+            terminalTitlesByTTY = [:]
+            tabBarCache.reset()
+            tabBarTrusted = AXIsProcessTrusted()
+            terminalSnapshotLoadedAt = .now
+            return
         }
-        let output = terminalTabSnapshot()
+        terminalSnapshotInFlight = true
+        Task.detached(priority: .utility) {
+            // PID-targeted Apple events fail harmlessly if Terminal exits; unlike a
+            // bundle-targeted `tell application "Terminal"`, they cannot relaunch it.
+            let output = AgentLightsTerminalTabSnapshot(processIdentifier) as String? ?? ""
+            let tabBar = TerminalTabBar.read(terminalPid: processIdentifier)
+            await MainActor.run {
+                self.terminalTitlesByTTY = self.parseTerminalTitles(output)
+                switch tabBar {
+                case .untrusted:
+                    self.tabBarTrusted = false
+                    self.tabBarCache.reset()
+                case .failed(let reason):
+                    self.tabBarTrusted = true
+                    self.tabBarCache.recordFailure(reason, at: .now)
+                case .snapshot(let titles):
+                    self.tabBarTrusted = true
+                    self.tabBarCache.recordSuccess(titles, at: .now)
+                }
+                self.terminalSnapshotLoadedAt = .now
+                self.terminalSnapshotInFlight = false
+            }
+        }
+    }
+
+    private func parseTerminalTitles(_ output: String) -> [String: String] {
         var titlesByTTY: [String: String] = [:]
         for line in output.split(whereSeparator: \.isNewline).map(String.init) {
             let parts = line.split(separator: "\t", maxSplits: 3, omittingEmptySubsequences: false)
@@ -197,7 +284,6 @@ private final class AgentLightsApp: NSObject, NSApplicationDelegate, NSMenuDeleg
                 titlesByTTY[tty] = windowTitle
             }
         }
-        terminalCustomTitlesCache = (loadedAt: now, titlesByTTY: titlesByTTY)
         return titlesByTTY
     }
 
@@ -332,26 +418,7 @@ private final class AgentLightsApp: NSObject, NSApplicationDelegate, NSMenuDeleg
     }
 
     private func ttyForProcess(pid: Int) -> String? {
-        Self.ttyForProcess(pid: pid, timeout: subprocessTimeout)
-    }
-
-    nonisolated private static func ttyForProcess(pid: Int, timeout: TimeInterval) -> String? {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/bin/ps")
-        process.arguments = ["-o", "tty=", "-p", String(pid)]
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = Pipe()
-        do {
-            try process.run()
-        } catch {
-            return nil
-        }
-        guard waitForProcess(process, timeout: timeout), process.terminationStatus == 0 else { return nil }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        let tty = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let tty, !tty.isEmpty, tty != "??" else { return nil }
-        return tty
+        ProcessInspector.tty(pid: pid)
     }
 
     nonisolated private static func waitForProcess(_ process: Process, timeout: TimeInterval) -> Bool {
@@ -365,6 +432,59 @@ private final class AgentLightsApp: NSObject, NSApplicationDelegate, NSMenuDeleg
             return false
         }
         return true
+    }
+
+    private func updateDotOrderItem(matched: Int, total: Int) {
+        let titlesHaveTTYs = tabBarCache.titles.contains { !TabBarOrder.ttys(inTitle: $0).isEmpty }
+        if !tabBarTrusted {
+            setDotOrderItem("tab opened \u{2014} Allow Accessibility to follow tabs\u{2026}", action: #selector(requestTabOrderPermission))
+        } else if tabBarCache.isUnavailable {
+            setDotOrderItem("tab opened \u{2014} can\u{2019}t read Terminal\u{2019}s tab bar (\(tabBarCache.lastFailure ?? "unknown"))", action: nil)
+        } else if matched < total && !titlesHaveTTYs {
+            setDotOrderItem("tab opened \u{2014} add \u{201C}TTY\u{201D} to Terminal tab titles\u{2026}", action: #selector(showTabTitleHelp))
+        } else if matched < total {
+            let count = total - matched
+            setDotOrderItem("Terminal tab bar; \(count) session\(count == 1 ? "" : "s") not matched to a Terminal tab", action: nil)
+        } else {
+            setDotOrderItem("Terminal tab bar", action: nil)
+        }
+    }
+
+    private func setDotOrderItem(_ detail: String, action: Selector?) {
+        dotOrderItem.title = "Dot order: \(detail)"
+        dotOrderItem.action = action
+        dotOrderItem.isEnabled = action != nil
+    }
+
+    /// Ask once per build: macOS ties the Accessibility grant to the app's
+    /// signature, and local builds are re-signed every time.
+    private func promptForTabOrderPermissionOncePerBuild() {
+        let executable = Bundle.main.executableURL
+        let modified = (try? executable?.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
+        let build = AccessibilityPrompt.buildKey(executablePath: executable?.path, modifiedAt: modified)
+        guard AccessibilityPrompt.shouldPrompt(
+            trusted: AXIsProcessTrusted(),
+            buildKey: build,
+            lastPromptedBuildKey: UserDefaults.standard.string(forKey: tabOrderPromptDefaultsKey)
+        ) else { return }
+        UserDefaults.standard.set(build, forKey: tabOrderPromptDefaultsKey)
+        TerminalTabBar.requestPermission()
+    }
+
+    @objc private func requestTabOrderPermission(_ sender: NSMenuItem) {
+        if !TerminalTabBar.requestPermission() {
+            TerminalTabBar.openAccessibilitySettings()
+        }
+        terminalSnapshotLoadedAt = nil
+    }
+
+    @objc private func showTabTitleHelp(_ sender: NSMenuItem) {
+        let alert = NSAlert()
+        alert.messageText = "Show each tab's TTY in Terminal tab titles"
+        alert.informativeText = "Agent Lights matches Terminal tabs to Hermes sessions by the terminal device name in the tab title.\n\nIn Terminal: Settings \u{2192} Profiles \u{2192} (each profile you use) \u{2192} Tab \u{2192} turn on \u{201C}TTY\u{201D}.\n\nUntil then, dots follow the order tabs were opened."
+        alert.addButton(withTitle: "OK")
+        NSApp.activate(ignoringOtherApps: true)
+        alert.runModal()
     }
 
     @objc private func refreshNow(_ sender: NSMenuItem) {
@@ -428,16 +548,9 @@ private final class AgentLightsApp: NSObject, NSApplicationDelegate, NSMenuDeleg
             return status
         }
         if status.shouldPrune(fileModifiedAt: modifiedAt) {
-            pruneSlotFiles(directory: directory, slot: slot)
+            SlotFilePruner.prune(directory: directory, slot: slot)
         }
         return nil
-    }
-
-    private func pruneSlotFiles(directory: URL, slot: Int) {
-        let jsonURL = directory.appendingPathComponent("\(slot).json")
-        let lockURL = directory.appendingPathComponent("\(slot).lock")
-        try? FileManager.default.removeItem(at: jsonURL)
-        try? FileManager.default.removeItem(at: lockURL)
     }
 }
 
@@ -609,9 +722,9 @@ private final class FloatingMonitorView: NSView {
 }
 
 private enum DotRenderer {
-    static func image(for statuses: [SlotStatus], agentGroup: AgentRingGroup = AgentRingGroup(statuses: [])) -> NSImage {
+    static func image(for statuses: [SlotStatus], agentGroup: AgentRingGroup = AgentRingGroup(statuses: []), flashOn: Bool = true) -> NSImage {
         let visibleStatuses = Array(statuses.prefix(6))
-        let layout = StatusIndicatorLayout(hermesStatuses: visibleStatuses, agentGroup: agentGroup)
+        let layout = StatusIndicatorLayout(hermesStatuses: visibleStatuses, agentGroup: agentGroup, flashOn: flashOn)
         let normalSlotIndicators = layout.normalSlotIndicators
         let geometry = StatusIndicatorGeometry()
         let dotCount = normalSlotIndicators.count
@@ -635,7 +748,8 @@ private enum DotRenderer {
                 color(for: indicator.state).setFill()
                 path.fill()
             case .outline:
-                NSColor.secondaryLabelColor.withAlphaComponent(0.72).setStroke()
+                let outlineColor = indicator.state == .error ? color(for: .error) : NSColor.secondaryLabelColor.withAlphaComponent(0.72)
+                outlineColor.setStroke()
                 path.lineWidth = 1.4
                 path.stroke()
             }
@@ -643,6 +757,15 @@ private enum DotRenderer {
 
         if layout.shouldRenderAgentRings {
             drawAgentRings(for: agentGroup, xOffset: dotWidth + gapWidth)
+        }
+
+        if layout.shouldRenderIdlePlaceholder {
+            let dotDiameter = CGFloat(geometry.hermesDotDiameter)
+            let rect = NSRect(x: (width - dotDiameter) / 2, y: (18 - dotDiameter) / 2, width: dotDiameter, height: dotDiameter)
+            let path = NSBezierPath(ovalIn: rect)
+            NSColor.secondaryLabelColor.withAlphaComponent(0.72).setStroke()
+            path.lineWidth = 1.4
+            path.stroke()
         }
 
         image.unlockFocus()

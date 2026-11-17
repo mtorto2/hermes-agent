@@ -7,7 +7,7 @@ Examples:
   # Estimate only, no API generation call:
   scripts/heygen_generate.py --estimate-only --text "Quick test"
 
-  # Generate with defaults and download to ~/Desktop:
+  # Generate with defaults and download to your Videos folder:
   scripts/heygen_generate.py --text "Quick HeyGen test from Hermes."
 
   # Pick explicit media:
@@ -38,6 +38,36 @@ DEFAULT_VOICE_ID = "f38a635bee7a4d1f9b0a654a31d050d2"
 DEFAULT_TEXT = "Quick HeyGen test from Hermes. If you can see this, the integration is working."
 # Empirical from Matt's first test: 5 credits cost about $0.08.
 DEFAULT_USD_PER_CREDIT = 0.016
+
+
+def _default_output_dir() -> Path:
+    """Return a user-visible video folder, honoring Windows known-folder redirects."""
+    configured = os.environ.get("HERMES_HEYGEN_OUTPUT_DIR", "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    if os.name != "nt":
+        return Path.home() / "Videos"
+    try:
+        import ctypes
+        from uuid import UUID
+
+        # FOLDERID_Videos; SHGetKnownFolderPath follows OneDrive and other
+        # Shell-folder redirects instead of assuming a home-directory layout.
+        folder_id = ctypes.create_string_buffer(
+            UUID("18989B1D-99B5-455B-841C-AB7C74E4DDFC").bytes_le
+        )
+        result = ctypes.c_wchar_p()
+        status = ctypes.windll.shell32.SHGetKnownFolderPath(
+            ctypes.byref(folder_id), 0, None, ctypes.byref(result)
+        )
+        if status == 0 and result.value:
+            try:
+                return Path(result.value)
+            finally:
+                ctypes.windll.ole32.CoTaskMemFree(result)
+    except Exception:
+        pass
+    return Path.home() / "Videos"
 
 
 def _headers(api_key: str) -> dict[str, str]:
@@ -209,7 +239,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--avatar-style", default="normal", help="Avatar style for avatar generations.")
     parser.add_argument("--width", type=int, default=1280)
     parser.add_argument("--height", type=int, default=720)
-    parser.add_argument("--output-dir", default="~/Desktop")
+    parser.add_argument("--output-dir", default=str(_default_output_dir()))
     parser.add_argument("--filename", default="", help="Optional output filename, e.g. test.mp4")
     parser.add_argument("--timeout-seconds", type=int, default=600)
     parser.add_argument("--poll-interval", type=int, default=5)

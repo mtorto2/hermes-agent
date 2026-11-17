@@ -85,14 +85,14 @@ class TestCwdHandling:
         assert config["host_cwd"] is None
         assert config["docker_mount_cwd_to_workspace"] is False
 
-    def test_users_path_maps_to_workspace_for_docker_when_enabled(self, monkeypatch):
-        """Docker should map the host cwd into /workspace only when explicitly enabled."""
+    def test_existing_host_directory_maps_to_workspace_for_docker_when_enabled(self, monkeypatch, tmp_path):
+        """Docker maps an existing host directory only when explicitly enabled."""
         monkeypatch.setenv("TERMINAL_ENV", "docker")
-        monkeypatch.setenv("TERMINAL_CWD", "/Users/someone/projects")
+        monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
         monkeypatch.setenv("TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE", "true")
         config = _tt_mod._get_env_config()
         assert config["cwd"] == "/workspace"
-        assert config["host_cwd"] == "/Users/someone/projects"
+        assert config["host_cwd"] == str(tmp_path)
         assert config["docker_mount_cwd_to_workspace"] is True
 
     def test_windows_path_replaced_for_modal(self, monkeypatch):
@@ -133,15 +133,15 @@ class TestCwdHandling:
             f"Backend {backend}: expected /root default, got {config['cwd']}"
         )
 
-    def test_docker_default_cwd_maps_current_directory_when_enabled(self, monkeypatch):
-        """Docker should use /workspace when cwd mounting is explicitly enabled."""
-        monkeypatch.setattr("tools.terminal_tool.os.getcwd", lambda: "/home/user/project")
+    def test_docker_default_cwd_maps_existing_current_directory_when_enabled(self, monkeypatch, tmp_path):
+        """Docker maps an existing current host directory when explicitly enabled."""
+        monkeypatch.setattr("tools.terminal_tool.os.getcwd", lambda: str(tmp_path))
         monkeypatch.setenv("TERMINAL_ENV", "docker")
         monkeypatch.setenv("TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE", "true")
         monkeypatch.delenv("TERMINAL_CWD", raising=False)
         config = _tt_mod._get_env_config()
         assert config["cwd"] == "/workspace"
-        assert config["host_cwd"] == "/home/user/project"
+        assert config["host_cwd"] == str(tmp_path)
 
     def test_local_backend_uses_getcwd(self, monkeypatch):
         """Local backend should use os.getcwd(), not /root."""
@@ -354,6 +354,12 @@ class TestDockerHostBindApproval:
         # Windows host path -> host access.
         assert _tt_mod._docker_has_host_access(
             {"env_type": "docker", "docker_volumes": ["C:\\Users:/data"]}) is True
+        # Windows drive-qualified paths stay host access even when drive-relative.
+        assert _tt_mod._docker_has_host_access(
+            {"env_type": "docker", "docker_volumes": ["C:workspace:/data"]}) is True
+        # UNC host paths are also Docker bind sources, never named volumes.
+        assert _tt_mod._docker_has_host_access(
+            {"env_type": "docker", "docker_volumes": [r"\\server\share:/data"]}) is True
         # Other container backends never report host access.
         assert _tt_mod._docker_has_host_access(
             {"env_type": "modal", "docker_volumes": ["/tmp:/x"]}) is False
@@ -391,10 +397,19 @@ class TestDockerHostBindApproval:
         config permanently allowlists e.g. "delete in root path" the guard
         under test silently approves and the assertions flip. CI never has
         such an allowlist, making this a local-only flake.
+
+        Same import-time freeze applies to ``_YOLO_MODE_FROZEN``: it reads
+        HERMES_YOLO_MODE off the environment when the module is imported at
+        collection time, before conftest's per-test env blanking runs. A test
+        run launched from a --yolo Hermes session (or any shell exporting
+        HERMES_YOLO_MODE=1) freezes True and every guard auto-approves.
+        Reset it explicitly so the tests exercise the guard, not the bypass.
         """
         import tools.approval as A
         monkeypatch.setattr(A, "_permanent_approved", set())
         monkeypatch.setattr(A, "_session_approved", {})
+        monkeypatch.setattr(A, "_YOLO_MODE_FROZEN", False)
+        monkeypatch.setattr(A, "_get_approval_mode", lambda: "manual")
 
     def test_host_bound_docker_requires_approval(self, monkeypatch):
         """Host-bound Docker dangerous command escalates instead of bypassing."""

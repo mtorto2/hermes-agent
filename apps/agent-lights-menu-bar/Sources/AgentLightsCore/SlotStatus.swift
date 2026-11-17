@@ -13,11 +13,187 @@ public enum SlotLifecycleState: String, Codable, Equatable {
 /// Agent Lights is a shared local surface across Hermes profiles, so it always
 /// reads the primary user home's status directory rather than a profile-scoped
 /// HERMES_HOME inherited from whichever producer launched it.
+///
+/// The `v2` pool belongs to the current ownership protocol (flock-serialized
+/// claims, numeric start times, claim-time reaping). Pre-v2 producers write
+/// `agent-lights/slots` and `agent-lights/agents`, which this app ignores, so
+/// the two generations can never contend for one slot.
 public enum AgentLightsPath {
+    public static let poolVersion = "v2"
+
     public static func sharedDirectory(userHomeDirectory: String) -> URL {
         URL(fileURLWithPath: userHomeDirectory)
             .appendingPathComponent(".hermes")
             .appendingPathComponent("agent-lights")
+            .appendingPathComponent(poolVersion)
+    }
+}
+
+/// `app.json` in the pool tells Hermes's launcher a current (v2) app is
+/// running. The launcher opens the app only when no Agent Lights app runs at
+/// all; it never quits or replaces one.
+public enum AppHeartbeat {
+    public static let fileName = "app.json"
+
+    public static func write(directory: URL, pid: Int, processStartTime: Double?) throws {
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        var payload: [String: Any] = ["pid": pid, "pool": AgentLightsPath.poolVersion]
+        if let processStartTime {
+            payload["process_start_time"] = processStartTime
+        }
+        let data = try JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
+        try data.write(to: directory.appendingPathComponent(fileName), options: .atomic)
+    }
+
+    /// Make sure the heartbeat names `pid`, rewriting it if it is missing,
+    /// unreadable, or names another process. Returns whether it does now.
+    @discardableResult
+    public static func ensure(directory: URL, pid: Int, processStartTime: Double?) -> Bool {
+        let url = directory.appendingPathComponent(fileName)
+        if let data = try? Data(contentsOf: url),
+           let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           object["pid"] as? Int == pid,
+           object["pool"] as? String == AgentLightsPath.poolVersion,
+           startTimesMatch(object["process_start_time"] as? Double, processStartTime) {
+            return true
+        }
+        do {
+            try write(directory: directory, pid: pid, processStartTime: processStartTime)
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    private static func startTimesMatch(_ stored: Double?, _ actual: Double?) -> Bool {
+        guard let stored, let actual else { return stored == nil && actual == nil }
+        return abs(stored - actual) <= SlotStatus.startTimeTolerance
+    }
+
+    /// Remove the heartbeat only if it still names `pid` (a newer app may own it).
+    public static func removeIfOwned(directory: URL, pid: Int) {
+        let url = directory.appendingPathComponent(fileName)
+        guard let data = try? Data(contentsOf: url),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              object["pid"] as? Int == pid else { return }
+        try? FileManager.default.removeItem(at: url)
+    }
+}
+
+/// Migration guard: the current app runs only from its own versioned bundle.
+/// Pre-v2 launchers package the newest built binary (which after an upgrade is
+/// this one) into `.build/AgentLightsMenuBar.app` and may rewrite that bundle
+/// at any time without taking the v2 launch lock. A copy running from there,
+/// or from anything aliased to it, must never become the v2 owner, so it exits
+/// before taking the instance lock or writing the heartbeat. This checks where
+/// the app runs, not build provenance. `AGENT_LIGHTS_ALLOW_ANY_BUNDLE=1`
+/// disables it for development runs only; leave it unset in normal use.
+public enum AppBundleIdentity {
+    public static let bundleName = "AgentLightsMenuBar-v2.app"
+    public static let legacyBundleName = "AgentLightsMenuBar.app"
+    public static let allowAnyBundleEnvironmentKey = "AGENT_LIGHTS_ALLOW_ANY_BUNDLE"
+
+    /// Why the app must not run from here, or nil if it may. Fails closed:
+    /// anything that cannot be inspected is a rejection.
+    public static func rejection(bundleURL: URL, executableURL: URL?, environment: [String: String]) -> String? {
+        if environment[allowAnyBundleEnvironmentKey] == "1" {
+            return nil
+        }
+        let launchedPath = bundleURL.standardizedFileURL.path
+        guard (launchedPath as NSString).lastPathComponent == bundleName,
+              let bundle = canonicalPath(launchedPath),
+              (bundle as NSString).lastPathComponent == bundleName else {
+            return "running from \(launchedPath), not a real \(bundleName)"
+        }
+        guard let executableURL, let executable = canonicalPath(executableURL.standardizedFileURL.path) else {
+            return "cannot inspect the app executable"
+        }
+        guard executable.hasPrefix(bundle + "/") else {
+            return "executable \(executable) is outside \(bundle)"
+        }
+        var info = stat()
+        guard stat(executable, &info) == 0 else {
+            return "cannot stat the app executable \(executable)"
+        }
+        // A hard-linked executable can be rewritten in place through another
+        // path (pre-v2 launchers truncate and rewrite their executable).
+        if info.st_nlink > 1 {
+            return "executable \(executable) has \(info.st_nlink) hard links"
+        }
+        // The pre-v2 launcher writes <dir>/AgentLightsMenuBar.app/Contents/
+        // MacOS/AgentLightsMenuBar. If that path reaches into this bundle
+        // through any symlink (the bundle root, Contents, MacOS or the
+        // executable itself), or names this very file, it could rewrite us.
+        let relativeExecutable = String(executable.dropFirst(bundle.count + 1))
+        for directory in Set([(launchedPath as NSString).deletingLastPathComponent, (bundle as NSString).deletingLastPathComponent]) {
+            let legacyExecutable = ((directory as NSString).appendingPathComponent(legacyBundleName) as NSString)
+                .appendingPathComponent(relativeExecutable)
+            if let reached = canonicalPath(legacyExecutable), reached == bundle || reached.hasPrefix(bundle + "/") {
+                return "\(legacyExecutable) resolves into this bundle (\(reached))"
+            }
+            var legacyInfo = stat()
+            if stat(legacyExecutable, &legacyInfo) == 0, legacyInfo.st_dev == info.st_dev, legacyInfo.st_ino == info.st_ino {
+                return "\(legacyExecutable) is this app's executable"
+            }
+        }
+        return nil
+    }
+
+    /// `realpath` of the longest existing prefix of `path`, with the missing
+    /// remainder appended. Unlike `URL.resolvingSymlinksInPath`, this never
+    /// rewrites `/private/var` as `/var`, so equal storage compares equal.
+    public static func canonicalPath(_ path: String) -> String? {
+        var existing = path
+        var missing: [String] = []
+        while !existing.isEmpty, existing != "/" {
+            if let resolved = realpath(existing, nil) {
+                defer { free(resolved) }
+                var result = String(cString: resolved)
+                for component in missing.reversed() {
+                    result = (result as NSString).appendingPathComponent(component)
+                }
+                return result
+            }
+            guard errno == ENOENT else { return nil }
+            missing.append((existing as NSString).lastPathComponent)
+            existing = (existing as NSString).deletingLastPathComponent
+        }
+        return nil
+    }
+
+}
+
+/// One current (v2) app at a time. The app holds an exclusive `flock` on
+/// `<pool>/app.lock` for its whole life; a second copy (opened by a racing
+/// launcher or by hand) cannot get it and exits. The kernel releases the lock
+/// when the holder dies, so a crash never blocks the next launch.
+public enum AppInstanceLock {
+    public static let fileName = "app.lock"
+
+    public enum Outcome: Equatable {
+        /// Keep this descriptor open for the process lifetime.
+        case acquired(Int32)
+        case heldByAnotherApp
+        case failed(String)
+    }
+
+    public static func acquire(directory: URL) -> Outcome {
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        } catch {
+            return .failed("cannot create \(directory.path): \(error.localizedDescription)")
+        }
+        let path = directory.appendingPathComponent(fileName).path
+        let fd = open(path, O_RDWR | O_CREAT, 0o600)
+        guard fd >= 0 else {
+            return .failed("cannot open \(path): \(String(cString: strerror(errno)))")
+        }
+        guard flock(fd, LOCK_EX | LOCK_NB) == 0 else {
+            let code = errno
+            close(fd)
+            return code == EWOULDBLOCK ? .heldByAnotherApp : .failed("cannot lock \(path): \(String(cString: strerror(code)))")
+        }
+        return .acquired(fd)
     }
 }
 
@@ -29,7 +205,12 @@ public struct SlotStatus: Equatable {
     public let event: String?
     public let updatedAt: String?
     public let pid: Int?
+    /// Legacy `ps -o lstart` text from pre-hardening producers. Its wording
+    /// depends on the writer's locale and timezone, so it is decoded for
+    /// display/debugging only and never used to judge liveness.
     public let processStartedAt: String?
+    /// Owner process start time in epoch seconds (locale-independent).
+    public let processStartTime: Double?
     public let source: String?
     public let modelName: String?
     public let kanbanBoard: String?
@@ -88,7 +269,7 @@ public struct SlotStatus: Equatable {
     }
 
     public static func missing(slot: Int) -> SlotStatus {
-        SlotStatus(slot: slot, state: .missing, event: nil, updatedAt: nil, pid: nil, processStartedAt: nil, source: nil, modelName: nil, kanbanBoard: nil, kanbanTaskId: nil, kanbanTaskTitle: nil, profile: nil, sessionId: nil)
+        SlotStatus(slot: slot, state: .missing, event: nil, updatedAt: nil, pid: nil, processStartedAt: nil, processStartTime: nil, source: nil, modelName: nil, kanbanBoard: nil, kanbanTaskId: nil, kanbanTaskTitle: nil, profile: nil, sessionId: nil)
     }
 
     public static func decode(from data: Data) throws -> SlotStatus {
@@ -101,6 +282,7 @@ public struct SlotStatus: Equatable {
             updatedAt: payload.updatedAt,
             pid: payload.pid,
             processStartedAt: payload.processStartedAt,
+            processStartTime: payload.processStartTime,
             source: payload.source,
             modelName: payload.modelName,
             kanbanBoard: payload.kanbanBoard,
@@ -146,22 +328,32 @@ public struct SlotStatus: Equatable {
         return trimmedTTY
     }
 
+    /// Two readings of one process's start time can differ by float rounding;
+    /// a recycled PID cannot start within this window of the original.
+    public static let startTimeTolerance: TimeInterval = 1.0
+
     public func shouldRender(
         now: Date = Date(),
         fileModifiedAt: Date? = nil,
         processIsRunning: (Int) -> Bool = SlotStatus.processIsRunning,
-        processStartedAtForPid: (Int) -> String? = SlotStatus.processStartedAt
+        processStartTimeForPid: (Int) -> Double? = ProcessInspector.startTime
     ) -> Bool {
         guard state != .missing else { return false }
 
         if let pid, pid > 0 {
-            if processIsRunning(pid) {
-                guard let processStartedAt, !processStartedAt.isEmpty else { return true }
-                if processStartedAtForPid(pid) == processStartedAt {
-                    return true
-                }
+            if Self.ownerIsAlive(
+                pid: pid,
+                processStartTime: processStartTime,
+                processIsRunning: processIsRunning,
+                processStartTimeForPid: processStartTimeForPid
+            ) {
+                return true
             }
-            return wasRecentlyModified(now: now, fileModifiedAt: fileModifiedAt)
+            // The owner is gone. Normal Hermes sessions often die without
+            // cleanup (terminal close, os._exit paths, kill -9), so hide them
+            // at once instead of leaving a ghost dot. Kanban workers exit by
+            // design after finishing; keep their last state briefly visible.
+            return isKanbanWorker && wasRecentlyModified(now: now, fileModifiedAt: fileModifiedAt)
         }
 
         return wasRecentlyModified(now: now, fileModifiedAt: fileModifiedAt)
@@ -171,14 +363,29 @@ public struct SlotStatus: Equatable {
         now: Date = Date(),
         fileModifiedAt: Date? = nil,
         processIsRunning: (Int) -> Bool = SlotStatus.processIsRunning,
-        processStartedAtForPid: (Int) -> String? = SlotStatus.processStartedAt
+        processStartTimeForPid: (Int) -> Double? = ProcessInspector.startTime
     ) -> Bool {
         state != .missing && !shouldRender(
             now: now,
             fileModifiedAt: fileModifiedAt,
             processIsRunning: processIsRunning,
-            processStartedAtForPid: processStartedAtForPid
+            processStartTimeForPid: processStartTimeForPid
         )
+    }
+
+    /// Whether `pid` still names the process that wrote a file stamped with
+    /// `processStartTime` (nil for legacy files: judged on PID liveness alone).
+    public static func ownerIsAlive(
+        pid: Int,
+        processStartTime: Double?,
+        processIsRunning: (Int) -> Bool = SlotStatus.processIsRunning,
+        processStartTimeForPid: (Int) -> Double? = ProcessInspector.startTime
+    ) -> Bool {
+        guard processIsRunning(pid) else { return false }
+        // Legacy payloads have no numeric start time: trust PID liveness.
+        guard let processStartTime else { return true }
+        guard let actual = processStartTimeForPid(pid) else { return false }
+        return abs(actual - processStartTime) <= Self.startTimeTolerance
     }
 
     private func wasRecentlyModified(now: Date, fileModifiedAt: Date?) -> Bool {
@@ -189,24 +396,341 @@ public struct SlotStatus: Equatable {
     public static func processIsRunning(pid: Int) -> Bool {
         kill(pid_t(pid), 0) == 0 || errno == EPERM
     }
+}
 
-    public static func processStartedAt(pid: Int) -> String? {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/bin/ps")
-        process.arguments = ["-o", "lstart=", "-p", String(pid)]
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = Pipe()
-        do {
-            try process.run()
-            process.waitUntilExit()
-        } catch {
-            return nil
+/// Process facts read straight from the kernel. Unlike `ps`, this spawns no
+/// subprocess (so it is cheap on the main thread) and its answers do not depend
+/// on locale or timezone.
+public enum ProcessInspector {
+    private static func kinfo(pid: Int) -> kinfo_proc? {
+        var info = kinfo_proc()
+        var size = MemoryLayout<kinfo_proc>.stride
+        var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, Int32(pid)]
+        guard sysctl(&mib, u_int(mib.count), &info, &size, nil, 0) == 0, size > 0 else { return nil }
+        return info
+    }
+
+    /// Process start time in epoch seconds, or nil if no such process.
+    public static func startTime(pid: Int) -> Double? {
+        guard pid > 0, let info = kinfo(pid: pid) else { return nil }
+        let start = info.kp_proc.p_un.__p_starttime
+        return Double(start.tv_sec) + Double(start.tv_usec) / 1_000_000
+    }
+
+    /// Controlling terminal name such as `ttys003`, or nil if none.
+    public static func tty(pid: Int) -> String? {
+        guard pid > 0, let info = kinfo(pid: pid) else { return nil }
+        let device = info.kp_eproc.e_tdev
+        guard device != -1, let name = devname(device, S_IFCHR) else { return nil }
+        let tty = String(cString: name)
+        return tty.isEmpty || tty == "??" ? nil : tty
+    }
+
+    /// Parent process id, or nil if no such process.
+    public static func parentPid(pid: Int) -> Int? {
+        guard pid > 0, let info = kinfo(pid: pid) else { return nil }
+        let parent = Int(info.kp_eproc.e_ppid)
+        return parent > 0 ? parent : nil
+    }
+
+    /// When the terminal tab hosting `pid` was opened: the start time of the
+    /// oldest ancestor on the same controlling terminal (the tab's login
+    /// shell). Nil when the process has no terminal. Unlike the process's own
+    /// start time, this stays put when Hermes is relaunched in the same tab or
+    /// restarts a backend process.
+    public static func terminalSessionStartTime(
+        pid: Int,
+        ttyOf: (Int) -> String? = ProcessInspector.tty,
+        parentOf: (Int) -> Int? = ProcessInspector.parentPid,
+        startTimeOf: (Int) -> Double? = ProcessInspector.startTime
+    ) -> Double? {
+        guard let tty = ttyOf(pid) else { return nil }
+        var oldest = pid
+        var seen: Set<Int> = [pid]
+        while let parent = parentOf(oldest), !seen.contains(parent), ttyOf(parent) == tty {
+            seen.insert(parent)
+            oldest = parent
         }
-        guard process.terminationStatus == 0 else { return nil }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        let output = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
-        return output?.isEmpty == false ? output : nil
+        return startTimeOf(oldest)
+    }
+}
+
+/// Removes a dead owner's slot files without racing a new claimant.
+///
+/// Hermes claims slots while holding an exclusive `flock` on
+/// `<directory>/.claim.lock`, and reaps the previous owner's status file in the
+/// same critical section. Pruning takes the same lock (without waiting, so the
+/// UI never blocks) and then re-reads each file and judges the owner it names
+/// *now*, by PID and start time. A decision made from an earlier snapshot can
+/// therefore never delete a file a new or PID-recycled owner has written since.
+public enum SlotFilePruner {
+    @discardableResult
+    public static func prune(
+        directory: URL,
+        slot: Int,
+        now: Date = Date(),
+        processIsRunning: (Int) -> Bool = SlotStatus.processIsRunning,
+        processStartTimeForPid: (Int) -> Double? = ProcessInspector.startTime
+    ) -> Bool {
+        let claimLock = directory.appendingPathComponent(".claim.lock").path
+        let fd = open(claimLock, O_RDWR | O_CREAT, 0o600)
+        guard fd >= 0 else { return false }
+        defer { close(fd) }
+        guard flock(fd, LOCK_EX | LOCK_NB) == 0 else { return false }
+        defer { flock(fd, LOCK_UN) }
+
+        var removed = false
+        let jsonURL = directory.appendingPathComponent("\(slot).json")
+        if let data = try? Data(contentsOf: jsonURL),
+           let status = try? SlotStatus.decode(from: data),
+           status.slot == slot {
+            let modifiedAt = try? jsonURL.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate
+            if status.shouldPrune(
+                now: now,
+                fileModifiedAt: modifiedAt,
+                processIsRunning: processIsRunning,
+                processStartTimeForPid: processStartTimeForPid
+            ), (try? FileManager.default.removeItem(at: jsonURL)) != nil {
+                removed = true
+            }
+        }
+
+        let lockURL = directory.appendingPathComponent("\(slot).lock")
+        if let data = try? Data(contentsOf: lockURL),
+           let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let pid = object["pid"] as? Int, pid > 0,
+           !SlotStatus.ownerIsAlive(
+               pid: pid,
+               processStartTime: object["process_start_time"] as? Double,
+               processIsRunning: processIsRunning,
+               processStartTimeForPid: processStartTimeForPid
+           ),
+           (try? FileManager.default.removeItem(at: lockURL)) != nil {
+            removed = true
+        }
+        return removed
+    }
+}
+
+/// Left-to-right order of the normal Hermes dots.
+///
+/// Slots are reused lowest-free-first, so slot order drifts away from the
+/// Terminal tab order as sessions come and go. Terminal's own window/tab order
+/// follows focus, which made the dots jump. Ordering by when each session's
+/// tab was opened (falling back to the process start time without a terminal)
+/// matches tabs opened left to right and never moves with focus. Ties and
+/// sessions with no time sort by slot.
+public enum DotOrder {
+    public static func ordered(
+        _ statuses: [SlotStatus],
+        sessionStartTime: (SlotStatus) -> Double? = DotOrder.defaultSessionStartTime,
+        processStartTime: (SlotStatus) -> Double? = { $0.processStartTime }
+    ) -> [SlotStatus] {
+        // Earlier first; a missing time sorts after any known one.
+        func compare(_ left: Double?, _ right: Double?) -> Bool? {
+            switch (left, right) {
+            case let (l?, r?) where l != r: return l < r
+            case (_?, nil): return true
+            case (nil, _?): return false
+            default: return nil
+            }
+        }
+        let keyed = statuses.map { (status: $0, session: sessionStartTime($0), process: processStartTime($0)) }
+        return keyed.sorted { left, right in
+            compare(left.session, right.session)
+                ?? compare(left.process, right.process)
+                ?? (left.status.slot < right.status.slot)
+        }.map(\.status)
+    }
+
+    /// When the session's Terminal tab was opened, or the process start time
+    /// for a session without a terminal.
+    public static func defaultSessionStartTime(_ status: SlotStatus) -> Double? {
+        if let pid = status.pid, let tabOpened = ProcessInspector.terminalSessionStartTime(pid: pid) {
+            return tabOpened
+        }
+        return status.processStartTime
+    }
+}
+
+/// Last good Terminal tab bar read. A failed or incomplete Accessibility read
+/// must not swap the dots into fallback order for a moment, so a failure keeps
+/// the last good titles until they are `staleAfter` seconds old, then reports
+/// the tab bar as unavailable.
+///
+/// Ages use `ContinuousClock`: monotonic, so wall-clock changes cannot make a
+/// read look fresh or stale, and still counting during sleep, so a read from
+/// before the Mac slept is not treated as fresh after it wakes.
+public struct TabBarCache: Equatable {
+    public typealias Instant = ContinuousClock.Instant
+
+    public static let staleAfter: TimeInterval = 10
+
+    public private(set) var titles: [String] = []
+    public private(set) var lastGoodAt: Instant?
+    public private(set) var lastFailure: String?
+
+    public init() {}
+
+    /// True when reads are failing and no recent good read remains.
+    public var isUnavailable: Bool {
+        lastFailure != nil && lastGoodAt == nil
+    }
+
+    public mutating func recordSuccess(_ titles: [String], at now: Instant) {
+        self.titles = titles
+        lastGoodAt = now
+        lastFailure = nil
+    }
+
+    public mutating func recordFailure(_ reason: String, at now: Instant) {
+        lastFailure = reason
+        if let lastGoodAt, now - lastGoodAt <= .seconds(Self.staleAfter) {
+            return
+        }
+        titles = []
+        lastGoodAt = nil
+    }
+
+    /// Enforce the age limit when the titles are used, so a read that is
+    /// slow or stuck (not just one that fails) cannot keep stale order alive.
+    public mutating func expire(at now: Instant) {
+        guard let lastGoodAt, now - lastGoodAt > .seconds(Self.staleAfter) else { return }
+        titles = []
+        self.lastGoodAt = nil
+        lastFailure = lastFailure ?? "no tab bar read in \(Int(Self.staleAfter))s"
+    }
+
+    /// Permission revoked or Terminal gone: nothing to keep.
+    public mutating func reset() {
+        self = TabBarCache()
+    }
+}
+
+/// Whether to show the system Accessibility prompt at launch.
+///
+/// macOS ties the grant to the app's signature and local builds are ad-hoc
+/// signed, so each build needs a new grant. Ask once per build (identified by
+/// `buildKey`), never when already trusted, and never twice for one build.
+public enum AccessibilityPrompt {
+    public static func shouldPrompt(trusted: Bool, buildKey: String, lastPromptedBuildKey: String?) -> Bool {
+        !trusted && buildKey != lastPromptedBuildKey
+    }
+
+    /// Identifies one build: the executable's path and modification time.
+    public static func buildKey(executablePath: String?, modifiedAt: Date?) -> String {
+        "\(executablePath ?? "?")@\(modifiedAt?.timeIntervalSince1970 ?? 0)"
+    }
+}
+
+/// Dot order from Terminal's real tab bar.
+///
+/// Terminal's tab titles are the only place the on-screen tab order is
+/// exposed (through Accessibility), and titles are often identical
+/// ("Terminal"). With the profile's Tab title set to include "TTY", each title
+/// carries its tab's `ttysNNN`, which matches a session's controlling terminal
+/// exactly. Sessions whose terminal is not found in the tab bar keep their
+/// fallback (tab-opened) order after the matched ones.
+public enum TabBarOrder {
+    public enum Source: Equatable {
+        /// Every session was placed by its tab's position.
+        case tabBar
+        /// Some or all sessions fell back to tab-opened order, and why.
+        case tabOpened(reason: String)
+    }
+
+    public static func ttys(inTitle title: String) -> [String] {
+        guard let regex = try? NSRegularExpression(pattern: #"\bttys[0-9]+\b"#) else { return [] }
+        let range = NSRange(title.startIndex..., in: title)
+        return regex.matches(in: title, range: range).compactMap { match in
+            Range(match.range, in: title).map { String(title[$0]) }
+        }
+    }
+
+    /// One Terminal window as Accessibility reports it.
+    public struct WindowTabs: Equatable {
+        public let x: Double
+        public let y: Double
+        /// Tab titles in tab-bar order, or nil when the window shows no tab bar.
+        public let tabTitles: [String]?
+        public let windowTitle: String?
+
+        public init(x: Double, y: Double, tabTitles: [String]?, windowTitle: String?) {
+            self.x = x
+            self.y = y
+            self.tabTitles = tabTitles
+            self.windowTitle = windowTitle
+        }
+    }
+
+    /// Flatten windows into on-screen tab order: windows left to right, then
+    /// top to bottom, tabs left to right. Windows at the same position (stacked,
+    /// full screen, other Spaces) are ordered by their lowest TTY number, which
+    /// never changes, rather than by Accessibility's reporting order, which
+    /// follows focus.
+    ///
+    /// Each tab of a tabbed window is also reported as its own window (the
+    /// unselected ones hidden, at the same position, with no tab bar). Such a
+    /// window is only a real single tab if its terminal is not already in some
+    /// tab bar, so tab bars are placed first and duplicates are dropped.
+    public static func onScreenTabTitles(_ windows: [WindowTabs]) -> [String] {
+        func identity(_ window: WindowTabs) -> (tty: Int, title: String) {
+            let titles = window.tabTitles ?? window.windowTitle.map { [$0] } ?? []
+            let numbers = titles.flatMap(ttys(inTitle:)).compactMap { Int($0.dropFirst("ttys".count)) }
+            return (numbers.min() ?? Int.max, titles.joined(separator: "\u{1F}"))
+        }
+        let ordered = windows.enumerated().sorted { left, right in
+            if left.element.x != right.element.x { return left.element.x < right.element.x }
+            if left.element.y != right.element.y { return left.element.y < right.element.y }
+            let l = identity(left.element), r = identity(right.element)
+            if l.tty != r.tty { return l.tty < r.tty }
+            if l.title != r.title { return l.title < r.title }
+            return left.offset < right.offset
+        }.map(\.element)
+        let inTabBars = Set(ordered.flatMap { ($0.tabTitles ?? []).flatMap(ttys(inTitle:)) })
+        var titles: [String] = []
+        for window in ordered {
+            if let tabTitles = window.tabTitles {
+                titles.append(contentsOf: tabTitles)
+            } else if let title = window.windowTitle {
+                let found = ttys(inTitle: title)
+                if found.isEmpty || !found.allSatisfy(inTabBars.contains) {
+                    titles.append(title)
+                }
+            }
+        }
+        return titles
+    }
+
+    /// `tabTitles` are Terminal tab titles in on-screen order (windows left to
+    /// right, tabs left to right). `fallbackOrdered` is the tab-opened order.
+    public static func ordered(
+        fallbackOrdered: [SlotStatus],
+        tabTitles: [String],
+        ttyOf: (SlotStatus) -> String?
+    ) -> (statuses: [SlotStatus], matchedCount: Int) {
+        var rank: [String: Int] = [:]
+        for (index, title) in tabTitles.enumerated() {
+            let found = ttys(inTitle: title)
+            // A title naming several terminals cannot place one tab.
+            guard found.count == 1, rank[found[0]] == nil else { continue }
+            rank[found[0]] = index
+        }
+        var matched: [(rank: Int, status: SlotStatus)] = []
+        var unmatched: [SlotStatus] = []
+        for status in fallbackOrdered {
+            if let tty = ttyOf(status).map(normalizedTTY), let position = rank[tty] {
+                matched.append((position, status))
+            } else {
+                unmatched.append(status)
+            }
+        }
+        let placed = matched.sorted { $0.rank < $1.rank }.map(\.status)
+        return (placed + unmatched, matched.count)
+    }
+
+    private static func normalizedTTY(_ tty: String) -> String {
+        tty.hasPrefix("/dev/") ? String(tty.dropFirst(5)) : tty
     }
 }
 
@@ -286,10 +810,19 @@ public struct NormalSlotIndicator: Equatable {
     public let state: SlotLifecycleState
     public let style: NormalSlotIndicatorStyle
 
-    public init(status: SlotStatus) {
+    /// `flashOn` is the current blink phase. Errors alternate between filled
+    /// and outline so they read differently from a steady red "answer ready".
+    public init(status: SlotStatus, flashOn: Bool = true) {
         self.slot = status.slot
         self.state = status.state
-        self.style = status.state == .idle ? .outline : .filled
+        switch status.state {
+        case .idle:
+            self.style = .outline
+        case .error:
+            self.style = flashOn ? .filled : .outline
+        default:
+            self.style = .filled
+        }
     }
 }
 
@@ -333,11 +866,17 @@ public struct StatusIndicatorLayout: Equatable {
         agentRingCount > 0
     }
 
-    public init(hermesStatuses: [SlotStatus], agentGroup: AgentRingGroup) {
+    /// Nothing to show: no Hermes slot dots and no agent rings. The menu bar
+    /// item is still there, so draw a hollow placeholder ring rather than an
+    /// empty (invisible) image, to show the app is running with no agents.
+    public var shouldRenderIdlePlaceholder: Bool {
+        normalSlotIndicators.isEmpty && !shouldRenderAgentRings
+    }
+
+    public init(hermesStatuses: [SlotStatus], agentGroup: AgentRingGroup, flashOn: Bool = true) {
         self.normalSlotIndicators = hermesStatuses
             .filter { (1...6).contains($0.slot) }
-            .sorted { $0.slot < $1.slot }
-            .map(NormalSlotIndicator.init)
+            .map { NormalSlotIndicator(status: $0, flashOn: flashOn) }
         self.filledDotCount = normalSlotIndicators.filter { $0.style == .filled }.count
         self.agentRingCount = agentGroup.shouldRender ? agentGroup.capacity : 0
         let columns = max(2, ((agentGroup.capacity + 3) / 4) * 2)
@@ -567,6 +1106,7 @@ private struct SlotStatusPayload: Decodable {
     let updatedAt: String?
     let pid: Int?
     let processStartedAt: String?
+    let processStartTime: Double?
     let source: String?
     let modelName: String?
     let kanbanBoard: String?
@@ -582,6 +1122,7 @@ private struct SlotStatusPayload: Decodable {
         case updatedAt = "updated_at"
         case pid
         case processStartedAt = "process_started_at"
+        case processStartTime = "process_start_time"
         case source
         case modelName = "model_name"
         case kanbanBoard = "kanban_board"

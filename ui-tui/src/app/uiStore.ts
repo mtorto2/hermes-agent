@@ -10,7 +10,8 @@ import { DEFAULT_INDICATOR_STYLE, type UiState } from './interfaces.js'
 // The profile launcher supplies an exact serialized skin. It must win over a
 // prior terminal boot cache so profiles cannot briefly inherit another
 // profile's brand. The cache remains the flash-free fallback for ordinary
-// launches without an explicit skin.
+// launches without an explicit skin (like the desktop's hermes-boot-* keys);
+// DEFAULT_THEME only on first launch.
 const initialTheme = () => {
   const raw = process.env.HERMES_TUI_INITIAL_SKIN
 
@@ -51,6 +52,8 @@ const buildUiState = (): UiState => {
     busy: false,
     busyInputMode: 'queue',
     compact: false,
+    compacting: false,
+    destructiveSlashConfirm: true,
     detailsMode: 'collapsed',
     detailsModeCommandOverride: false,
     focusView: false,
@@ -68,7 +71,9 @@ const buildUiState = (): UiState => {
     sid: null,
     status: `summoning ${theme.brand.name.toLowerCase()}…`,
     statusBar: 'top',
+    statusBarFields: null,
     streaming: true,
+    timestamps: false,
     theme,
     usage: ZERO
   }

@@ -1,0 +1,17 @@
+name: agent-lights
+version: 0.2.0
+description: "Shows each Hermes CLI/TUI session and Kanban worker as a dot in the Agent Lights macOS menu-bar app."
+author: "Matt Tortorich (@mtorto2)"
+provides_hooks:
+  - pre_llm_call
+  - post_llm_call
+  - on_session_end
+  - subagent_start
+  - kanban_task_blocked
+  - kanban_task_completed
+  - on_human_input_request
+  - on_human_input_resolved
+  - pre_tool_call
+  - post_tool_call
+  - pre_approval_request
+  - post_approval_response

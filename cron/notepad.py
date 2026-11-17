@@ -50,8 +50,10 @@ def _current_notepad_file() -> Path:
 
 
 def _connect() -> sqlite3.Connection:
+    from cron.jobs import _ensure_cron_dir
+
     notepad_file = _current_notepad_file()
-    notepad_file.parent.mkdir(parents=True, exist_ok=True)
+    _ensure_cron_dir(notepad_file.parent)
     return sqlite3.connect(notepad_file, timeout=5)
 
 
@@ -162,7 +164,13 @@ def list_notes(job_id: str) -> List[Dict[str, Any]]:
 
 
 def clear_notepad(job_id: str) -> int:
-    """Delete every key for one job (e.g. on job removal). Returns row count."""
+    """Delete every key for one job (e.g. on job removal). Returns row count.
+
+    Called from ``cron.jobs.remove_job`` so deleted jobs don't orphan their
+    rows. No-ops without creating the DB when no notepad file exists yet.
+    """
+    if not NOTEPAD_FILE.exists():
+        return 0
     with _transaction() as conn:
         cur = conn.execute(
             "DELETE FROM cron_notepad WHERE job_id=?", (str(job_id),)

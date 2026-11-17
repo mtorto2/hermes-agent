@@ -12,7 +12,8 @@ These tests confirm that:
   3. Mixed media lists (voice + audio) split correctly.
 """
 
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -74,10 +75,43 @@ async def test_voice_message_still_transcribed():
             history=[],
         )
 
-    mock_transcribe.assert_called_once_with("/tmp/voice.ogg")
+    mock_transcribe.assert_called_once_with("/tmp/voice.ogg", None, "gateway")
     # The transcript passes through as a plain quoted line — no "voice message"
     # meta-commentary in the LLM-visible prompt.
     assert "hello world" in result
+
+
+@pytest.mark.asyncio
+async def test_voice_hard_stt_failure_is_neutral_and_emits_no_false_echo():
+    runner = _make_runner(stt_enabled=True)
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="1", chat_type="dm")
+    event = _voice_event("/tmp/voice-failed.ogg")
+    adapter = SimpleNamespace(send=AsyncMock())
+    runner.adapters = {Platform.TELEGRAM: adapter}
+
+    with patch(
+        "tools.transcription_tools.transcribe_audio",
+        return_value={"success": False, "error": "synthetic configured failure"},
+    ) as configured, patch(
+        "tools.transcription_tools.transcribe_audio_local_fallback",
+        return_value={"success": False, "error": "synthetic fallback failure"},
+    ) as fallback, patch(
+        "tools.credential_files.to_agent_visible_cache_path",
+        side_effect=lambda path: path,
+    ):
+        result = await runner._prepare_inbound_message_text(
+            event=event,
+            source=source,
+            history=[],
+        )
+
+    configured.assert_called_once_with("/tmp/voice-failed.ogg", None, "gateway")
+    fallback.assert_called_once_with("/tmp/voice-failed.ogg")
+    assert result.startswith("[voice message could not be transcribed automatically;")
+    assert "audio is available at: /tmp/voice-failed.ogg" in result
+    assert "synthetic configured failure" not in result
+    assert "synthetic fallback failure" not in result
+    adapter.send.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------

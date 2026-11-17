@@ -24,8 +24,9 @@ state we don't need here.
 """
 
 import os
+import threading
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 
@@ -138,6 +139,27 @@ class TestIsSessionYoloActiveHelper:
         with patch.object(approval_module, "_YOLO_MODE_FROZEN", True):
             assert HermesCLI._is_session_yolo_active(stand_in) is True
 
+    def test_toggle_under_frozen_yolo_reports_locked_and_stays_on(self):
+        """With process-level YOLO frozen ON, /yolo must NOT claim approvals
+        are back. Pre-fix, the second toggle printed "YOLO mode OFF —
+        dangerous commands will require approval" while the frozen flag kept
+        auto-approving everything — a false safety claim."""
+        stand_in = _make_stand_in()
+
+        printed = []
+        with patch.object(approval_module, "_YOLO_MODE_FROZEN", True):
+            with patch("cli._cprint", side_effect=lambda msg: printed.append(msg)):
+                HermesCLI._toggle_yolo(stand_in)
+                HermesCLI._toggle_yolo(stand_in)
+
+            # Still effectively ON, and no session-level state was flipped.
+            assert HermesCLI._is_session_yolo_active(stand_in) is True
+            assert not approval_module.is_session_yolo_enabled(SESSION_KEY)
+
+        joined = "\n".join(printed)
+        assert "locked ON" in joined
+        assert "will require approval" not in joined
+
 
 class TestToggleYoloEndToEnd:
     """End-to-end: a dangerous command must auto-approve through the same
@@ -195,3 +217,70 @@ class TestSessionRotationTransfersYolo:
         # Neither key should have been touched.
         assert approval_module.is_session_yolo_enabled("new") is False
         assert approval_module.is_session_yolo_enabled("old") is False
+
+
+@pytest.mark.parametrize("raises", [False, True])
+def test_chat_thread_binds_and_resets_yolo_session(monkeypatch, raises):
+    import cli as cli_module
+
+    config = {"model": {"default": "test-model", "provider": "openai",
+                        "base_url": "https://example.invalid/v1"},
+              "display": {"compact": False, "tool_progress": "all"},
+              "agent": {}, "terminal": {"env_type": "local"}}
+    with patch("cli.get_tool_definitions", return_value=[]), patch.dict(
+        cli_module.__dict__, {"CLI_CONFIG": config}
+    ):
+        shell = HermesCLI()
+    shell.session_id = SESSION_KEY
+    observed = []
+    after_thread = []
+    parent_thread = threading.current_thread()
+    real_thread = threading.Thread
+
+    class TrackingThread(real_thread):
+        def run(self):
+            is_agent = getattr(self._target, "__name__", "") == "run_agent"
+            try:
+                super().run()
+            finally:
+                if is_agent:
+                    after_thread.append(approval_module.get_current_session_key(default=""))
+
+    class Agent:
+        session_id = SESSION_KEY
+        model = "test-model"
+        platform = "cli"
+        max_iterations = 10
+        _active_children = []
+        _interrupt_requested = False
+
+        def clear_interrupt(self):
+            pass
+
+        def run_conversation(self, **kwargs):
+            assert threading.current_thread() is not parent_thread
+            observed.append(approval_module.check_all_command_guards(
+                "rm -rf /tmp/scratch-xyzzy", "local"))
+            if raises:
+                raise RuntimeError("test turn failure")
+            return {"final_response": "done", "messages": [], "api_calls": 1,
+                    "completed": True, "partial": True, "response_previewed": True}
+
+    shell.agent = Agent()
+    approval_callback = Mock(return_value="deny")
+    monkeypatch.setattr(shell, "_approval_callback", approval_callback)
+    monkeypatch.setattr(shell, "_ensure_runtime_credentials", lambda: True)
+    monkeypatch.setattr(shell, "_resolve_turn_agent_config", lambda message: {
+        "signature": shell._active_agent_route_signature,
+        "model": None, "runtime": None, "request_overrides": None})
+    monkeypatch.setattr(shell, "_init_agent", lambda **kwargs: True)
+    monkeypatch.setattr(cli_module.threading, "Thread", TrackingThread)
+    monkeypatch.setenv("HERMES_INTERACTIVE", "1")
+    monkeypatch.setattr(approval_module, "_get_approval_mode", lambda: "manual")
+    monkeypatch.setenv("HERMES_SESSION_ID", "unrelated-env-session")
+    with patch("cli._cprint"):
+        shell._toggle_yolo()
+        shell.chat("hello")
+    assert observed and observed[0]["approved"] is True
+    approval_callback.assert_not_called()
+    assert after_thread == [""]
