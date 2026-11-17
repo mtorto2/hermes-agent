@@ -866,6 +866,13 @@ public struct StatusIndicatorLayout: Equatable {
         agentRingCount > 0
     }
 
+    /// Nothing to show: no Hermes slot dots and no agent rings. The menu bar
+    /// item is still there, so draw a hollow placeholder ring rather than an
+    /// empty (invisible) image, to show the app is running with no agents.
+    public var shouldRenderIdlePlaceholder: Bool {
+        normalSlotIndicators.isEmpty && !shouldRenderAgentRings
+    }
+
     public init(hermesStatuses: [SlotStatus], agentGroup: AgentRingGroup, flashOn: Bool = true) {
         self.normalSlotIndicators = hermesStatuses
             .filter { (1...6).contains($0.slot) }

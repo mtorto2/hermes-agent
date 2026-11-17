@@ -257,6 +257,20 @@ final class SlotStatusTests: XCTestCase {
         XCTAssertEqual(layout.filledDotCount, 6)
     }
 
+    func testIdlePlaceholderShowsOnlyWhenNothingElseIsDrawn() throws {
+        let empty = StatusIndicatorLayout(hermesStatuses: [], agentGroup: AgentRingGroup(statuses: []))
+        XCTAssertTrue(empty.shouldRenderIdlePlaceholder)
+
+        let working = try SlotStatus.decode(from: #"{"slot":1,"state":"working","source":"hermes"}"#.data(using: .utf8)!)
+        let withDot = StatusIndicatorLayout(hermesStatuses: [working], agentGroup: AgentRingGroup(statuses: []))
+        XCTAssertFalse(withDot.shouldRenderIdlePlaceholder)
+
+        let agent = try SlotStatus.decode(from: #"{"slot":1,"state":"working","source":"kanban"}"#.data(using: .utf8)!)
+        let agentGroup = AgentRingGroup(statuses: [agent])
+        let withRings = StatusIndicatorLayout(hermesStatuses: [], agentGroup: agentGroup)
+        XCTAssertEqual(withRings.shouldRenderIdlePlaceholder, !agentGroup.shouldRender)
+    }
+
     func testStatusIndicatorLayoutKeepsTheGivenDotOrder() throws {
         let statuses = try [3, 1, 2].map { slot in
             try SlotStatus.decode(from: "{\"slot\":\(slot),\"state\":\"working\",\"source\":\"hermes\"}".data(using: .utf8)!)

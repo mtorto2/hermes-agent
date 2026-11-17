@@ -759,6 +759,15 @@ private enum DotRenderer {
             drawAgentRings(for: agentGroup, xOffset: dotWidth + gapWidth)
         }
 
+        if layout.shouldRenderIdlePlaceholder {
+            let dotDiameter = CGFloat(geometry.hermesDotDiameter)
+            let rect = NSRect(x: (width - dotDiameter) / 2, y: (18 - dotDiameter) / 2, width: dotDiameter, height: dotDiameter)
+            let path = NSBezierPath(ovalIn: rect)
+            NSColor.secondaryLabelColor.withAlphaComponent(0.72).setStroke()
+            path.lineWidth = 1.4
+            path.stroke()
+        }
+
         image.unlockFocus()
         image.isTemplate = false
         return image
